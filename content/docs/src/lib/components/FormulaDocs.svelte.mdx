@@ -1,45 +1,102 @@
 ---
 title: "FormulaDocs.svelte"
-description: "Formula reference browser — the function list and docs come straight from the Rust core's registry (formula_docs() wasm export)."
+description: "The formula reference — every function's docs read straight from the Rust registry, searchable, and insertable into the editor"
 source: "src/lib/components/FormulaDocs.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A browsable reference for every formula function. What makes it worth reading is
+where the content comes from: nothing is written here. The names, signatures,
+descriptions, examples and categories are all read out of the Rust core's own
+function registry through the `formula_docs()` WASM export.
 
-````svelte FormulaDocs.svelte -n
+That means the reference cannot drift from the implementation. Adding a
+function in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) makes it
+appear here with no change to this file — the same registry that
+[docgen.rs](/docs/quadratic-core/src/bin/docgen.rs) renders to markdown.
+
+<Scrollycoding>
+
+## !!steps Fetching the registry, then taking focus
+
+The first effect pulls the docs through
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts), which loads the WASM
+module if needed and caches the result — so opening this dialog a second time is
+instant.
+
+`finally` clears the loading flag on both paths, so a failure shows an empty
+list rather than a spinner that never stops.
+
+The second effect is separated for a reason. Focusing the search box has to wait
+until `loading` is false, because the input only exists once the loading
+placeholder is replaced — focusing earlier would find nothing. Splitting the two
+lets Svelte re-run just the focus logic when the flag flips.
+
+```svelte ! FormulaDocs.svelte
 <script lang="ts">
-	// Formula reference browser — the function list and docs come straight
-	// from the Rust core's registry (formula_docs() wasm export).
-	import { getFormulaDocs, type FormulaDoc } from '../formulas/runFormula';
-	import { app } from '../state.svelte';
-	import Modal from './Modal.svelte';
-
-	let docs = $state<FormulaDoc[]>([]);
-	let loading = $state(true);
-	let search = $state('');
-	let searchEl: HTMLInputElement | undefined = $state();
-
 	$effect(() => {
 		void getFormulaDocs()
 			.then((d) => (docs = d))
+			// !mark
 			.finally(() => (loading = false));
 	});
 	$effect(() => {
+		// !mark
 		if (!loading) searchEl?.focus();
 	});
+</script>
+```
 
+## !!steps Searching descriptions, not just names
+
+The filter matches against the function's **documentation text** as well as its
+name, which changes what the search is for. Typing `average` finds `AVERAGE`
+and `AVERAGEIF`, but typing `round` also surfaces functions whose description
+mentions rounding without carrying the word in their name.
+
+That is the right behavior for a reference someone consults when they know what
+they want to do but not what it is called — the opposite situation from the
+command palette, where the user knows the command's name.
+
+Trimming the query first means stray whitespace from a paste does not empty the
+list, and an empty query short-circuits to the full set rather than filtering
+every entry against an empty string.
+
+```svelte ! FormulaDocs.svelte
+<script lang="ts">
 	const filtered = $derived.by(() => {
 		const q = search.trim().toLowerCase();
+		// !mark
 		if (!q) return docs;
 		return docs.filter(
+			// !mark
 			(d) => d.name.toLowerCase().includes(q) || d.doc.toLowerCase().includes(q)
 		);
 	});
+</script>
+```
 
+## !!steps Grouping without reordering
+
+Categories are built by walking the filtered list and appending to a `Map` keyed
+by category name.
+
+Using a `Map` rather than a plain object is what preserves **insertion order**,
+so the categories appear in the order the Rust registry emits them — the
+deliberate ordering in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), which
+puts common categories first — rather than alphabetically or in whatever order
+object keys happen to fall.
+
+The same property applies within each category: functions keep their registry
+order. Nothing here sorts anything, which is the point — the Rust side already
+decided.
+
+```svelte ! FormulaDocs.svelte
+<script lang="ts">
 	const groups = $derived.by(() => {
+		// !mark
 		const map = new Map<string, FormulaDoc[]>();
 		for (const doc of filtered) {
 			const list = map.get(doc.category);
@@ -48,45 +105,56 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		}
 		return [...map.entries()];
 	});
+</script>
+```
 
+## !!steps Inserting only where there is somewhere to insert
+
+`canInsert` is true only when the code editor is open *and* editing a formula.
+Opened from the Help menu with no editor, this is a read-only reference, and the
+component says so by leaving the hint hidden and the rows unclickable.
+
+The insert itself carries a small piece of judgement. If a function's only usage
+ends in `()` it takes no arguments, so the complete call is inserted and the
+caret lands after it. Otherwise only the opening parenthesis is written,
+leaving the cursor positioned to type arguments — which is what you want, since
+a closing paren would have to be stepped over.
+
+The text is handed to
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) through the
+`pendingEditorInsert` channel. Notably it does *not* set `pendingInsertIsRef`,
+so this is a plain insertion rather than a repointable cell reference.
+
+```svelte ! FormulaDocs.svelte
+<script lang="ts">
 	const canInsert = $derived(app.showCodeEditor && app.editorMode === 'FORMULA');
-
-	function close(): void {
-		app.showFormulaDocs = false;
-	}
 
 	function insert(doc: FormulaDoc): void {
 		if (!canInsert) return;
+		// !mark(1:2)
 		const takesArgs = !(doc.usages.length === 1 && doc.usages[0].endsWith('()'));
 		app.pendingEditorInsert = doc.name + (takesArgs ? '(' : '()');
 		close();
 	}
-
-	function onKeyDown(e: KeyboardEvent): void {
-		e.stopPropagation();
-		if (e.key === 'Escape') close();
-	}
 </script>
+```
 
-<Modal onclose={close} wide>
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="docs" onkeydown={onKeyDown}>
-		<div class="head">
-			<input
-				bind:this={searchEl}
-				bind:value={search}
-				class="search"
-				placeholder="Search formula functions…"
-				spellcheck="false"
-			/>
-			{#if canInsert}
-				<span class="hint">Click a function to insert it into the formula editor</span>
-			{/if}
-		</div>
-		<div class="list">
-			{#if loading}
-				<div class="empty">Loading function reference…</div>
-			{:else}
+## !!steps One row per function, several signatures each
+
+Each function renders as a button holding three parts: its signatures, its
+description, and its examples.
+
+A function can have more than one usage — overloads with different argument
+counts — so the signatures are joined with a middle-dot separator emitted
+between entries rather than after each, which is why the `{#if i > 0}` sits
+before the `code` element. The markup is packed onto shared lines because any
+whitespace between these elements would render as a visible gap.
+
+Examples render only when the registry supplies them, and the `{:else}` on the
+outer `each` covers a search with no matches, quoting the query back so it is
+clear what was searched for.
+
+```svelte ! FormulaDocs.svelte
 				{#each groups as [category, functions] (category)}
 					<div class="category">{category}</div>
 					{#each functions as doc (doc.name)}
@@ -107,34 +175,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				{:else}
 					<div class="empty">No functions match “{search}”</div>
 				{/each}
-			{/if}
-		</div>
-	</div>
-</Modal>
+```
 
+## !!steps Headings that stay while you scroll
+
+`position: sticky` with `top: 0` keeps each category label pinned as its
+functions scroll past, so you always know which section you are in — the detail
+that makes a long single-scroll list navigable without a sidebar.
+
+For sticky to work the scroll container must be the `.list` element rather than
+the page, which is why `overflow-y: auto` sits there.
+
+The cursor is the quiet part of the affordance: rows default to `cursor:
+default` and only become `pointer` — with a hover background — when
+`insertable` is applied. So the same list silently presents itself as clickable
+or not, matching whether clicking would do anything.
+
+```svelte ! FormulaDocs.svelte
 <style>
-	.docs {
-		display: flex;
-		flex-direction: column;
-		min-height: 0;
-	}
-	.head {
-		border-bottom: 1px solid var(--border-light);
-	}
-	.search {
-		width: 100%;
-		border: none;
-		outline: none;
-		padding: 0.9rem 1rem 0.5rem;
-		font-size: 0.95rem;
-		box-sizing: border-box;
-	}
-	.hint {
-		display: block;
-		padding: 0 1rem 0.5rem;
-		font-size: 0.7rem;
-		color: var(--formula);
-	}
 	.list {
 		overflow-y: auto;
 		padding: 0.25rem 0 0.75rem;
@@ -152,16 +210,6 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		border-bottom: 1px solid var(--border-light);
 	}
 	.fn {
-		display: flex;
-		flex-direction: column;
-		gap: 0.2rem;
-		width: 100%;
-		background: none;
-		border: none;
-		border-bottom: 1px solid var(--border-light);
-		font: inherit;
-		text-align: left;
-		padding: 0.55rem 1rem;
 		cursor: default;
 	}
 	.fn.insertable {
@@ -170,30 +218,37 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	.fn.insertable:hover {
 		background: var(--hover);
 	}
-	.sig {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.4rem;
-		align-items: baseline;
-	}
+</style>
+```
+
+## !!steps Respecting the registry's line breaks
+
+`white-space: pre-line` on the description is a small but necessary choice. The
+doc strings in the Rust source are written as multi-line prose — often with a
+blank line before a note or a list — and the default `normal` would collapse all
+of that into one run-on paragraph.
+
+`pre-line` keeps the authored newlines while still collapsing runs of spaces and
+wrapping long lines, which is exactly the treatment plain-text documentation
+needs.
+
+Signatures and examples are both `code`, distinguished by weight and colour
+rather than shape: signatures take the formula accent from
+[app.css](/docs/src/app.css), while examples are muted on a subtle background —
+so the eye finds the signature first.
+
+```svelte ! FormulaDocs.svelte
+<style>
 	.sig code {
 		font-size: 0.82rem;
 		font-weight: 600;
 		color: var(--formula);
-	}
-	.sep {
-		color: var(--border);
 	}
 	.doc {
 		font-size: 0.8rem;
 		color: var(--text);
 		line-height: 1.45;
 		white-space: pre-line;
-	}
-	.examples {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.6rem;
 	}
 	.examples code {
 		font-size: 0.72rem;
@@ -202,10 +257,18 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		padding: 0.1rem 0.35rem;
 		border-radius: 3px;
 	}
-	.empty {
-		padding: 1rem;
-		color: var(--muted);
-		font-size: 0.85rem;
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Opened from the `ƒx Functions` button in
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte), from the Help
+menu in [TopBar.svelte](/docs/src/lib/components/TopBar.svelte), and from the
+command palette. It renders inside
+[Modal.svelte](/docs/src/lib/components/Modal.svelte) with the `wide` prop, since
+signatures and descriptions need more room than a command list.
+
+The same registry data reaches the editor by a second route: the LSP module's
+completion items, cached by `getFormulaCompletions` and filtered as you type.
+This dialog is the browse path; autocomplete is the recall path.
