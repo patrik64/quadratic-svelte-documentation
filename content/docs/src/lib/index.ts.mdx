@@ -1,14 +1,61 @@
 ---
 title: "index.ts"
-description: "Library entry point for $lib imports."
+description: "SvelteKit's $lib barrel file, left empty — the project imports subpaths directly instead"
 source: "src/lib/index.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The whole file:
 
-````ts index.ts -n
+```ts index.ts
 // place files you want to import through the `$lib` alias in this folder.
-````
+```
+
+One comment, seventy-five bytes, exactly as SvelteKit generates it. There is no
+code to walk through — so this page explains what the file is for and why it
+stayed empty, which is the only interesting thing about it.
+
+## What `$lib` is
+
+SvelteKit configures `$lib` as an alias for `src/lib`, so anything under that
+directory can be imported without counting `../` segments from wherever the
+importing file happens to sit. The alias is provided by the framework; nothing
+in this repository configures it.
+
+This file is the *barrel* that convention suggests you fill: re-export things
+from here, and callers can write `import { thing } from '$lib'`.
+
+## What the project does instead
+
+It never uses the barrel. Searching the source finds:
+
+- **11 subpath imports** of the form `$lib/components/BottomBar.svelte`, all of
+  them in [+page.svelte](/docs/src/routes/+page.svelte), which is the one file
+  that reaches into `lib` from outside it.
+- **0 imports** of `$lib` itself — so `index.ts` is never imported by anything.
+- **56 relative imports** between files inside `src/lib`, which use `../core/types`
+  and similar rather than the alias.
+
+That division is consistent: routes address the library through the alias, and
+the library addresses itself relatively. Deleting this file would change
+nothing.
+
+## Why an empty barrel is a reasonable outcome
+
+Leaving it empty is not just neglect — a populated barrel would work against
+something this codebase depends on.
+
+The app is careful to keep heavy dependencies out of the initial bundle, and
+does it with dynamic imports at the point of use: Pyodide in
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts), the WebAssembly core in
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts), plotly.js in
+[plotlyImage.ts](/docs/src/lib/python/plotlyImage.ts), and the per-language
+branches in
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts).
+
+A barrel re-exporting those modules would give every importer of `$lib` a
+static edge to all of them, which is exactly the shape that makes lazy loading
+stop working. A sheet containing no Python cells would download Pyodide anyway.
+
+So the file's emptiness quietly preserves a property the rest of the codebase
+works to maintain — whether or not that was the reason it was left alone.
