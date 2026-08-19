@@ -1,19 +1,38 @@
 ---
 title: "cellTextFormatter.test.ts"
-description: "Unit tests for cellTextFormatter.ts."
+description: "Vitest coverage for display formatting — each numeric type, the non-numeric guard, and the percentage case that reveals an asymmetry"
 source: "src/lib/core/cellTextFormatter.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Formatting decides what a cell *looks* like without changing what it stores, so
+these tests are written as exact output strings — the point of the module is
+its rendering, and anything vaguer would not pin it down.
 
-````ts cellTextFormatter.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { formatCellValue, isNumericValue } from './cellTextFormatter';
-import type { Cell, CellFormat } from './types';
+The suite covers each of the four numeric types plus the guards around them.
+One assertion documents behavior that is easy to misread, and it is called out
+below.
 
+<Scrollycoding>
+
+## !!steps Two factories, and what happens with no format
+
+The helpers build the minimum viable `Cell` and `CellFormat`, filling
+coordinates and timestamps that formatting never reads. Keeping them out of
+each assertion is what lets the expectations show only the value and the format
+under test.
+
+The first case establishes the module's default: with no format at all, the
+raw value comes back untouched. The second is more pointed — a format
+containing only `bold` also returns the raw value, because formatting keys off
+the `textFormat` field specifically, not the presence of a format object. A
+bold cell is not a formatted number.
+
+The missing-cell case returns an empty string rather than throwing, which is
+what lets callers render sparse regions without checking every coordinate
+first.
+
+```ts ! cellTextFormatter.test.ts
 function cell(value: string): Cell {
 	return { x: 0, y: 0, type: 'TEXT', value, last_modified: '' };
 }
@@ -25,19 +44,56 @@ function fmt(textFormat: CellFormat['textFormat']): CellFormat {
 describe('formatCellValue', () => {
 	it('passes raw values through without a format', () => {
 		expect(formatCellValue(cell('hello'), undefined)).toBe('hello');
+		// !mark
 		expect(formatCellValue(cell('1234.5'), { x: 0, y: 0, bold: true })).toBe('1234.5');
 	});
 
 	it('returns empty for missing cells', () => {
 		expect(formatCellValue(undefined, undefined)).toBe('');
 	});
+```
 
+## !!steps Grouping and a fixed number of decimals
+
+The `NUMBER` case asserts two behaviors in one string. Thousands separators
+appear — `1234.5` becomes `1,234.50` — and the decimal count is **exact**
+rather than a ceiling: a value with one decimal place is padded to two.
+
+That padding is what makes a column of numbers line up, and it comes from
+`toLocaleString` receiving the requested precision as both its minimum and
+maximum fraction digits.
+
+The locale is hard-coded to `en-US` in the implementation rather than following
+the browser, so this assertion holds regardless of where the tests run — a
+deliberate trade of localization for determinism, since a spreadsheet's stored
+values are not locale-dependent either.
+
+```ts ! cellTextFormatter.test.ts
 	it('formats NUMBER with grouping and decimals', () => {
+		// !mark
 		expect(formatCellValue(cell('1234.5'), fmt({ type: 'NUMBER', decimalPlaces: 2 }))).toBe(
 			'1,234.50'
 		);
 	});
+```
 
+## !!steps A symbol, and zero decimals meaning zero
+
+Currency is number formatting with a symbol prepended, and the two assertions
+divide the work: the first confirms the symbol and the grouping travel
+together, the second changes both the symbol and the precision at once.
+
+`decimalPlaces: 0` producing `€2` rather than `€2.00` is worth noticing. Zero
+is a real value here, not a missing one — the implementation defaults to two
+decimals only when the field is `undefined`, so a caller can genuinely ask for
+whole units.
+
+The symbol is a plain string prefix rather than a locale currency code, which
+is why `€` lands before the digits exactly as `$` does. Correct for dollars,
+and a simplification for currencies conventionally written with a trailing
+symbol.
+
+```ts ! cellTextFormatter.test.ts
 	it('formats CURRENCY with its symbol', () => {
 		expect(
 			formatCellValue(
@@ -48,24 +104,65 @@ describe('formatCellValue', () => {
 		expect(
 			formatCellValue(
 				cell('2'),
+				// !mark(1:2)
 				fmt({ type: 'CURRENCY', display: 'CURRENCY', symbol: '€', decimalPlaces: 0 })
 			)
 		).toBe('€2');
 	});
+```
 
+## !!steps The assertion that documents an inconsistency
+
+Read quickly, this test looks wrong: `decimalPlaces: 1` yet the expected output
+is `25%`, with no decimal at all.
+
+It is correct, and it records a real asymmetry in
+[cellTextFormatter.ts](/docs/src/lib/core/cellTextFormatter.ts). For `NUMBER`
+and `CURRENCY` the requested precision is passed as both the minimum and the
+maximum fraction digits, so the output is padded to exactly that many places.
+For `PERCENTAGE` the minimum is hard-coded to `0` and only the maximum comes
+from `decimalPlaces` — making it a *ceiling* rather than a fixed width. Since
+`0.25 × 100` is exactly `25`, nothing is padded.
+
+The practical consequence is that a percentage column does not align the way a
+number column does: `25%` and `33.3%` have different decimal widths. Whether
+that is intended the code does not say, but this test locks in the current
+behavior, so a change would be deliberate rather than accidental.
+
+The scaling itself is the other half — percentages are stored as fractions and
+multiplied by 100 for display, so the underlying `0.25` is what formulas see.
+
+```ts ! cellTextFormatter.test.ts
 	it('formats PERCENTAGE by scaling ×100', () => {
+		// !mark(1:3)
 		expect(formatCellValue(cell('0.25'), fmt({ type: 'PERCENTAGE', decimalPlaces: 1 }))).toBe(
 			'25%'
 		);
 	});
+```
 
-	it('formats EXPONENTIAL', () => {
-		expect(formatCellValue(cell('1234.5'), fmt({ type: 'EXPONENTIAL', decimalPlaces: 2 }))).toBe(
-			'1.23e+3'
-		);
-	});
+## !!steps Never formatting what is not a number
 
+`EXPONENTIAL` delegates to JavaScript's own `toExponential`, so its output
+carries the platform's conventions — the sign and the lack of zero-padding in
+`1.23e+3` are not choices this module made.
+
+The final case is the important guard. A numeric format applied to the text
+`hello` returns `hello`, and applied to an empty string returns an empty
+string. Formatting is skipped whenever the value is blank or does not parse,
+so a format left on a column cannot corrupt a label that shares it — no `NaN`
+ever reaches the grid.
+
+That guard is exactly what `isNumericValue` exposes for callers who need the
+same decision, and its own test states the rule directly: an exponential
+literal counts as numeric, while text and a whitespace-only string do not.
+Blank-versus-numeric matters elsewhere too, since
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) draws the same
+line when summing a selection.
+
+```ts ! cellTextFormatter.test.ts
 	it('leaves non-numeric values alone even with a numeric format', () => {
+		// !mark(1:3)
 		expect(formatCellValue(cell('hello'), fmt({ type: 'NUMBER', decimalPlaces: 2 }))).toBe(
 			'hello'
 		);
@@ -76,9 +173,23 @@ describe('formatCellValue', () => {
 describe('isNumericValue', () => {
 	it('accepts numbers and rejects text and blanks', () => {
 		expect(isNumericValue('42')).toBe(true);
+		// !mark
 		expect(isNumericValue('-1.5e3')).toBe(true);
 		expect(isNumericValue('abc')).toBe(false);
 		expect(isNumericValue('  ')).toBe(false);
 	});
 });
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. The formatter is called from two places that must agree:
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) when rasterizing cell text,
+and the file that persists values — which is why formatting is kept purely
+presentational, with the raw string always preserved on the cell in
+[types.ts](/docs/src/lib/core/types.ts).
+
+Not covered: the default paths where `decimalPlaces` is omitted entirely, which
+behave differently per type — `NUMBER` allows up to two decimals without
+padding, `CURRENCY` fixes two, `PERCENTAGE` allows up to one — and the
+`default` branch for an unrecognized format type.
