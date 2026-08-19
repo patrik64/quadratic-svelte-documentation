@@ -1,0 +1,397 @@
+---
+title: "keyboard.ts"
+description: "Keyboard handling, ported from src/gridGL/interaction/keyboard/*. characters that open the inline editor when typed on a cell"
+source: "src/lib/grid/keyboard.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts keyboard.ts -n
+// Keyboard handling, ported from src/gridGL/interaction/keyboard/*.
+
+import { isCodeCellType } from '../core/types';
+
+import {
+	app,
+	clearFormatting,
+	copySelection,
+	deleteCellsInRect,
+	getSelectionRect,
+	gotoCell,
+	pasteFromClipboard,
+	redo,
+	sheetController,
+	toggleBold,
+	toggleItalic,
+	undo,
+	zoomIn,
+	zoomOut,
+	zoomTo100,
+	zoomToFit,
+	zoomToSelection,
+	ensureCursorVisible,
+	switchSheetRelative,
+	insertTodayDate,
+	copyFormat,
+	copySelectionAsPng,
+	downloadSelectionAsCsv,
+	pasteFormat,
+	rerunAllCode,
+	fillDown,
+	fillRight
+} from '../state.svelte';
+
+// characters that open the inline editor when typed on a cell
+const ALLOWED_FIRST_CHARS = /^[a-zA-Z0-9!"#$%&'()*+,\-.:;<>?@[\\\]^_`{|}~]$/;
+
+function anyModalOpen(): boolean {
+	return (
+		app.showCommandPalette ||
+		app.showGoToMenu ||
+		app.showCellTypeMenu ||
+		app.showFileMenu ||
+		app.showFormulaDocs ||
+		app.showInput
+	);
+}
+
+/** Window-level shortcuts (Quadratic's keyboardViewport). Returns true if handled. */
+export function keyboardViewport(e: KeyboardEvent): boolean {
+	const mod = e.metaKey || e.ctrlKey;
+	const key = e.key.toLowerCase();
+
+	// modern shortcut: alt+arrows switch sheets
+	if (e.altKey && !mod) {
+		if (key === 'arrowright' || key === 'arrowup') {
+			switchSheetRelative(1);
+			return true;
+		}
+		if (key === 'arrowleft' || key === 'arrowdown') {
+			switchSheetRelative(-1);
+			return true;
+		}
+	}
+	if (e.altKey) return false;
+
+	if (mod && key === 'o') {
+		app.showFileMenu = !app.showFileMenu;
+		app.showCommandPalette = false;
+		app.showGoToMenu = false;
+		app.showCellTypeMenu = false;
+		return true;
+	}
+	if (app.showFileMenu) {
+		if (key === 'escape') {
+			app.showFileMenu = false;
+			return true;
+		}
+		return false;
+	}
+	if (mod && (key === 'p' || key === 'k' || key === '/')) {
+		app.showCommandPalette = !app.showCommandPalette;
+		app.showGoToMenu = false;
+		app.showCellTypeMenu = false;
+		return true;
+	}
+	if (mod && key === '\\') {
+		clearFormatting();
+		return true;
+	}
+	if (mod && key === '.') {
+		app.presentationMode = !app.presentationMode;
+		return true;
+	}
+	if (key === 'escape') {
+		if (app.presentationMode) {
+			app.presentationMode = false;
+			return true;
+		}
+		if (anyModalOpen() || app.showCodeEditor) return false; // modals handle their own escape
+		return false;
+	}
+	if (mod && key === 'b') {
+		toggleBold();
+		return true;
+	}
+	if (mod && key === 'i') {
+		toggleItalic();
+		return true;
+	}
+	if (mod && key === 'f') {
+		app.searchAllSheets = e.shiftKey;
+		app.showSearch = true;
+		return true;
+	}
+	if (mod && (key === 'g' || key === 'j')) {
+		app.showGoToMenu = !app.showGoToMenu;
+		app.showCommandPalette = false;
+		return true;
+	}
+	if (mod && (key === '=' || key === '+')) {
+		zoomIn();
+		return true;
+	}
+	if (mod && (key === '-' || key === '_')) {
+		zoomOut();
+		return true;
+	}
+	if (mod && key === '8') {
+		zoomToSelection();
+		return true;
+	}
+	if (mod && key === '9') {
+		zoomToFit();
+		return true;
+	}
+	if (mod && key === '0') {
+		zoomTo100();
+		return true;
+	}
+	if (mod && e.shiftKey && key === 'enter') {
+		void rerunAllCode();
+		return true;
+	}
+	if (mod && key === ';') {
+		void insertTodayDate(e.shiftKey);
+		return true;
+	}
+	if (mod && key === 's') {
+		return true; // swallow browser save
+	}
+	return false;
+}
+
+function moveCursor(dx: number, dy: number, shift: boolean): void {
+	if (shift) {
+		const move = { x: app.keyboardMovePosition.x + dx, y: app.keyboardMovePosition.y + dy };
+		app.keyboardMovePosition = move;
+		app.multiCursor = {
+			originPosition: { ...app.cursorPosition },
+			terminalPosition: move
+		};
+	} else {
+		const pos = { x: app.cursorPosition.x + dx, y: app.cursorPosition.y + dy };
+		app.cursorPosition = pos;
+		app.keyboardMovePosition = pos;
+		app.multiCursor = undefined;
+	}
+	ensureCursorVisible();
+}
+
+/** Excel-style ctrl+arrow jump: to the edge of the current content run. */
+function jumpCursor(dx: number, dy: number, shift: boolean): void {
+	const sheet = sheetController.sheet;
+	const base = shift ? app.keyboardMovePosition : app.cursorPosition;
+	let { x, y } = base;
+	const has = (cx: number, cy: number) => {
+		const c = sheet.getCell(cx, cy);
+		return c !== undefined && c.value !== '';
+	};
+	const MAX = 10000;
+	if (has(x, y) && has(x + dx, y + dy)) {
+		// inside a run: go to its far edge
+		let steps = 0;
+		while (has(x + dx, y + dy) && steps++ < MAX) {
+			x += dx;
+			y += dy;
+		}
+	} else {
+		// jump to the next cell with content
+		let steps = 0;
+		let cx = x + dx;
+		let cy = y + dy;
+		while (!has(cx, cy) && steps++ < MAX) {
+			cx += dx;
+			cy += dy;
+		}
+		if (steps < MAX) {
+			x = cx;
+			y = cy;
+		} else {
+			x += dx;
+			y += dy;
+		}
+	}
+	if (shift) {
+		app.keyboardMovePosition = { x, y };
+		app.multiCursor = { originPosition: { ...app.cursorPosition }, terminalPosition: { x, y } };
+	} else {
+		app.cursorPosition = { x, y };
+		app.keyboardMovePosition = { x, y };
+		app.multiCursor = undefined;
+	}
+	ensureCursorVisible();
+}
+
+function openCellEditor(seed?: string): void {
+	const { x, y } = app.cursorPosition;
+	const cell = sheetController.sheet.getCell(x, y);
+	if (cell && isCodeCellType(cell.type)) {
+		app.editorMode = cell.type;
+		app.editorCell = { x, y };
+		app.showCodeEditor = true;
+		return;
+	}
+	app.inputInitialValue = seed !== undefined ? seed : (cell?.value ?? '');
+	app.showInput = true;
+}
+
+/** Grid-level keys (Quadratic's onKeyDown chain). Returns true if handled. */
+export function keyboardGrid(e: KeyboardEvent): boolean {
+	const mod = e.metaKey || e.ctrlKey;
+	const key = e.key;
+
+	// format painter (e.code because Option+letter types special chars on mac)
+	if (mod && e.altKey && e.code === 'KeyC') {
+		copyFormat();
+		return true;
+	}
+	if (mod && e.altKey && e.code === 'KeyV') {
+		pasteFormat();
+		return true;
+	}
+
+	// clipboard
+	if (mod && e.shiftKey && key.toLowerCase() === 'c') {
+		void copySelectionAsPng();
+		return true;
+	}
+	if (mod && e.shiftKey && key.toLowerCase() === 'e') {
+		downloadSelectionAsCsv();
+		return true;
+	}
+	if (mod && key.toLowerCase() === 'c') {
+		void copySelection(false);
+		return true;
+	}
+	if (mod && key.toLowerCase() === 'x') {
+		void copySelection(true);
+		return true;
+	}
+	if (mod && key.toLowerCase() === 'v') {
+		void pasteFromClipboard();
+		return true;
+	}
+
+	// fill
+	if (mod && key.toLowerCase() === 'd' && !e.shiftKey) {
+		void fillDown();
+		return true;
+	}
+	if (mod && key.toLowerCase() === 'r' && !e.shiftKey) {
+		void fillRight();
+		return true;
+	}
+
+	// undo/redo
+	if (mod && key.toLowerCase() === 'z') {
+		if (e.shiftKey) redo();
+		else undo();
+		return true;
+	}
+	if (e.ctrlKey && key.toLowerCase() === 'y') {
+		redo();
+		return true;
+	}
+
+	// select all
+	if (mod && key.toLowerCase() === 'a') {
+		const bounds = sheetController.sheet.getBounds();
+		if (bounds) {
+			gotoCell(bounds.left, bounds.top, { x1: bounds.right, y1: bounds.bottom });
+		}
+		return true;
+	}
+
+	// navigation
+	if (key === 'ArrowUp') {
+		if (mod) jumpCursor(0, -1, e.shiftKey);
+		else moveCursor(0, -1, e.shiftKey);
+		return true;
+	}
+	if (key === 'ArrowDown') {
+		if (mod) jumpCursor(0, 1, e.shiftKey);
+		else moveCursor(0, 1, e.shiftKey);
+		return true;
+	}
+	if (key === 'ArrowLeft') {
+		if (mod) jumpCursor(-1, 0, e.shiftKey);
+		else moveCursor(-1, 0, e.shiftKey);
+		return true;
+	}
+	if (key === 'ArrowRight') {
+		if (mod) jumpCursor(1, 0, e.shiftKey);
+		else moveCursor(1, 0, e.shiftKey);
+		return true;
+	}
+
+	if (mod) return false;
+
+	if (key === 'Tab') {
+		moveCursor(e.shiftKey ? -1 : 1, 0, false);
+		return true;
+	}
+
+	if (key === 'Backspace' || key === 'Delete') {
+		const { x0, y0, x1, y1 } = getSelectionRect();
+		void deleteCellsInRect(x0, y0, x1, y1);
+		return true;
+	}
+
+	if (key === 'Enter') {
+		openCellEditor();
+		return true;
+	}
+
+	if (key === '/' || key === '=') {
+		const { x, y } = app.cursorPosition;
+		const cell = sheetController.sheet.getCell(x, y);
+		if (cell && isCodeCellType(cell.type)) {
+			app.editorMode = cell.type;
+			app.editorCell = { x, y };
+			app.showCodeEditor = true;
+		} else if (cell) {
+			app.inputInitialValue = cell.value;
+			app.showInput = true;
+		} else if (key === '=') {
+			// modern behavior: = starts a formula directly
+			app.editorCell = { x, y };
+			app.editorMode = 'FORMULA';
+			app.showCodeEditor = true;
+		} else {
+			app.editorCell = { x, y };
+			app.editorMode = 'PYTHON';
+			app.showCellTypeMenu = true;
+		}
+		return true;
+	}
+
+	if (ALLOWED_FIRST_CHARS.test(key)) {
+		openCellEditor(key);
+		return true;
+	}
+
+	return false;
+}
+
+export function handleKeyDown(e: KeyboardEvent): void {
+	// modals/inputs own their keys
+	const target = e.target as HTMLElement;
+	const inField =
+		target instanceof HTMLInputElement ||
+		target instanceof HTMLTextAreaElement ||
+		target?.isContentEditable;
+
+	if (keyboardViewport(e)) {
+		e.preventDefault();
+		return;
+	}
+	if (inField || anyModalOpen()) return;
+	if (keyboardGrid(e)) {
+		e.preventDefault();
+	}
+}
+````

@@ -1,0 +1,15 @@
+{
+  "title": "lib",
+  "pages": [
+    "components",
+    "core",
+    "files",
+    "formulas",
+    "grid",
+    "helpers",
+    "javascript",
+    "python",
+    "index.ts",
+    "state.svelte.ts"
+  ]
+}

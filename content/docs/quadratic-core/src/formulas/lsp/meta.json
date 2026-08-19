@@ -1,0 +1,7 @@
+{
+  "title": "lsp",
+  "pages": [
+    "mod.rs",
+    "types.rs"
+  ]
+}

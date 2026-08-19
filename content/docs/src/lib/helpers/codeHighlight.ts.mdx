@@ -1,0 +1,302 @@
+---
+title: "codeHighlight.ts"
+description: "Minimal tokenizers for editor and hover-card syntax highlighting. Each produces a flat token stream whose concatenated text is exactly the input, so a highli…"
+source: "src/lib/helpers/codeHighlight.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts codeHighlight.ts -n
+/** Minimal tokenizers for editor and hover-card syntax highlighting.
+ *
+ * Each produces a flat token stream whose concatenated text is exactly the
+ * input, so a highlighted <pre> stays glyph-for-glyph aligned with the
+ * transparent textarea layered on top of it. JS regex literals are not
+ * recognized (indistinguishable from division without a parser) and render
+ * as plain text; Python f-string interpolations render as string.
+ */
+
+export type CodeTokenType =
+	| 'keyword'
+	| 'literal'
+	| 'string'
+	| 'number'
+	| 'comment'
+	| 'function'
+	| 'plain';
+
+export interface CodeToken {
+	type: CodeTokenType;
+	text: string;
+}
+
+/** Picks the tokenizer for a code cell / editor language. Formulas reuse the
+ * JS tokenizer: strings, numbers, and call-shaped identifiers cover formula
+ * syntax well. */
+export function tokenizeCode(
+	lang: 'FORMULA' | 'PYTHON' | 'JAVASCRIPT',
+	code: string
+): CodeToken[] {
+	return lang === 'PYTHON' ? tokenizePython(code) : tokenizeJs(code);
+}
+
+/** Token accumulator that coalesces consecutive plain text into one token. */
+class TokenSink {
+	tokens: CodeToken[] = [];
+	private plain = '';
+
+	flush(): void {
+		if (this.plain) {
+			this.tokens.push({ type: 'plain', text: this.plain });
+			this.plain = '';
+		}
+	}
+	push(type: CodeTokenType, text: string): void {
+		if (!text) return;
+		this.flush();
+		this.tokens.push({ type, text });
+	}
+	pushPlain(text: string): void {
+		this.plain += text;
+	}
+	pushAll(tokens: CodeToken[]): void {
+		this.flush();
+		this.tokens.push(...tokens);
+	}
+	done(): CodeToken[] {
+		this.flush();
+		return this.tokens;
+	}
+}
+
+const skipInlineSpace = (code: string, i: number, step: 1 | -1): number => {
+	while (i >= 0 && i < code.length && (code[i] === ' ' || code[i] === '\t')) i += step;
+	return i;
+};
+
+// ---------------------------------------------------------------- JavaScript
+
+const JS_KEYWORDS = new Set(
+	(
+		'async await break case catch class const continue debugger default delete do else ' +
+		'export extends finally for function if import in instanceof let new of return ' +
+		'static super switch this throw try typeof var void while with yield'
+	).split(' ')
+);
+
+const JS_LITERALS = new Set(['true', 'false', 'null', 'undefined', 'NaN', 'Infinity']);
+
+const JS_IDENT_START = /[A-Za-z_$]/;
+const JS_IDENT_PART = /[A-Za-z0-9_$]/;
+const JS_NUMBER =
+	/^(?:0[xX][0-9a-fA-F]+n?|0[bB][01]+n?|0[oO][0-7]+n?|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?n?|\.\d+(?:[eE][+-]?\d+)?)/;
+
+export function tokenizeJs(code: string): CodeToken[] {
+	const out = new TokenSink();
+	const n = code.length;
+	let i = 0;
+	while (i < n) {
+		const ch = code[i];
+		const next = code[i + 1];
+
+		if (ch === '/' && next === '/') {
+			let j = code.indexOf('\n', i);
+			if (j === -1) j = n;
+			out.push('comment', code.slice(i, j));
+			i = j;
+			continue;
+		}
+
+		if (ch === '/' && next === '*') {
+			const end = code.indexOf('*/', i + 2);
+			const j = end === -1 ? n : end + 2;
+			out.push('comment', code.slice(i, j));
+			i = j;
+			continue;
+		}
+
+		// single/double-quoted string; unterminated ones stop at the newline
+		if (ch === '"' || ch === "'") {
+			let j = i + 1;
+			while (j < n && code[j] !== ch && code[j] !== '\n') {
+				if (code[j] === '\\') j++;
+				j++;
+			}
+			if (j < n && code[j] === ch) j++;
+			out.push('string', code.slice(i, j));
+			i = j;
+			continue;
+		}
+
+		// template literal; ${…} interpolations are tokenized as code (brace
+		// matching is a naive depth count, so a brace inside a nested string
+		// can cut an interpolation short — harmless for highlighting)
+		if (ch === '`') {
+			let seg = i;
+			let j = i + 1;
+			while (j < n) {
+				const c = code[j];
+				if (c === '\\') {
+					j += 2;
+					continue;
+				}
+				if (c === '`') {
+					j++;
+					break;
+				}
+				if (c === '$' && code[j + 1] === '{') {
+					out.push('string', code.slice(seg, j));
+					out.push('plain', '${');
+					let depth = 1;
+					let k = j + 2;
+					while (k < n && depth > 0) {
+						if (code[k] === '{') depth++;
+						else if (code[k] === '}') depth--;
+						k++;
+					}
+					const closed = depth === 0;
+					out.pushAll(tokenizeJs(code.slice(j + 2, closed ? k - 1 : k)));
+					if (closed) out.push('plain', '}');
+					j = k;
+					seg = j;
+					continue;
+				}
+				j++;
+			}
+			out.push('string', code.slice(seg, Math.min(j, n)));
+			i = j;
+			continue;
+		}
+
+		if (JS_IDENT_START.test(ch)) {
+			let j = i + 1;
+			while (j < n && JS_IDENT_PART.test(code[j])) j++;
+			const word = code.slice(i, j);
+			// dotted property access is never a keyword: `a.new`, `q.delete`
+			const afterDot = code[skipInlineSpace(code, i - 1, -1)] === '.';
+			const isCall = code[skipInlineSpace(code, j, 1)] === '(';
+			if (!afterDot && JS_KEYWORDS.has(word)) out.push('keyword', word);
+			else if (!afterDot && JS_LITERALS.has(word)) out.push('literal', word);
+			else if (isCall) out.push('function', word);
+			else out.pushPlain(word);
+			i = j;
+			continue;
+		}
+
+		if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(next ?? ''))) {
+			const m = JS_NUMBER.exec(code.slice(i));
+			if (m) {
+				out.push('number', m[0]);
+				i += m[0].length;
+				continue;
+			}
+		}
+
+		out.pushPlain(ch);
+		i++;
+	}
+	return out.done();
+}
+
+// -------------------------------------------------------------------- Python
+
+const PY_KEYWORDS = new Set(
+	(
+		'and as assert async await break class continue def del elif else except finally for ' +
+		'from global if import in is lambda nonlocal not or pass raise return try while with yield'
+	).split(' ')
+);
+
+const PY_LITERALS = new Set(['True', 'False', 'None']);
+
+const PY_IDENT_START = /[A-Za-z_]/;
+const PY_IDENT_PART = /[A-Za-z0-9_]/;
+const PY_NUMBER =
+	/^(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][+-]?\d+)?[jJ]?|\.\d[\d_]*(?:[eE][+-]?\d+)?[jJ]?)/;
+
+/** Consumes a Python string starting at its quote; returns the end index.
+ * Handles ''' and """ triples; unterminated single-quoted strings stop at
+ * the newline. */
+function scanPyString(code: string, quoteAt: number): number {
+	const n = code.length;
+	const q = code[quoteAt];
+	const triple = code.slice(quoteAt, quoteAt + 3) === q + q + q;
+	let j = quoteAt + (triple ? 3 : 1);
+	while (j < n) {
+		const c = code[j];
+		if (c === '\\') {
+			j += 2;
+			continue;
+		}
+		if (triple) {
+			if (c === q && code.slice(j, j + 3) === q + q + q) return j + 3;
+		} else {
+			if (c === q) return j + 1;
+			if (c === '\n') return j;
+		}
+		j++;
+	}
+	return n;
+}
+
+export function tokenizePython(code: string): CodeToken[] {
+	const out = new TokenSink();
+	const n = code.length;
+	let i = 0;
+	while (i < n) {
+		const ch = code[i];
+
+		if (ch === '#') {
+			let j = code.indexOf('\n', i);
+			if (j === -1) j = n;
+			out.push('comment', code.slice(i, j));
+			i = j;
+			continue;
+		}
+
+		if (ch === '"' || ch === "'") {
+			const j = scanPyString(code, i);
+			out.push('string', code.slice(i, j));
+			i = j;
+			continue;
+		}
+
+		if (PY_IDENT_START.test(ch)) {
+			let j = i + 1;
+			while (j < n && PY_IDENT_PART.test(code[j])) j++;
+			const word = code.slice(i, j);
+			// string prefix: f'…', rb"…", …
+			if ((code[j] === '"' || code[j] === "'") && /^[rbufRBUF]{1,2}$/.test(word)) {
+				const end = scanPyString(code, j);
+				out.push('string', code.slice(i, end));
+				i = end;
+				continue;
+			}
+			const afterDot = code[skipInlineSpace(code, i - 1, -1)] === '.';
+			const isCall = code[skipInlineSpace(code, j, 1)] === '(';
+			if (!afterDot && PY_KEYWORDS.has(word)) out.push('keyword', word);
+			else if (!afterDot && PY_LITERALS.has(word)) out.push('literal', word);
+			else if (isCall) out.push('function', word);
+			else out.pushPlain(word);
+			i = j;
+			continue;
+		}
+
+		if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(code[i + 1] ?? ''))) {
+			const m = PY_NUMBER.exec(code.slice(i));
+			if (m) {
+				out.push('number', m[0]);
+				i += m[0].length;
+				continue;
+			}
+		}
+
+		out.pushPlain(ch);
+		i++;
+	}
+	return out.done();
+}
+````

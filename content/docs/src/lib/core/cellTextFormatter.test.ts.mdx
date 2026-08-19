@@ -1,0 +1,84 @@
+---
+title: "cellTextFormatter.test.ts"
+description: "Unit tests for cellTextFormatter.ts."
+source: "src/lib/core/cellTextFormatter.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts cellTextFormatter.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { formatCellValue, isNumericValue } from './cellTextFormatter';
+import type { Cell, CellFormat } from './types';
+
+function cell(value: string): Cell {
+	return { x: 0, y: 0, type: 'TEXT', value, last_modified: '' };
+}
+
+function fmt(textFormat: CellFormat['textFormat']): CellFormat {
+	return { x: 0, y: 0, textFormat };
+}
+
+describe('formatCellValue', () => {
+	it('passes raw values through without a format', () => {
+		expect(formatCellValue(cell('hello'), undefined)).toBe('hello');
+		expect(formatCellValue(cell('1234.5'), { x: 0, y: 0, bold: true })).toBe('1234.5');
+	});
+
+	it('returns empty for missing cells', () => {
+		expect(formatCellValue(undefined, undefined)).toBe('');
+	});
+
+	it('formats NUMBER with grouping and decimals', () => {
+		expect(formatCellValue(cell('1234.5'), fmt({ type: 'NUMBER', decimalPlaces: 2 }))).toBe(
+			'1,234.50'
+		);
+	});
+
+	it('formats CURRENCY with its symbol', () => {
+		expect(
+			formatCellValue(
+				cell('1234.5'),
+				fmt({ type: 'CURRENCY', display: 'CURRENCY', symbol: '$', decimalPlaces: 2 })
+			)
+		).toBe('$1,234.50');
+		expect(
+			formatCellValue(
+				cell('2'),
+				fmt({ type: 'CURRENCY', display: 'CURRENCY', symbol: '€', decimalPlaces: 0 })
+			)
+		).toBe('€2');
+	});
+
+	it('formats PERCENTAGE by scaling ×100', () => {
+		expect(formatCellValue(cell('0.25'), fmt({ type: 'PERCENTAGE', decimalPlaces: 1 }))).toBe(
+			'25%'
+		);
+	});
+
+	it('formats EXPONENTIAL', () => {
+		expect(formatCellValue(cell('1234.5'), fmt({ type: 'EXPONENTIAL', decimalPlaces: 2 }))).toBe(
+			'1.23e+3'
+		);
+	});
+
+	it('leaves non-numeric values alone even with a numeric format', () => {
+		expect(formatCellValue(cell('hello'), fmt({ type: 'NUMBER', decimalPlaces: 2 }))).toBe(
+			'hello'
+		);
+		expect(formatCellValue(cell(''), fmt({ type: 'CURRENCY', display: 'CURRENCY' }))).toBe('');
+	});
+});
+
+describe('isNumericValue', () => {
+	it('accepts numbers and rejects text and blanks', () => {
+		expect(isNumericValue('42')).toBe(true);
+		expect(isNumericValue('-1.5e3')).toBe(true);
+		expect(isNumericValue('abc')).toBe(false);
+		expect(isNumericValue('  ')).toBe(false);
+	});
+});
+````

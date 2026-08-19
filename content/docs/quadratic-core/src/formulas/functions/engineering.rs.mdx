@@ -1,0 +1,185 @@
+---
+title: "engineering.rs"
+description: "Engineering functions, backported from the modern quadratic-core: bitwise operations plus the DELTA/GESTEP comparators. The complex-number, Bessel, and CONVE…"
+source: "quadratic-core/src/formulas/functions/engineering.rs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````rust engineering.rs -n
+//! Engineering functions, backported from the modern quadratic-core:
+//! bitwise operations plus the DELTA/GESTEP comparators. The complex-number,
+//! Bessel, and CONVERT families remain unported (stretch goals).
+
+use super::*;
+
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "Engineering functions",
+    docs: "Bitwise functions accept integers from 0 up to 2^48.\n\n",
+    get_functions,
+};
+
+/// Bitwise operands must be non-negative and below 2^48 (Excel's limit).
+const MAX_BITWISE: i64 = 1 << 48;
+
+fn bit_operand(v: &Spanned<Value>) -> FormulaResult<i64> {
+    let n = v.to_integer()?;
+    if !(0..MAX_BITWISE).contains(&n) {
+        return Err(FormulaErrorMsg::Expected {
+            expected: "integer between 0 and 2^48".into(),
+            got: Some(n.to_string().into()),
+        }
+        .with_span(v.span));
+    }
+    Ok(n)
+}
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "BITAND",
+            arg_completion: "${1:a}, ${2:b}",
+            usages: &["a, b"],
+            examples: &["BITAND(13, 25)"],
+            doc: "Returns the bitwise AND of two non-negative integers.",
+            eval: util::array_mapped(|[a, b]| Ok(Value::Number(
+                (bit_operand(&a)? & bit_operand(&b)?) as f64
+            ))),
+        },
+        FormulaFunction {
+            name: "BITOR",
+            arg_completion: "${1:a}, ${2:b}",
+            usages: &["a, b"],
+            examples: &["BITOR(5, 3)"],
+            doc: "Returns the bitwise OR of two non-negative integers.",
+            eval: util::array_mapped(|[a, b]| Ok(Value::Number(
+                (bit_operand(&a)? | bit_operand(&b)?) as f64
+            ))),
+        },
+        FormulaFunction {
+            name: "BITXOR",
+            arg_completion: "${1:a}, ${2:b}",
+            usages: &["a, b"],
+            examples: &["BITXOR(5, 3)"],
+            doc: "Returns the bitwise XOR of two non-negative integers.",
+            eval: util::array_mapped(|[a, b]| Ok(Value::Number(
+                (bit_operand(&a)? ^ bit_operand(&b)?) as f64
+            ))),
+        },
+        FormulaFunction {
+            name: "BITLSHIFT",
+            arg_completion: "${1:number}, ${2:shift}",
+            usages: &["number, shift"],
+            examples: &["BITLSHIFT(4, 2)"],
+            doc: "Shifts a number left by `shift` bits (right when negative). \
+                  `shift` must be between −53 and 53.",
+            eval: util::array_mapped(|[n, shift]| bit_shift(&n, &shift, 1)),
+        },
+        FormulaFunction {
+            name: "BITRSHIFT",
+            arg_completion: "${1:number}, ${2:shift}",
+            usages: &["number, shift"],
+            examples: &["BITRSHIFT(16, 2)"],
+            doc: "Shifts a number right by `shift` bits (left when negative). \
+                  `shift` must be between −53 and 53.",
+            eval: util::array_mapped(|[n, shift]| bit_shift(&n, &shift, -1)),
+        },
+        FormulaFunction {
+            name: "DELTA",
+            arg_completion: "${1:a}",
+            usages: &["a", "a, b"],
+            examples: &["DELTA(5, 5)", "DELTA(3)"],
+            doc: "Tests whether two numbers are equal: 1 when equal, else 0. \
+                  `b` defaults to 0.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(first), second, None) = (a.next(), a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let x = first.to_number()?;
+                let y = second.map_or(Ok(0.0), |v| v.to_number())?;
+                Ok(Value::Number(if (x - y).abs() < f64::EPSILON { 1.0 } else { 0.0 }))
+            }),
+        },
+        FormulaFunction {
+            name: "GESTEP",
+            arg_completion: "${1:number}",
+            usages: &["number", "number, step"],
+            examples: &["GESTEP(5, 4)", "GESTEP(-1)"],
+            doc: "Returns 1 when `number` ≥ `step` (default 0), else 0.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(first), second, None) = (a.next(), a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let x = first.to_number()?;
+                let step = second.map_or(Ok(0.0), |v| v.to_number())?;
+                Ok(Value::Number(if x >= step { 1.0 } else { 0.0 }))
+            }),
+        },
+    ]
+}
+
+fn bit_shift(n: &Spanned<Value>, shift: &Spanned<Value>, direction: i64) -> FormulaResult {
+    let value = bit_operand(n)?;
+    let raw_shift = shift.to_integer()?;
+    if !(-53..=53).contains(&raw_shift) {
+        return Err(FormulaErrorMsg::Expected {
+            expected: "shift between -53 and 53".into(),
+            got: Some(raw_shift.to_string().into()),
+        }
+        .with_span(shift.span));
+    }
+    let amount = raw_shift * direction;
+    let result = if amount >= 0 {
+        value.checked_shl(amount as u32).unwrap_or(0)
+    } else {
+        value >> ((-amount) as u32)
+    };
+    Ok(Value::Number(result as f64))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::formulas::tests::*;
+
+    fn eval(s: &str) -> String {
+        eval_to_string(&mut NoGrid, s)
+    }
+
+    #[test]
+    fn test_bitwise() {
+        assert_eq!("9", eval("BITAND(13, 25)"));
+        assert_eq!("7", eval("BITOR(5, 3)"));
+        assert_eq!("6", eval("BITXOR(5, 3)"));
+        assert_eq!("16", eval("BITLSHIFT(4, 2)"));
+        assert_eq!("4", eval("BITRSHIFT(16, 2)"));
+        assert_eq!("4", eval("BITLSHIFT(16, -2)"));
+    }
+
+    #[test]
+    fn test_bitwise_errors() {
+        assert!(crate::formulas::tests::eval(&mut NoGrid, "BITAND(-1, 3)").is_err());
+        assert!(crate::formulas::tests::eval(&mut NoGrid, "BITLSHIFT(1, 60)").is_err());
+    }
+
+    #[test]
+    fn test_delta_gestep() {
+        assert_eq!("1", eval("DELTA(5, 5)"));
+        assert_eq!("0", eval("DELTA(5, 4)"));
+        assert_eq!("0", eval("DELTA(3)"));
+        assert_eq!("1", eval("DELTA(0)"));
+        assert_eq!("1", eval("GESTEP(5, 4)"));
+        assert_eq!("0", eval("GESTEP(3, 4)"));
+        assert_eq!("0", eval("GESTEP(-1)"));
+        assert_eq!("1", eval("GESTEP(0)"));
+    }
+}
+````

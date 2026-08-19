@@ -1,0 +1,370 @@
+---
+title: "datetime.rs"
+description: "Excel-style date and time functions over ISO-string values, built on Hinnant civil-calendar math with no external date crates"
+source: "quadratic-core/src/formulas/functions/datetime.rs"
+full: true
+---
+
+This module is the "Date & time functions" category of the formula engine.
+Unlike the modern quadratic-core, which has first-class Date/Time/DateTime
+values, this engine's values are only strings and numbers — so dates travel as
+ISO strings (`2026-08-06`), times as `14:30:00`, and all calendar arithmetic
+is done by hand using Howard Hinnant's civil-calendar algorithms, with no
+external date crates.
+
+Like every sibling in this directory, the module exports a `CATEGORY`
+constant whose `get_functions` pointer produces the actual
+`FormulaFunction` values; [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs)
+collects all categories into the global `ALL_FUNCTIONS` map that the
+evaluator consults by uppercase name.
+
+<Scrollycoding>
+
+## !!steps One category, twenty-three functions
+
+The `CATEGORY` constant is the module's registration point: a name, docs for
+the formula editor, and a `get_functions` pointer. Each entry in the returned
+vector is a `FormulaFunction` bundling the name, autocomplete snippet,
+usage strings, docs, and an `eval` closure. `TODAY` shows the simplest shape:
+`util::pure_fn` wraps a closure over the raw argument list, which here just
+asserts zero arguments and formats the current date.
+
+```rust ! datetime.rs
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "Date & time functions",
+    docs: "Dates are ISO strings like `2026-08-06`; times are `14:30:00`. \
+           `M/D/YYYY`, `D.M.YYYY`, and `YYYY/M/D` inputs are also accepted.\n\n",
+    get_functions,
+};
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "TODAY",
+            arg_completion: "",
+            usages: &[""],
+            examples: &["TODAY()"],
+            doc: "Returns the current date, like `2026-08-06`.",
+            // !mark
+            eval: util::pure_fn(|args| {
+                if !args.inner.is_empty() {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(args.span));
+                }
+                let (y, m, d, ..) = current_datetime();
+                Ok(Value::String(format_date(y, m, d)))
+            }),
+        },
+        // ...
+    ]
+}
+```
+
+## !!steps Civil-calendar math, no crates
+
+All date arithmetic reduces to a single integer: days since 1970-01-01.
+`days_from_civil` and `civil_from_days` are Hinnant's classic algorithms,
+which treat March as the first month of the year (so leap days land at the
+*end* of the internal year) and work in 400-year eras of exactly 146097
+days. Every function below converts to day numbers, does plain integer math,
+and converts back.
+
+```rust ! datetime.rs
+/// Days since 1970-01-01 (Hinnant's `days_from_civil`).
+pub(super) fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = ((m + 9) % 12) as i64; // Mar=0 .. Feb=11
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    // !mark
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+```
+
+## !!steps Four input formats, one parser
+
+`parse_date_str` accepts ISO dashes, slashes (disambiguated by whether the
+first field looks like a year), and EU-style dots. It then *validates*, not
+normalizes: month must be 1–12 and the day must exist in that month, so
+`2026-02-29` is rejected rather than rolled over. Rollover is exclusively
+`DATE`'s job — parsed text must name a real day.
+
+```rust ! datetime.rs
+/// Parses a date from ISO (`2026-08-06`, `2026/8/6`), US (`8/6/2026`), or
+/// EU-dotted (`6.8.2026`) forms. Returns (year, month, day).
+pub(super) fn parse_date_str(s: &str) -> Option<(i64, u32, u32)> {
+    let s = s.trim();
+    let (y, m, d) = if let Some(v) = split_ints(s, '-').filter(|v| v.len() == 3) {
+        (v[0], v[1], v[2])
+    } else if let Some(v) = split_ints(s, '/').filter(|v| v.len() == 3) {
+        // !mark(1:5)
+        if v[0] >= 1000 {
+            (v[0], v[1], v[2]) // YYYY/M/D
+        } else {
+            (v[2], v[0], v[1]) // M/D/YYYY
+        }
+    } else if let Some(v) = split_ints(s, '.').filter(|v| v.len() == 3) {
+        (v[2], v[1], v[0]) // D.M.YYYY
+    } else {
+        return None;
+    };
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    let (m, d_max) = (m as u32, days_in_month(y, m as u32) as i64);
+    if !(1..=d_max).contains(&d) {
+        return None;
+    }
+    Some((y, m, d as u32))
+}
+```
+
+## !!steps Coercing arguments to days and times
+
+Every date argument goes through `arg_to_days`, which stringifies the value
+and parses it (a datetime string's time part is simply dropped).
+`arg_to_time` tries harder: a bare time string, then the time half of a
+datetime, and finally an Excel-style *fraction of a day* — so `0.5` means
+noon. The `rem_euclid(1.0)` keeps only the fractional part, and rounding to
+whole seconds happens before splitting into h/m/s.
+
+```rust ! datetime.rs
+/// Extracts a date (days since epoch) from an argument.
+fn arg_to_days(v: &Spanned<Value>) -> FormulaResult<i64> {
+    let s = v.inner.to_string();
+    match parse_datetime_str(&s) {
+        Some(((y, m, d), _)) => Ok(days_from_civil(y, m, d)),
+        None => Err(expected_date(v)),
+    }
+}
+
+/// Extracts (h, m, s) from a time/datetime string or a fraction-of-day number.
+fn arg_to_time(v: &Spanned<Value>) -> FormulaResult<(u32, u32, u32)> {
+    let s = v.inner.to_string();
+    if let Some(t) = parse_time_str(&s) {
+        return Ok(t);
+    }
+    if let Some((_, Some(t))) = parse_datetime_str(&s) {
+        return Ok(t);
+    }
+    if let Ok(n) = v.inner.to_number() {
+        // Excel-style fraction of a day
+        // !mark
+        let secs = ((n.rem_euclid(1.0)) * 86400.0).round() as u32 % 86400;
+        return Ok((secs / 3600, secs % 3600 / 60, secs % 60));
+    }
+    Err(FormulaErrorMsg::Expected {
+        expected: "time (e.g. 14:30:00)".into(),
+        got: Some(s.into()),
+    }
+    .with_span(v.span))
+}
+```
+
+## !!steps Rollover versus clamping
+
+Two different out-of-range policies coexist, both Excel-faithful.
+`normalized_date` backs `DATE` and lets month and day over- or underflow:
+month 13 rolls into the next year, day 0 into the previous month. In
+contrast, `edate_days` backs `EDATE` and `EOMONTH`: it shifts by whole
+months and *clamps* the day to the target month's length, so one month after
+`2026-08-31` is `2026-09-30`, not October 1st. With `end_of_month` set it
+ignores the day entirely and lands on the month's last day.
+
+```rust ! datetime.rs
+/// `DATE`-style normalization: month/day may over- or underflow.
+fn normalized_date(y: i64, m: i64, d: i64) -> (i64, u32, u32) {
+    let months0 = y * 12 + (m - 1);
+    let ny = months0.div_euclid(12);
+    let nm = (months0.rem_euclid(12) + 1) as u32;
+    // !mark
+    civil_from_days(days_from_civil(ny, nm, 1) + d - 1)
+}
+
+fn edate_days(days: i64, months: i64, end_of_month: bool) -> i64 {
+    let (y, m, d) = civil_from_days(days);
+    let months0 = y * 12 + (m as i64 - 1) + months;
+    let ny = months0.div_euclid(12);
+    let nm = (months0.rem_euclid(12) + 1) as u32;
+    let nd = if end_of_month {
+        days_in_month(ny, nm)
+    } else {
+        // !mark
+        d.min(days_in_month(ny, nm))
+    };
+    days_from_civil(ny, nm, nd)
+}
+```
+
+## !!steps The 30-360 day-count conventions
+
+`days360` implements the financial fiction of a year with twelve 30-day
+months, in both flavors: the European method simply caps day 31 at 30 on
+either end, while the US (NASD) method snaps a start date on the *last day
+of its month* (which catches February) to 30, and only then adjusts the end
+date. `YEARFRAC` builds on this — basis 0 and 4 divide `days360` by 360,
+bases 2 and 3 divide actual days by 360 or 365, and basis 1 divides by the
+average real length of the calendar years the interval spans.
+
+```rust ! datetime.rs
+fn days360(start: i64, end: i64, european: bool) -> i64 {
+    let (sy, sm, mut sd) = civil_from_days(start);
+    let (ey, em, mut ed) = civil_from_days(end);
+    if european {
+        if sd == 31 {
+            sd = 30;
+        }
+        if ed == 31 {
+            ed = 30;
+        }
+    } else {
+        // US/NASD method
+        // !mark
+        let s_last = sd == days_in_month(sy, sm);
+        if s_last {
+            sd = 30;
+        }
+        if ed == 31 && sd == 30 {
+            ed = 30;
+        }
+    }
+    (ey - sy) * 360 + (em as i64 - sm as i64) * 30 + (ed as i64 - sd as i64)
+}
+```
+
+## !!steps DATEDIF and its six units
+
+`DATEDIF` is the subtlest function in the file. `"D"`, `"M"`, and `"Y"` are
+straightforward (whole months come from `datediff_months`, which decrements
+when the end day-of-month hasn't been reached yet). The odd ones are the
+partial units: `"MD"` counts days ignoring months and years, borrowing the
+length of the month *before the end date* when the end day is smaller than
+the start day; `"YD"` anchors the start date into the end date's year —
+stepping back a year if that anchor overshoots — and counts days from there.
+
+```rust ! datetime.rs
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let [start, end, unit] = args_n::<3>(args)?;
+                let s = arg_to_days(&start)?;
+                let e = arg_to_days(&end)?;
+                // ...
+                let (sy, sm, sd) = civil_from_days(s);
+                let (ey, em, ed) = civil_from_days(e);
+                let result = match unit.to_string().to_uppercase().as_str() {
+                    "D" => e - s,
+                    "M" => datediff_months(s, e),
+                    "Y" => datediff_months(s, e) / 12,
+                    "YM" => datediff_months(s, e) % 12,
+                    "MD" => {
+                        if ed as i64 >= sd as i64 {
+                            ed as i64 - sd as i64
+                        } else {
+                            // !mark(1:2)
+                            let (py, pm) = if em == 1 { (ey - 1, 12) } else { (ey, em - 1) };
+                            days_in_month(py, pm) as i64 - sd as i64 + ed as i64
+                        }
+                    }
+                    "YD" => {
+                        let mut anchor = days_from_civil(ey, sm, sd.min(days_in_month(ey, sm)));
+                        if anchor > e {
+                            anchor = days_from_civil(ey - 1, sm, sd.min(days_in_month(ey - 1, sm)));
+                        }
+                        e - anchor
+                    }
+                    // ...
+                };
+                Ok(Value::Number(result as f64))
+            }),
+```
+
+## !!steps Working days by brute force
+
+`NETWORKDAYS` and `WORKDAY` share two tiny helpers: `is_weekend` (ISO
+weekday 6 or 7) and `holidays_set`, which flattens an optional array
+argument into a list of day numbers, silently skipping blanks. Neither
+function does anything clever with calendars — `WORKDAY` just steps one day
+at a time in the right direction, counting only days that are neither
+weekend nor holiday, which is plenty fast for spreadsheet-scale inputs.
+
+```rust ! datetime.rs
+fn is_weekend(days: i64) -> bool {
+    iso_weekday(days) >= 6
+}
+
+// ...
+            eval: util::pure_fn(|args| {
+                let (start, days_arg, holidays) = two_or_three_args(args)?;
+                let mut day = arg_to_days(&start)?;
+                let mut remaining = days_arg.to_integer()?;
+                let holidays = holidays_set(holidays.as_ref());
+                let step = if remaining >= 0 { 1 } else { -1 };
+                remaining = remaining.abs();
+                while remaining > 0 {
+                    day += step;
+                    // !mark
+                    if !is_weekend(day) && !holidays.contains(&day) {
+                        remaining -= 1;
+                    }
+                }
+                let (y, m, d) = civil_from_days(day);
+                Ok(Value::String(format_date(y, m, d)))
+            }),
+```
+
+</Scrollycoding>
+
+## Implemented functions
+
+| Name | Purpose |
+| --- | --- |
+| TODAY | Current date as an ISO string |
+| NOW | Current date and time |
+| DATE | Build a date from year, month, day; out-of-range parts roll over |
+| TIME | Build a time from hour, minute, second; wraps at 24 hours |
+| YEAR | Year of a date |
+| MONTH | Month of a date (1–12) |
+| DAY | Day of the month (1–31) |
+| HOUR | Hour of a time (0–23) |
+| MINUTE | Minute of a time (0–59) |
+| SECOND | Second of a time (0–59) |
+| DATEVALUE | Parse date text in any accepted format and return ISO form |
+| TIMEVALUE | Parse time text and return `HH:MM:SS` |
+| EDATE | Date a number of months away, clamped to the target month length |
+| EOMONTH | Last day of the month a number of months away |
+| DAYS | Days from start date to end date |
+| DAYS360 | Day count on a 360-day year, US (NASD) or European method |
+| DATEDIF | Date difference in units Y, M, D, MD, YM, or YD |
+| WEEKDAY | Day of the week with three numbering schemes |
+| ISOWEEKNUM | ISO 8601 week number |
+| WEEKNUM | Week number with Sunday, Monday, or ISO week starts |
+| NETWORKDAYS | Working days between two dates, skipping weekends and holidays |
+| WORKDAY | Date a number of working days away, skipping weekends and holidays |
+| YEARFRAC | Fraction of a year between two dates under bases 0–4 |
+
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs); the
+`pure_fn` and `array_mapped` wrappers used by every `eval` come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), and
+the `Value` type they produce is defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs).
+[financial.rs](/docs/quadratic-core/src/formulas/functions/financial.rs)
+imports `days_from_civil` and `parse_date_str` from here to price cash flows
+on arbitrary dates in `XNPV` and `XIRR`.

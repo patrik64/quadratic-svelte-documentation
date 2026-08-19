@@ -1,0 +1,389 @@
+---
+title: "database.rs"
+description: "Database (D-) functions, backported from the modern quadratic-core. The database is a range whose first row holds column headers; the criteria range repeats …"
+source: "quadratic-core/src/formulas/functions/database.rs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````rust database.rs -n
+//! Database (D-) functions, backported from the modern quadratic-core.
+//!
+//! The database is a range whose first row holds column headers; the
+//! criteria range repeats headers in its first row with condition rows
+//! below. Criteria rows are OR'd together; the columns within one row are
+//! AND'd. Each condition cell goes through the same `Criterion` parser the
+//! `*IF` functions use, so Excel-style comparison strings (`">=10"`,
+//! `"<>x"`) and `*`/`?` wildcards with `~` escapes work everywhere.
+
+use smallvec::SmallVec;
+
+use super::statistics::Criterion;
+use super::*;
+
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "Database functions",
+    docs: "The database and criteria ranges both start with a header row.\n\n",
+    get_functions,
+};
+
+type Row = SmallVec<[Value; 1]>;
+
+fn is_blank(v: &Value) -> bool {
+    matches!(v, Value::String(s) if s.trim().is_empty())
+}
+
+fn to_rows(v: Spanned<Value>) -> FormulaResult<Vec<Row>> {
+    let span = v.span;
+    let rows = v.inner.into_array();
+    let width = rows.first().map_or(0, |r| r.len());
+    if rows.iter().any(|r| r.len() != width) {
+        return Err(FormulaErrorMsg::NonRectangularArray.with_span(span));
+    }
+    Ok(rows)
+}
+
+fn header_index(headers: &Row, name: &str) -> Option<usize> {
+    let lower = name.trim().to_lowercase();
+    headers.iter().position(|h| h.to_string().trim().to_lowercase() == lower)
+}
+
+/// Resolves `field` (1-based column number or header name) to a column index.
+fn field_column(headers: &Row, field: &Spanned<Value>) -> FormulaResult<usize> {
+    if let Ok(n) = field.inner.to_number() {
+        let col = n as i64;
+        if col < 1 || col as usize > headers.len() {
+            return Err(FormulaErrorMsg::IndexOutOfBounds.with_span(field.span));
+        }
+        return Ok(col as usize - 1);
+    }
+    header_index(headers, &field.inner.to_string()).ok_or_else(|| {
+        FormulaErrorMsg::Expected {
+            expected: "a column header from the database range".into(),
+            got: Some(field.inner.to_string().into()),
+        }
+        .with_span(field.span)
+    })
+}
+
+/// Returns the field-column values of database rows matching the criteria.
+fn matching_values(
+    database: Spanned<Value>,
+    field: &Spanned<Value>,
+    criteria: Spanned<Value>,
+) -> FormulaResult<Vec<Value>> {
+    let db_span = database.span;
+    let crit_span = criteria.span;
+    let db = to_rows(database)?;
+    let crit = to_rows(criteria)?;
+    let (Some(headers), Some(crit_headers)) = (db.first(), crit.first()) else {
+        return Err(FormulaErrorMsg::Expected {
+            expected: "a range with a header row".into(),
+            got: None,
+        }
+        .with_span(if db.is_empty() { db_span } else { crit_span }));
+    };
+    let col = field_column(headers, field)?;
+
+    // resolve each criteria column to a database column once, and parse the
+    // condition cells once
+    let crit_cols: Vec<Option<usize>> = crit_headers
+        .iter()
+        .map(|h| header_index(headers, &h.to_string()))
+        .collect();
+
+    let mut out = Vec::new();
+    for row in db.iter().skip(1) {
+        let matched = crit.iter().skip(1).any(|crit_row| {
+            crit_row.iter().enumerate().all(|(i, cond)| {
+                if is_blank(cond) {
+                    return true;
+                }
+                let Some(Some(db_col)) = crit_cols.get(i) else {
+                    return true; // criteria column not in the database: ignore
+                };
+                let value = row.get(*db_col).cloned().unwrap_or(Value::String(String::new()));
+                Criterion::parse(&cond.to_string()).matches(&value)
+            })
+        });
+        // a criteria range with no condition rows matches everything
+        let matched = matched || crit.len() <= 1;
+        if matched {
+            if let Some(v) = row.get(col) {
+                out.push(v.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn matching_numbers(
+    database: Spanned<Value>,
+    field: &Spanned<Value>,
+    criteria: Spanned<Value>,
+) -> FormulaResult<Vec<f64>> {
+    Ok(matching_values(database, field, criteria)?
+        .iter()
+        .filter(|v| !is_blank(v))
+        .filter_map(|v| v.to_number().ok())
+        .collect())
+}
+
+/// Unpacks the fixed (database, field, criteria) argument triple.
+fn d_args(
+    args: Spanned<Vec<Spanned<Value>>>,
+) -> FormulaResult<(Spanned<Value>, Spanned<Value>, Spanned<Value>)> {
+    let span = args.span;
+    let mut a = args.inner.into_iter();
+    let (Some(db), Some(field), Some(crit), None) = (a.next(), a.next(), a.next(), a.next())
+    else {
+        return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+    };
+    Ok((db, field, crit))
+}
+
+/// Builds one D-function over the matched numeric values.
+macro_rules! d_number_fn {
+    ($name:literal, $doc:literal, $example:literal, $agg:expr) => {
+        FormulaFunction {
+            name: $name,
+            arg_completion: "${1:database}, ${2:field}, ${3:criteria}",
+            usages: &["database, field, criteria"],
+            examples: &[$example],
+            doc: $doc,
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let (db, field, crit) = d_args(args)?;
+                let values = matching_numbers(db, &field, crit)?;
+                let agg: fn(Vec<f64>, crate::formulas::Span) -> FormulaResult = $agg;
+                agg(values, span)
+            }),
+        }
+    };
+}
+
+fn sample_variance(values: &[f64]) -> Option<f64> {
+    if values.len() < 2 {
+        return None;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    Some(values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / (n - 1.0))
+}
+
+fn population_variance(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    Some(values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n)
+}
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        d_number_fn!(
+            "DSUM",
+            "Adds the numbers in the field column of database records that match the criteria.",
+            "DSUM(A0:C10, \"Sales\", E0:F1)",
+            |v, _span| Ok(Value::Number(v.iter().sum()))
+        ),
+        d_number_fn!(
+            "DAVERAGE",
+            "Averages the numbers in the field column of database records that match the criteria.",
+            "DAVERAGE(A0:C10, \"Sales\", E0:F1)",
+            |v, span| {
+                if v.is_empty() {
+                    return Err(FormulaErrorMsg::DivideByZero.with_span(span));
+                }
+                Ok(Value::Number(v.iter().sum::<f64>() / v.len() as f64))
+            }
+        ),
+        d_number_fn!(
+            "DCOUNT",
+            "Counts the numeric cells in the field column of database records that match the criteria.",
+            "DCOUNT(A0:C10, \"Sales\", E0:F1)",
+            |v, _span| Ok(Value::Number(v.len() as f64))
+        ),
+        d_number_fn!(
+            "DMAX",
+            "Returns the largest number in the field column of matching records (0 when none match).",
+            "DMAX(A0:C10, \"Sales\", E0:F1)",
+            |v, _span| Ok(Value::Number(if v.is_empty() {
+                0.0
+            } else {
+                v.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            }))
+        ),
+        d_number_fn!(
+            "DMIN",
+            "Returns the smallest number in the field column of matching records (0 when none match).",
+            "DMIN(A0:C10, \"Sales\", E0:F1)",
+            |v, _span| Ok(Value::Number(if v.is_empty() {
+                0.0
+            } else {
+                v.iter().copied().fold(f64::INFINITY, f64::min)
+            }))
+        ),
+        d_number_fn!(
+            "DPRODUCT",
+            "Multiplies the numbers in the field column of matching records.",
+            "DPRODUCT(A0:C10, \"Sales\", E0:F1)",
+            |v, _span| Ok(Value::Number(v.iter().product()))
+        ),
+        d_number_fn!(
+            "DSTDEV",
+            "Estimates the standard deviation of a population sample from the matching records.",
+            "DSTDEV(A0:C10, \"Sales\", E0:F1)",
+            |v, span| sample_variance(&v)
+                .map(|var| Value::Number(var.sqrt()))
+                .ok_or_else(|| FormulaErrorMsg::DivideByZero.with_span(span))
+        ),
+        d_number_fn!(
+            "DSTDEVP",
+            "Calculates the standard deviation of an entire population from the matching records.",
+            "DSTDEVP(A0:C10, \"Sales\", E0:F1)",
+            |v, span| population_variance(&v)
+                .map(|var| Value::Number(var.sqrt()))
+                .ok_or_else(|| FormulaErrorMsg::DivideByZero.with_span(span))
+        ),
+        d_number_fn!(
+            "DVAR",
+            "Estimates the variance of a population sample from the matching records.",
+            "DVAR(A0:C10, \"Sales\", E0:F1)",
+            |v, span| sample_variance(&v)
+                .map(Value::Number)
+                .ok_or_else(|| FormulaErrorMsg::DivideByZero.with_span(span))
+        ),
+        d_number_fn!(
+            "DVARP",
+            "Calculates the variance of an entire population from the matching records.",
+            "DVARP(A0:C10, \"Sales\", E0:F1)",
+            |v, span| population_variance(&v)
+                .map(Value::Number)
+                .ok_or_else(|| FormulaErrorMsg::DivideByZero.with_span(span))
+        ),
+        FormulaFunction {
+            name: "DCOUNTA",
+            arg_completion: "${1:database}, ${2:field}, ${3:criteria}",
+            usages: &["database, field, criteria"],
+            examples: &["DCOUNTA(A0:C10, \"Name\", E0:F1)"],
+            doc: "Counts the non-blank cells in the field column of database \
+                  records that match the criteria.",
+            eval: util::pure_fn(|args| {
+                let (db, field, crit) = d_args(args)?;
+                let values = matching_values(db, &field, crit)?;
+                Ok(Value::Number(values.iter().filter(|v| !is_blank(v)).count() as f64))
+            }),
+        },
+        FormulaFunction {
+            name: "DGET",
+            arg_completion: "${1:database}, ${2:field}, ${3:criteria}",
+            usages: &["database, field, criteria"],
+            examples: &["DGET(A0:C10, \"Price\", E0:F1)"],
+            doc: "Extracts the single value in the field column of the one \
+                  database record that matches the criteria; errors when no \
+                  record or more than one record matches.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let (db, field, crit) = d_args(args)?;
+                let mut values = matching_values(db, &field, crit)?;
+                match values.len() {
+                    1 => Ok(values.remove(0)),
+                    0 => Err(FormulaErrorMsg::Expected {
+                        expected: "exactly one matching record".into(),
+                        got: Some("none".into()),
+                    }
+                    .with_span(span)),
+                    n => Err(FormulaErrorMsg::Expected {
+                        expected: "exactly one matching record".into(),
+                        got: Some(n.to_string().into()),
+                    }
+                    .with_span(span)),
+                }
+            }),
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::formulas::tests::*;
+
+    // A1:C5 database (headers + 4 rows), E1:F3 criteria (headers + 2 rows)
+    fn eval_db(formula: &str) -> String {
+        let mut g = FnGrid(|pos| {
+            let db = [
+                ["Name", "Region", "Sales"],
+                ["Ada", "North", "100"],
+                ["Bob", "South", "200"],
+                ["Cid", "North", "300"],
+                ["Dee", "East", ""],
+            ];
+            let crit = [["Region", "Sales"], ["North", ""], ["East", ""]];
+            // rows shifted to start at y=1 so the eval cell (0,0) stays free
+            match (pos.x, pos.y) {
+                (0..=2, 1..=5) => Some(db[(pos.y - 1) as usize][pos.x as usize].to_string()),
+                (4..=5, 1..=3) => Some(crit[(pos.y - 1) as usize][(pos.x - 4) as usize].to_string()),
+                _ => None,
+            }
+        });
+        eval_to_string(&mut g, formula)
+    }
+
+    #[test]
+    fn test_database_aggregates() {
+        // North OR East rows: Ada 100, Cid 300, Dee (blank)
+        assert_eq!("400", eval_db("DSUM(A1:C5, \"Sales\", E1:F3)"));
+        assert_eq!("200", eval_db("DAVERAGE(A1:C5, \"Sales\", E1:F3)"));
+        assert_eq!("2", eval_db("DCOUNT(A1:C5, \"Sales\", E1:F3)"));
+        assert_eq!("3", eval_db("DCOUNTA(A1:C5, \"Name\", E1:F3)"));
+        assert_eq!("300", eval_db("DMAX(A1:C5, \"Sales\", E1:F3)"));
+        assert_eq!("100", eval_db("DMIN(A1:C5, \"Sales\", E1:F3)"));
+        assert_eq!("30000", eval_db("DPRODUCT(A1:C5, \"Sales\", E1:F3)"));
+    }
+
+    #[test]
+    fn test_database_field_forms() {
+        // field by 1-based number instead of header name
+        assert_eq!("400", eval_db("DSUM(A1:C5, 3, E1:F3)"));
+    }
+
+    #[test]
+    fn test_database_criteria_strings() {
+        // single criteria row with a comparison string
+        let formula = "DSUM(A1:C5, \"Sales\", {\"Sales\"; \">150\"})";
+        assert_eq!("500", eval_db(formula)); // 200 + 300
+    }
+
+    #[test]
+    fn test_dget() {
+        assert_eq!("Bob", eval_db("DGET(A1:C5, \"Name\", {\"Region\"; \"South\"})"));
+        // no match and multiple matches both error
+        assert!(
+            crate::formulas::tests::eval(
+                &mut FnGrid(|_| None),
+                "DGET({\"A\"; 1}, \"A\", {\"A\"; 2})"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_database_stats() {
+        // North rows only: 100, 300 → sample var 20000, stdev ~141.42
+        let var = eval_db("DVAR(A1:C5, \"Sales\", {\"Region\"; \"North\"})");
+        assert_eq!("20000", var);
+        let stdev: f64 = eval_db("DSTDEV(A1:C5, \"Sales\", {\"Region\"; \"North\"})")
+            .parse()
+            .unwrap();
+        assert!((stdev - 141.4213562).abs() < 1e-6);
+        assert_eq!("10000", eval_db("DVARP(A1:C5, \"Sales\", {\"Region\"; \"North\"})"));
+    }
+}
+````

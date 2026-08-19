@@ -1,0 +1,84 @@
+---
+title: "javascriptRunner.test.ts"
+description: "Unit tests for javascriptRunner.ts."
+source: "src/lib/javascript/javascriptRunner.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts javascriptRunner.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { runJavascript, transformImports } from './javascriptRunner';
+
+describe('transformImports', () => {
+	it('rewrites default imports', () => {
+		expect(transformImports("import Chart from 'https://esm.run/chart.js/auto';")).toBe(
+			"const { default: Chart } = await import('https://esm.run/chart.js/auto');"
+		);
+	});
+
+	it('rewrites named imports, including renames', () => {
+		expect(transformImports("import { min, max as maximum } from 'https://x/d.js'")).toBe(
+			"const { min, max: maximum } = await import('https://x/d.js');"
+		);
+	});
+
+	it('rewrites namespace imports', () => {
+		expect(transformImports('import * as d3 from "https://esm.run/d3";')).toBe(
+			'const d3 = await import("https://esm.run/d3");'
+		);
+	});
+
+	it('rewrites combined default + named imports', () => {
+		expect(transformImports("import Chart, { registerables } from 'https://x/c.js';")).toBe(
+			"const { default: Chart, registerables } = await import('https://x/c.js');"
+		);
+	});
+
+	it('rewrites combined default + namespace imports', () => {
+		expect(transformImports("import D, * as ns from 'https://x/c.js';")).toBe(
+			"const ns = await import('https://x/c.js'), D = ns.default;"
+		);
+	});
+
+	it('rewrites bare imports', () => {
+		expect(transformImports("import 'https://x/side-effect.js';")).toBe(
+			"await import('https://x/side-effect.js');"
+		);
+	});
+
+	it('preserves indentation, line count, and non-import lines', () => {
+		const code = "let a = 1;\n  import X from 'm';\nreturn a; // import X from 'm'";
+		const out = transformImports(code);
+		expect(out.split('\n').length).toBe(3);
+		expect(out).toContain("  const { default: X } = await import('m');");
+		expect(out).toContain("return a; // import X from 'm'");
+	});
+});
+
+describe('runJavascript', () => {
+	const noCells = () => undefined;
+
+	it('compiles static import syntax', async () => {
+		// Node's test VM has no dynamic-import callback, so execution fails
+		// here (in the browser it resolves); what matters is that the static
+		// import compiled instead of raising a SyntaxError
+		const result = await runJavascript(
+			"import X from 'data:text/javascript,export default 42';\nreturn X;",
+			{ x: 0, y: 0 },
+			noCells
+		);
+		expect(result.std_err ?? '').not.toMatch(/import statement|Unexpected/);
+	});
+
+	it('still returns plain values', async () => {
+		const result = await runJavascript('return 1 + 1;', { x: 0, y: 0 }, noCells);
+		expect(result.success).toBe(true);
+		expect(result.output_value).toBe('2');
+		expect(result.image_output).toBeUndefined();
+	});
+});
+````

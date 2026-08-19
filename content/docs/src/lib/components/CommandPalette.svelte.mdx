@@ -1,0 +1,270 @@
+---
+title: "CommandPalette.svelte"
+description: "The CommandPalette Svelte component."
+source: "src/lib/components/CommandPalette.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte CommandPalette.svelte -n
+<script lang="ts">
+	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
+	import {
+		addSheet,
+		app,
+		changeDecimals,
+		deleteCurrentSheet,
+		duplicateCurrentSheet,
+		insertTodayDate,
+		openCodeEditorAt,
+		switchSheetRelative,
+		copySelectionAsPng,
+		downloadSelectionAsCsv,
+		deleteColumns,
+		deleteRows,
+		insertColumn,
+		insertRow,
+		getSelectionRect,
+		rerunAllCode,
+		fillDown,
+		fillRight,
+		clearFormatting,
+		copySelection,
+		importCSVAt,
+		newFile,
+		pasteFromClipboard,
+		redo,
+		saveFile,
+		copyFormat,
+		pasteFormat,
+		setAlignment,
+		setBorders,
+		setTextFormat,
+		setWrapping,
+		toggleBold,
+		toggleItalic,
+		undo,
+		zoomIn,
+		zoomOut,
+		zoomTo100,
+		zoomToFit,
+		zoomToSelection
+	} from '../state.svelte';
+	import Modal from './Modal.svelte';
+
+	const C = KeyboardSymbols.Cmd;
+
+	interface Command {
+		group: string;
+		label: string;
+		shortcut?: string;
+		action: () => void;
+	}
+
+	function importCsvViaPicker(): void {
+		const input = document.createElement('input');
+		input.type = 'file';
+		input.accept = '.csv';
+		input.onchange = async () => {
+			const file = input.files?.[0];
+			if (file) await importCSVAt(await file.text(), app.cursorPosition);
+		};
+		input.click();
+	}
+
+	const commands: Command[] = [
+		{ group: 'File', label: 'File: New', action: newFile },
+		{ group: 'File', label: 'File: Open…', shortcut: `${C}O`, action: () => (app.showFileMenu = true) },
+		{ group: 'File', label: 'File: Examples…', action: () => (app.showFileMenu = true) },
+		{ group: 'File', label: 'File: Download local copy', action: saveFile },
+		{ group: 'Edit', label: 'Edit: Undo', shortcut: `${C}Z`, action: undo },
+		{ group: 'Edit', label: 'Edit: Redo', shortcut: `${C}⇧Z`, action: redo },
+		{ group: 'Edit', label: 'Edit: Cut', shortcut: `${C}X`, action: () => void copySelection(true) },
+		{ group: 'Edit', label: 'Edit: Copy', shortcut: `${C}C`, action: () => void copySelection(false) },
+		{ group: 'Edit', label: 'Edit: Paste', shortcut: `${C}V`, action: () => void pasteFromClipboard() },
+		{ group: 'Edit', label: 'Edit: Find in sheet', shortcut: `${C}F`, action: () => { app.searchAllSheets = false; app.showSearch = true; } },
+		{ group: 'Edit', label: 'Edit: Find in all sheets', shortcut: `${C}⇧F`, action: () => { app.searchAllSheets = true; app.showSearch = true; } },
+		{ group: 'Edit', label: 'Edit: Fill down', shortcut: `${C}D`, action: () => void fillDown() },
+		{ group: 'Edit', label: 'Edit: Fill right', shortcut: `${C}R`, action: () => void fillRight() },
+		{ group: 'Edit', label: 'Edit: Copy format', shortcut: `${C}⌥C`, action: copyFormat },
+		{ group: 'Edit', label: 'Edit: Paste format', shortcut: `${C}⌥V`, action: pasteFormat },
+		{ group: 'Edit', label: 'Edit: Go to cell', shortcut: `${C}G`, action: () => (app.showGoToMenu = true) },
+		{ group: 'Edit', label: 'Edit: Copy selection as PNG', shortcut: `${C}⇧C`, action: () => void copySelectionAsPng() },
+		{ group: 'File', label: 'File: Download as CSV', shortcut: `${C}⇧E`, action: downloadSelectionAsCsv },
+		{ group: 'View', label: 'View: Show row and column headings', action: () => (app.showHeadings = !app.showHeadings) },
+		{ group: 'View', label: 'View: Show grid axis', action: () => (app.showGridAxes = !app.showGridAxes) },
+		{ group: 'View', label: 'View: Show grid lines', action: () => (app.showGridLines = !app.showGridLines) },
+		{ group: 'View', label: 'View: Show code cell outlines', action: () => (app.showCellTypeOutlines = !app.showCellTypeOutlines) },
+		{ group: 'View', label: 'View: Show A1 notation on headings', action: () => (app.showA1Notation = !app.showA1Notation) },
+		{ group: 'View', label: 'View: Presentation mode', shortcut: `${C}.`, action: () => (app.presentationMode = !app.presentationMode) },
+		{ group: 'View', label: 'View: Zoom in', shortcut: `${C}+`, action: zoomIn },
+		{ group: 'View', label: 'View: Zoom out', shortcut: `${C}−`, action: zoomOut },
+		{ group: 'View', label: 'View: Zoom to selection', shortcut: `${C}8`, action: zoomToSelection },
+		{ group: 'View', label: 'View: Zoom to fit', shortcut: `${C}9`, action: zoomToFit },
+		{ group: 'View', label: 'View: Zoom to 100%', shortcut: `${C}0`, action: zoomTo100 },
+		{ group: 'Import', label: 'Import: CSV', action: importCsvViaPicker },
+		{ group: 'Insert', label: 'Insert: Python code', action: () => openCodeEditorAt('PYTHON') },
+		{ group: 'Insert', label: 'Insert: JavaScript code', action: () => openCodeEditorAt('JAVASCRIPT') },
+		{ group: 'Insert', label: 'Insert: Formula', shortcut: '=', action: () => openCodeEditorAt('FORMULA') },
+		{ group: 'Insert', label: "Insert: Today's date", shortcut: `${C};`, action: () => void insertTodayDate(false) },
+		{ group: 'Insert', label: 'Insert: Date and time', shortcut: `${C}⇧;`, action: () => void insertTodayDate(true) },
+		{ group: 'Insert', label: 'Insert: Column left', action: () => void insertColumn(getSelectionRect().x0) },
+		{ group: 'Insert', label: 'Insert: Column right', action: () => void insertColumn(getSelectionRect().x1 + 1) },
+		{ group: 'Insert', label: 'Insert: Row above', action: () => void insertRow(getSelectionRect().y0) },
+		{ group: 'Insert', label: 'Insert: Row below', action: () => void insertRow(getSelectionRect().y1 + 1) },
+		{ group: 'Edit', label: 'Edit: Delete column(s)', action: () => { const s = getSelectionRect(); void deleteColumns(s.x0, s.x1); } },
+		{ group: 'Edit', label: 'Edit: Delete row(s)', action: () => { const s = getSelectionRect(); void deleteRows(s.y0, s.y1); } },
+		{ group: 'Sheet', label: 'Sheet: New sheet', action: addSheet },
+		{ group: 'Sheet', label: 'Sheet: Duplicate sheet', action: duplicateCurrentSheet },
+		{ group: 'Sheet', label: 'Sheet: Delete sheet', action: deleteCurrentSheet },
+		{ group: 'Sheet', label: 'Sheet: Next sheet', shortcut: '⌥→', action: () => switchSheetRelative(1) },
+		{ group: 'Sheet', label: 'Sheet: Previous sheet', shortcut: '⌥←', action: () => switchSheetRelative(-1) },
+		{ group: 'Text', label: 'Text: Bold', shortcut: `${C}B`, action: toggleBold },
+		{ group: 'Text', label: 'Text: Italic', shortcut: `${C}I`, action: toggleItalic },
+		{ group: 'Text', label: 'Text: Align left', action: () => setAlignment('left') },
+		{ group: 'Text', label: 'Text: Align center', action: () => setAlignment('center') },
+		{ group: 'Text', label: 'Text: Align right', action: () => setAlignment('right') },
+		{
+			group: 'View',
+			label: 'View: Toggle dark theme',
+			action: () => (app.theme = app.theme === 'dark' ? 'light' : 'dark')
+		},
+		{ group: 'Text', label: 'Text: Overflow (no wrap)', action: () => setWrapping(undefined) },
+		{ group: 'Text', label: 'Text: Wrap', action: () => setWrapping('wrap') },
+		{ group: 'Text', label: 'Text: Clip', action: () => setWrapping('clip') },
+		{ group: 'Format', label: 'Format: Plain text', action: () => setTextFormat(undefined) },
+		{ group: 'Format', label: 'Format: Number', action: () => setTextFormat({ type: 'NUMBER', decimalPlaces: 2 }) },
+		{ group: 'Format', label: 'Format: Currency', action: () => setTextFormat({ type: 'CURRENCY', display: 'CURRENCY', symbol: '$', decimalPlaces: 2 }) },
+		{ group: 'Format', label: 'Format: Percent', action: () => setTextFormat({ type: 'PERCENTAGE', decimalPlaces: 2 }) },
+		{ group: 'Format', label: 'Format: Scientific', action: () => setTextFormat({ type: 'EXPONENTIAL', decimalPlaces: 2 }) },
+		{ group: 'Format', label: 'Format: Increase decimals', action: () => changeDecimals(1) },
+		{ group: 'Format', label: 'Format: Decrease decimals', action: () => changeDecimals(-1) },
+		{ group: 'Format', label: 'Format: All borders', action: () => setBorders('all') },
+		{ group: 'Format', label: 'Format: Outer borders', action: () => setBorders('outer') },
+		{ group: 'Format', label: 'Format: Inner borders', action: () => setBorders('inner') },
+		{ group: 'Format', label: 'Format: Clear borders', action: () => setBorders('clear') },
+		{ group: 'Format', label: 'Format: Clear formatting', shortcut: `${C}\\`, action: clearFormatting },
+		{ group: 'Edit', label: 'Edit: Rerun all code', shortcut: `${C}⇧↵`, action: () => void rerunAllCode() },
+		{ group: 'Help', label: 'Help: Example files', action: () => (app.showFileMenu = true) },
+		{ group: 'Help', label: 'Help: Formula reference', action: () => (app.showFormulaDocs = true) },
+		{ group: 'Help', label: 'Help: Read the docs', action: () => window.open('https://docs.quadratichq.com', '_blank') }
+	];
+
+	let search = $state('');
+	let selectedIndex = $state(0);
+	let searchEl: HTMLInputElement | undefined = $state();
+	let listEl: HTMLDivElement | undefined = $state();
+
+	const filtered = $derived(
+		commands.filter((c) => c.label.toLowerCase().includes(search.toLowerCase()))
+	);
+
+	$effect(() => {
+		searchEl?.focus();
+	});
+	$effect(() => {
+		void search;
+		selectedIndex = 0;
+	});
+
+	function close(): void {
+		app.showCommandPalette = false;
+	}
+
+	function runCommand(cmd: Command): void {
+		close();
+		cmd.action();
+	}
+
+	function onKeyDown(e: KeyboardEvent): void {
+		e.stopPropagation();
+		if (e.key === 'Escape') close();
+		else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+			e.preventDefault();
+			const delta = e.key === 'ArrowDown' ? 1 : -1;
+			selectedIndex = (selectedIndex + delta + filtered.length) % Math.max(1, filtered.length);
+			listEl
+				?.querySelector(`[data-index="${selectedIndex}"]`)
+				?.scrollIntoView({ block: 'nearest' });
+		} else if (e.key === 'Enter') {
+			e.preventDefault();
+			const cmd = filtered[selectedIndex];
+			if (cmd) runCommand(cmd);
+		}
+	}
+</script>
+
+<Modal onclose={close}>
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div onkeydown={onKeyDown}>
+		<input
+			bind:this={searchEl}
+			bind:value={search}
+			class="search"
+			placeholder="Search menus and commands…"
+			spellcheck="false"
+		/>
+		<div class="list" bind:this={listEl}>
+			{#each filtered as cmd, i (cmd.label)}
+				<button
+					class="row"
+					class:selected={i === selectedIndex}
+					data-index={i}
+					onclick={() => runCommand(cmd)}
+					onmouseenter={() => (selectedIndex = i)}
+				>
+					<span>{cmd.label}</span>
+					{#if cmd.shortcut}<span class="shortcut">{cmd.shortcut}</span>{/if}
+				</button>
+			{:else}
+				<div class="empty">No matches</div>
+			{/each}
+		</div>
+	</div>
+</Modal>
+
+<style>
+	.search {
+		width: 100%;
+		border: none;
+		outline: none;
+		padding: 0.9rem 1rem;
+		font-size: 0.95rem;
+		border-bottom: 1px solid var(--border-light);
+		box-sizing: border-box;
+	}
+	.list {
+		overflow-y: auto;
+		max-height: 330px;
+		padding: 0.25rem 0;
+	}
+	.row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		width: 100%;
+		background: none;
+		border: none;
+		font: inherit;
+		font-size: 0.85rem;
+		padding: 0.45rem 1rem;
+		cursor: pointer;
+		text-align: left;
+	}
+	.row.selected {
+		background: var(--accent-soft);
+	}
+	.shortcut {
+		color: var(--faint-2);
+		font-size: 0.75rem;
+	}
+	.empty {
+		padding: 0.75rem 1rem;
+		color: var(--muted);
+		font-size: 0.85rem;
+	}
+</style>
+````

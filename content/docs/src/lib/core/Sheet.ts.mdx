@@ -1,0 +1,178 @@
+---
+title: "Sheet.ts"
+description: "Sparse spreadsheet model: cells, formats, and dependency edges."
+source: "src/lib/core/Sheet.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts Sheet.ts -n
+import { GridOffsets } from './GridOffsets';
+import {
+	coordKey,
+	parseCoordKey,
+	type Cell,
+	type CellFormat,
+	type Coordinate,
+	type GridFileData,
+	type Rect
+} from './types';
+
+/** Sparse spreadsheet model: cells, formats, and dependency edges. */
+export class Sheet {
+	name = 'Sheet1';
+	color: string | undefined; // SheetBar tab color (modern client feature)
+	gridOffsets = new GridOffsets();
+
+	private cells = new Map<string, Cell>();
+	private formats = new Map<string, CellFormat>();
+	/** dependency: key cell -> set of cells whose computation reads it */
+	private dependents = new Map<string, Set<string>>();
+
+	// ---------- cells ----------
+
+	getCell(x: number, y: number): Cell | undefined {
+		return this.cells.get(coordKey(x, y));
+	}
+
+	setCell(cell: Cell): void {
+		this.cells.set(coordKey(cell.x, cell.y), cell);
+	}
+
+	deleteCell(x: number, y: number): void {
+		this.cells.delete(coordKey(x, y));
+	}
+
+	getAllCells(): Cell[] {
+		return [...this.cells.values()];
+	}
+
+	getCellsInRect(rect: Rect): Cell[] {
+		const out: Cell[] = [];
+		for (const cell of this.cells.values()) {
+			if (cell.x >= rect.left && cell.x <= rect.right && cell.y >= rect.top && cell.y <= rect.bottom)
+				out.push(cell);
+		}
+		return out;
+	}
+
+	get cellCount(): number {
+		return this.cells.size;
+	}
+
+	// ---------- formats ----------
+
+	getFormat(x: number, y: number): CellFormat | undefined {
+		return this.formats.get(coordKey(x, y));
+	}
+
+	setFormat(x: number, y: number, update: Partial<CellFormat>): CellFormat {
+		const key = coordKey(x, y);
+		const existing = this.formats.get(key) ?? { x, y };
+		const merged: CellFormat = { ...existing, ...update, x, y };
+		// drop undefined entries so empty formats can be pruned
+		for (const k of Object.keys(merged) as (keyof CellFormat)[]) {
+			if (merged[k] === undefined) delete merged[k];
+		}
+		if (Object.keys(merged).length <= 2) this.formats.delete(key);
+		else this.formats.set(key, merged);
+		return merged;
+	}
+
+	clearFormat(x: number, y: number): void {
+		this.formats.delete(coordKey(x, y));
+	}
+
+	getAllFormats(): CellFormat[] {
+		return [...this.formats.values()];
+	}
+
+	// ---------- bounds ----------
+
+	/** Bounding rect of all content (cells + formats), or undefined when empty. */
+	getBounds(): Rect | undefined {
+		let bounds: Rect | undefined;
+		const extend = (x: number, y: number) => {
+			if (!bounds) bounds = { left: x, top: y, right: x, bottom: y };
+			else {
+				bounds.left = Math.min(bounds.left, x);
+				bounds.right = Math.max(bounds.right, x);
+				bounds.top = Math.min(bounds.top, y);
+				bounds.bottom = Math.max(bounds.bottom, y);
+			}
+		};
+		for (const c of this.cells.values()) extend(c.x, c.y);
+		for (const f of this.formats.values()) extend(f.x, f.y);
+		return bounds;
+	}
+
+	// ---------- dependency graph ----------
+
+	/** Record that `dependent` reads from each of `reads`. */
+	setDependencies(dependent: Coordinate, reads: Coordinate[]): void {
+		const depKey = coordKey(dependent.x, dependent.y);
+		// remove old edges pointing at this dependent
+		for (const set of this.dependents.values()) set.delete(depKey);
+		for (const r of reads) {
+			const key = coordKey(r.x, r.y);
+			let set = this.dependents.get(key);
+			if (!set) this.dependents.set(key, (set = new Set()));
+			set.add(depKey);
+		}
+		// prune empty sets
+		for (const [key, set] of this.dependents) if (set.size === 0) this.dependents.delete(key);
+	}
+
+	/** Cells whose computations read (x, y). */
+	getDependents(x: number, y: number): Coordinate[] {
+		const set = this.dependents.get(coordKey(x, y));
+		return set ? [...set].map(parseCoordKey) : [];
+	}
+
+	/** Re-derive the dependency graph from stored evaluation results (after undo/redo/import). */
+	rebuildDependencies(): void {
+		this.dependents.clear();
+		for (const cell of this.cells.values()) {
+			const accessed = cell.evaluation_result?.cells_accessed;
+			if (accessed && accessed.length > 0) {
+				this.setDependencies(
+					{ x: cell.x, y: cell.y },
+					accessed.map(([x, y]) => ({ x, y }))
+				);
+			}
+		}
+	}
+
+	// ---------- serialization ----------
+
+	export(): GridFileData {
+		return {
+			cells: this.getAllCells(),
+			formats: this.getAllFormats(),
+			columns: this.gridOffsets.exportColumns(),
+			rows: this.gridOffsets.exportRows(),
+			cell_dependency: JSON.stringify(
+				[...this.dependents.entries()].map(([k, v]) => [k, [...v]])
+			)
+		};
+	}
+
+	import(data: GridFileData): void {
+		this.cells.clear();
+		this.formats.clear();
+		this.dependents.clear();
+		for (const cell of data.cells) this.cells.set(coordKey(cell.x, cell.y), cell);
+		for (const format of data.formats) this.formats.set(coordKey(format.x, format.y), format);
+		this.gridOffsets.importHeadings(data.columns ?? [], data.rows ?? []);
+		try {
+			const parsed = JSON.parse(data.cell_dependency || '[]') as [string, string[]][];
+			for (const [k, v] of parsed) this.dependents.set(k, new Set(v));
+		} catch {
+			// dependency cache is re-derivable; ignore corrupt data
+		}
+	}
+}
+````

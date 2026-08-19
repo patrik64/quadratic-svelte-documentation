@@ -1,0 +1,153 @@
+---
+title: "sheetRefs.ts"
+description: "Cross-sheet references (`Sheet2!A1`, `'My Sheet'!A0:B2`) for formulas. The vendored Rust engine's CellRef is Copy and sheet-unaware; rather than refactor the…"
+source: "src/lib/formulas/sheetRefs.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts sheetRefs.ts -n
+// Cross-sheet references (`Sheet2!A1`, `'My Sheet'!A0:B2`) for formulas.
+//
+// The vendored Rust engine's CellRef is Copy and sheet-unaware; rather than
+// refactor the crate, qualified refs are resolved here at evaluation time:
+// single cells inline as literals and ranges as `{a, b; c, d}` array
+// literals (which the engine parses natively). The formula's stored text is
+// never changed — substitution happens on the way into eval only.
+
+import { parseCellRef } from '../core/a1';
+import type { Sheet } from '../core/Sheet';
+
+export interface SheetRef {
+	sheetName: string;
+	start: number; // span in the source, inclusive
+	end: number; // exclusive
+	x0: number;
+	y0: number;
+	x1: number;
+	y1: number;
+}
+
+const CELL = String.raw`\$?n?[A-Za-z]+\$?n?\d+`;
+const REF_RE = new RegExp(
+	// 'Quoted Name'!A1[:B2]  or  Plain_Name!A1[:B2]
+	String.raw`(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!(${CELL})(?::(${CELL}))?`,
+	'g'
+);
+
+/** Spans of string literals, so refs inside quotes are left alone. */
+function stringSpans(source: string): [number, number][] {
+	const spans: [number, number][] = [];
+	let i = 0;
+	while (i < source.length) {
+		const ch = source[i];
+		if (ch === '"' || ch === "'") {
+			const close = source.indexOf(ch, i + 1);
+			if (close === -1) {
+				spans.push([i, source.length]);
+				break;
+			}
+			spans.push([i, close + 1]);
+			i = close + 1;
+		} else i++;
+	}
+	return spans;
+}
+
+/** Finds sheet-qualified references outside string literals. */
+export function findSheetRefs(source: string): SheetRef[] {
+	const spans = stringSpans(source);
+	const inString = (at: number) => spans.some(([s, e]) => at > s && at < e);
+	const out: SheetRef[] = [];
+	for (const m of source.matchAll(REF_RE)) {
+		// skip refs inside string literals; a quoted sheet name's own span
+		// starts AT the match, so `inString` (strictly inside) spares it
+		if (inString(m.index)) continue;
+		const a = parseCellRef(m[3].replace(/\$/g, ''));
+		if (!a) continue;
+		const b = m[4] ? parseCellRef(m[4].replace(/\$/g, '')) : undefined;
+		if (m[4] && !b) continue;
+		out.push({
+			sheetName: m[1] ?? m[2],
+			start: m.index,
+			end: m.index + m[0].length,
+			x0: Math.min(a.x, b?.x ?? a.x),
+			y0: Math.min(a.y, b?.y ?? a.y),
+			x1: Math.max(a.x, b?.x ?? a.x),
+			y1: Math.max(a.y, b?.y ?? a.y)
+		});
+	}
+	return out;
+}
+
+/** Renders one cell value as a formula literal. */
+function valueLiteral(raw: string | undefined): string {
+	if (raw === undefined || raw === '') return '""';
+	if (raw.trim() !== '' && !Number.isNaN(Number(raw))) return raw.trim();
+	if (/^(true|false)$/i.test(raw)) return raw.toUpperCase();
+	// pick a quote character the value doesn't contain; drop it otherwise
+	if (!raw.includes('"')) return `"${raw}"`;
+	if (!raw.includes("'")) return `'${raw}'`;
+	return `"${raw.replace(/"/g, '')}"`;
+}
+
+/**
+ * Replaces every sheet-qualified reference with the referenced values.
+ * Unknown sheet names are left in place (the engine reports a parse error
+ * at that span, which is the honest outcome).
+ */
+export function substituteSheetRefs(
+	source: string,
+	resolveSheet: (name: string) => Sheet | undefined
+): { code: string; refs: SheetRef[] } {
+	const refs = findSheetRefs(source);
+	let code = source;
+	for (const ref of [...refs].reverse()) {
+		const sheet = resolveSheet(ref.sheetName);
+		if (!sheet) continue;
+		let literal: string;
+		if (ref.x0 === ref.x1 && ref.y0 === ref.y1) {
+			literal = valueLiteral(sheet.getCell(ref.x0, ref.y0)?.value);
+		} else {
+			const rows: string[] = [];
+			for (let y = ref.y0; y <= ref.y1; y++) {
+				const cols: string[] = [];
+				for (let x = ref.x0; x <= ref.x1; x++) {
+					cols.push(valueLiteral(sheet.getCell(x, y)?.value));
+				}
+				rows.push(cols.join(', '));
+			}
+			literal = `{${rows.join('; ')}}`;
+		}
+		code = code.slice(0, ref.start) + literal + code.slice(ref.end);
+	}
+	return { code, refs };
+}
+
+/**
+ * Masks sheet-qualified refs as quoted placholders so the Rust
+ * adjust/relocate passes (which are sheet-unaware) cannot rewrite their A1
+ * parts; `unmask` restores them afterwards.
+ */
+export function maskSheetRefs(source: string): {
+	masked: string;
+	unmask: (adjusted: string) => string;
+} {
+	const refs = findSheetRefs(source);
+	const originals: string[] = [];
+	let masked = source;
+	for (let i = refs.length - 1; i >= 0; i--) {
+		const ref = refs[i];
+		originals.unshift(source.slice(ref.start, ref.end));
+		masked = masked.slice(0, ref.start) + `"__XREF${i}__"` + masked.slice(ref.end);
+	}
+	return {
+		masked,
+		unmask: (adjusted) =>
+			adjusted.replace(/"__XREF(\d+)__"/g, (_, n) => originals[Number(n)] ?? '')
+	};
+}
+````

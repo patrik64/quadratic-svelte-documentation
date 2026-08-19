@@ -1,0 +1,8 @@
+{
+  "title": "routes",
+  "pages": [
+    "+layout.svelte",
+    "+layout.ts",
+    "+page.svelte"
+  ]
+}

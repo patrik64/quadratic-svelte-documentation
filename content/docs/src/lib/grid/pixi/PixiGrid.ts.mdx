@@ -1,0 +1,663 @@
+---
+title: "PixiGrid.ts"
+description: "Pixi.js grid engine — the port of Quadratic's gridGL/pixiApp. Display objects persist between frames; pan/zoom is a pure viewport transform, and layers redra…"
+source: "src/lib/grid/pixi/PixiGrid.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts PixiGrid.ts -n
+// Pixi.js grid engine — the port of Quadratic's gridGL/pixiApp.
+// Display objects persist between frames; pan/zoom is a pure viewport
+// transform, and layers redraw only when their dirty flag is set.
+
+import { Application, Container, Graphics, Rectangle, Sprite, Text, Texture } from 'pixi.js';
+import { Viewport } from 'pixi-viewport';
+import { formatCellValue } from '../../core/cellTextFormatter';
+import type { Sheet } from '../../core/Sheet';
+import { coordKey, type Coordinate } from '../../core/types';
+import {
+	colors,
+	editorModeColor,
+	gridLineAlpha,
+	setPixiTheme,
+	themeBackground,
+	type ThemeName
+} from '../colors';
+import { GridHeadings, refreshHeadingLabelStyle } from './GridHeadings';
+import { CELL_TEXT_MARGIN_LEFT, FONT_SIZE, measureWrapped } from './measureText';
+
+export interface GridUIState {
+	cursorPosition: Coordinate;
+	multiCursor?: { originPosition: Coordinate; terminalPosition: Coordinate };
+	showHeadings: boolean;
+	showGridAxes: boolean;
+	showGridLines: boolean;
+	showCellTypeOutlines: boolean;
+	showA1Notation: boolean;
+	presentationMode: boolean;
+	editorOpen: boolean;
+	editorMode: 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
+	editorCell: Coordinate;
+	inputOpen: boolean;
+	fillPreview?: { x0: number; y0: number; x1: number; y1: number };
+	refPreview?: { x0: number; y0: number; x1: number; y1: number };
+}
+
+const CULL_MARGIN_CELLS = 3;
+
+/** Rough luminance check for hex colors like `#ffe9b3`. */
+function isLightColor(hex: string): boolean {
+	const m = /^#([0-9a-f]{6})$/i.exec(hex);
+	if (!m) return false;
+	const n = parseInt(m[1], 16);
+	const r = (n >> 16) & 0xff;
+	const g = (n >> 8) & 0xff;
+	const b = n & 0xff;
+	return 0.299 * r + 0.587 * g + 0.114 * b > 150;
+}
+const MAX_VISIBLE_LABELS = 6000;
+// Text rasterization is the expensive step; cap creations per frame and
+// stream the rest in on subsequent frames so panning never blocks
+const LABEL_BUDGET_PER_FRAME = 250;
+
+interface CachedLabel {
+	text: Text;
+	sig: string;
+}
+
+export class PixiGrid {
+	app = new Application();
+	viewport!: Viewport;
+	headings!: GridHeadings;
+
+	dirtyViewport = true;
+	dirtyCells = true;
+	dirtyCursor = true;
+
+	/** Fires whenever the pixi viewport moves/zooms (drag, wheel, decelerate). */
+	onViewportChanged: (x: number, y: number, scale: number) => void = () => {};
+
+	private fills = new Graphics();
+	private gridLines = new Graphics();
+	private axes = new Graphics();
+	private borders = new Graphics();
+	private outlines = new Graphics();
+	private labelLayer = new Container();
+	private imageLayer = new Container();
+	private selectionGfx = new Graphics();
+	private labelCache = new Map<string, CachedLabel>();
+	// canvas outputs (charts), keyed by a cheap signature of the data URL
+	private imageTextures = new Map<string, Texture | 'loading'>();
+	private destroyed = false;
+
+	constructor(
+		private getSheet: () => Sheet,
+		private getState: () => GridUIState
+	) {}
+
+	async init(container: HTMLElement): Promise<void> {
+		await this.app.init({
+			background: '#ffffff',
+			antialias: true,
+			resolution: window.devicePixelRatio || 1,
+			autoDensity: true,
+			width: container.clientWidth || 800,
+			height: container.clientHeight || 600,
+			preference: 'webgl'
+		});
+		if (this.destroyed) return;
+		this.app.canvas.classList.add('grid-canvas');
+		container.appendChild(this.app.canvas);
+
+		this.viewport = new Viewport({
+			events: this.app.renderer.events,
+			screenWidth: container.clientWidth,
+			screenHeight: container.clientHeight,
+			ticker: this.app.ticker,
+			passiveWheel: false,
+			disableOnContextMenu: true
+		});
+		this.viewport
+			.drag({ pressDrag: true, keyToPress: ['Space'] })
+			.decelerate()
+			.pinch()
+			.wheel({ trackpadPinch: true, wheelZoom: false, percent: 1.5 })
+			.clampZoom({ minScale: 0.1, maxScale: 10 });
+
+		this.viewport.addChild(
+			this.fills,
+			this.gridLines,
+			this.axes,
+			this.borders, // above gridlines so cell borders paint over them
+			this.outlines,
+			this.labelLayer,
+			this.imageLayer, // charts cover cell text beneath them
+			this.selectionGfx
+		);
+		this.app.stage.addChild(this.viewport);
+
+		this.headings = new GridHeadings(this.getSheet, () => this.viewport);
+		this.app.stage.addChild(this.headings.container);
+
+		this.viewport.on('moved', this.handleMoved, this);
+		this.viewport.on('zoomed', this.handleMoved, this);
+
+		// cmd+wheel zooms (trackpad pinch arrives as ctrl+wheel and is handled
+		// by the pinch/wheel plugins); capture phase so the plugin never pans
+		this.app.canvas.addEventListener('wheel', this.handleMetaWheel, {
+			capture: true,
+			passive: false
+		});
+
+		this.app.ticker.add(this.update, this);
+	}
+
+	private handleMoved(): void {
+		this.dirtyViewport = true;
+		this.onViewportChanged(this.viewport.left, this.viewport.top, this.viewport.scale.x);
+	}
+
+	private handleMetaWheel = (e: WheelEvent): void => {
+		if (!e.metaKey || e.ctrlKey) return;
+		e.preventDefault();
+		e.stopImmediatePropagation();
+		const rect = this.app.canvas.getBoundingClientRect();
+		const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+		const factor = Math.pow(2, -e.deltaY * 0.01);
+		const newScale = Math.min(10, Math.max(0.1, this.viewport.scale.x * factor));
+		const world = this.viewport.toWorld(point.x, point.y);
+		this.viewport.setZoom(newScale, false);
+		this.viewport.moveCorner(world.x - point.x / newScale, world.y - point.y / newScale);
+		this.handleMoved();
+	};
+
+	/** Apply externally-driven viewport state (zoom buttons, goto, arrows). */
+	/** Switches the Pixi palette; dirtyCells destroys the label cache, so
+	 * every label re-rasterizes with the new font color. PNG export keeps a
+	 * white background regardless of theme. */
+	setTheme(theme: ThemeName): void {
+		setPixiTheme(theme);
+		refreshHeadingLabelStyle();
+		this.app.renderer.background.color = themeBackground(theme);
+		this.dirtyCells = true;
+		this.dirtyViewport = true;
+		this.dirtyCursor = true;
+	}
+
+	applyViewport(x: number, y: number, scale: number): void {
+		if (!this.viewport) return;
+		const eps = 0.0001;
+		if (
+			Math.abs(this.viewport.left - x) < eps &&
+			Math.abs(this.viewport.top - y) < eps &&
+			Math.abs(this.viewport.scale.x - scale) < eps
+		)
+			return;
+		this.viewport.setZoom(scale, false);
+		this.viewport.moveCorner(x, y);
+		this.dirtyViewport = true;
+	}
+
+	resize(width: number, height: number): void {
+		if (!this.viewport) return;
+		this.app.renderer.resize(width, height);
+		this.viewport.resize(width, height);
+		this.dirtyViewport = true;
+	}
+
+	/** Renders a world-space rectangle to a PNG blob (selection overlay hidden). */
+	async extractPng(x: number, y: number, w: number, h: number): Promise<Blob | null> {
+		if (!this.viewport) return null;
+		this.selectionGfx.visible = false;
+		try {
+			const canvas = this.app.renderer.extract.canvas({
+				target: this.viewport,
+				frame: new Rectangle(x, y, w, h),
+				resolution: 2,
+				clearColor: '#ffffff'
+			});
+			if ('convertToBlob' in canvas) {
+				return await (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' });
+			}
+			return await new Promise<Blob | null>((resolve) =>
+				(canvas as HTMLCanvasElement).toBlob((blob) => resolve(blob), 'image/png')
+			);
+		} catch {
+			return null;
+		} finally {
+			this.selectionGfx.visible = true;
+		}
+	}
+
+	destroy(): void {
+		this.destroyed = true;
+		this.app.canvas?.removeEventListener('wheel', this.handleMetaWheel, { capture: true });
+		this.app.destroy(true, { children: true, texture: true });
+	}
+
+	// ------------------------------------------------------------ frame update
+
+	private lastRange = { colStart: NaN, colEnd: NaN, rowStart: NaN, rowEnd: NaN };
+	private labelsPending = false;
+
+	private update(): void {
+		if (!this.viewport) return;
+		const state = this.getState();
+		if (this.dirtyCells) {
+			// content changed: throw away label cache so text/styles refresh
+			for (const cached of this.labelCache.values()) cached.text.destroy();
+			this.labelCache.clear();
+			this.labelLayer.removeChildren();
+			this.lastRange = { colStart: NaN, colEnd: NaN, rowStart: NaN, rowEnd: NaN };
+		}
+		const range = this.visibleRange();
+		const rangeChanged =
+			range.colStart !== this.lastRange.colStart ||
+			range.colEnd !== this.lastRange.colEnd ||
+			range.rowStart !== this.lastRange.rowStart ||
+			range.rowEnd !== this.lastRange.rowEnd;
+
+		// cell layers only when content or the visible cell range changed
+		if (this.dirtyCells || this.labelsPending || (this.dirtyViewport && rangeChanged)) {
+			this.drawCells(state, range);
+			this.lastRange = range;
+		}
+		if (this.dirtyCells || this.dirtyViewport) {
+			this.drawGridLines(state);
+			this.drawCursor(state);
+			this.headings.draw(this.headingsState(state));
+			this.dirtyCells = false;
+			this.dirtyViewport = false;
+			this.dirtyCursor = false;
+		} else if (this.dirtyCursor) {
+			this.drawCursor(state);
+			this.headings.draw(this.headingsState(state));
+			this.dirtyCursor = false;
+		}
+	}
+
+	private headingsState(state: GridUIState) {
+		return {
+			showHeadings: state.showHeadings,
+			showA1Notation: state.showA1Notation,
+			presentationMode: state.presentationMode,
+			selection: this.selectionRange(state)
+		};
+	}
+
+	private selectionRange(state: GridUIState): { x0: number; y0: number; x1: number; y1: number } {
+		if (state.multiCursor) {
+			const o = state.multiCursor.originPosition;
+			const t = state.multiCursor.terminalPosition;
+			return {
+				x0: Math.min(o.x, t.x),
+				y0: Math.min(o.y, t.y),
+				x1: Math.max(o.x, t.x),
+				y1: Math.max(o.y, t.y)
+			};
+		}
+		const c = state.cursorPosition;
+		return { x0: c.x, y0: c.y, x1: c.x, y1: c.y };
+	}
+
+	private visibleRange(): { colStart: number; colEnd: number; rowStart: number; rowEnd: number } {
+		const offsets = this.getSheet().gridOffsets;
+		const v = this.viewport;
+		return {
+			colStart: offsets.getColumnIndex(v.left) - CULL_MARGIN_CELLS,
+			colEnd: offsets.getColumnIndex(v.left + v.screenWidth / v.scale.x) + CULL_MARGIN_CELLS,
+			rowStart: offsets.getRowIndex(v.top) - CULL_MARGIN_CELLS,
+			rowEnd: offsets.getRowIndex(v.top + v.screenHeight / v.scale.y) + CULL_MARGIN_CELLS
+		};
+	}
+
+	// ------------------------------------------------------------ layers
+
+	private drawGridLines(state: GridUIState): void {
+		const g = this.gridLines;
+		g.clear();
+		const offsets = this.getSheet().gridOffsets;
+		const v = this.viewport;
+		const { colStart, colEnd, rowStart, rowEnd } = this.visibleRange();
+		const wLeft = v.left - 100;
+		const wTop = v.top - 100;
+		const wRight = v.left + v.screenWidth / v.scale.x + 100;
+		const wBottom = v.top + v.screenHeight / v.scale.y + 100;
+
+		if (state.showGridLines && !state.presentationMode) {
+			for (let x = colStart; x <= colEnd + 1; x++) {
+				const wx = offsets.getColumnX(x);
+				g.moveTo(wx, wTop).lineTo(wx, wBottom);
+			}
+			for (let y = rowStart; y <= rowEnd + 1; y++) {
+				const wy = offsets.getRowY(y);
+				g.moveTo(wLeft, wy).lineTo(wRight, wy);
+			}
+			// modern look: gridlines fade out as you zoom out
+			g.stroke({ color: colors.gridLines, alpha: 0.2 * gridLineAlpha(v.scale.x), pixelLine: true });
+		}
+
+		const a = this.axes;
+		a.clear();
+		if (state.showGridAxes && !state.presentationMode) {
+			a.moveTo(0, wTop).lineTo(0, wBottom).moveTo(wLeft, 0).lineTo(wRight, 0);
+			a.stroke({ color: 0x000000, alpha: 0.35, pixelLine: true });
+		}
+	}
+
+	private drawCells(state: GridUIState, range: ReturnType<PixiGrid['visibleRange']>): void {
+		const offsets = this.getSheet().gridOffsets;
+		const { colStart, colEnd, rowStart, rowEnd } = range;
+		this.labelsPending = false;
+		let creationBudget = LABEL_BUDGET_PER_FRAME;
+
+		// fills + borders from formats
+		const fills = this.fills;
+		fills.clear();
+		const borders = this.borders;
+		borders.clear();
+		for (const format of this.getSheet().getAllFormats()) {
+			if (!format.fillColor && !format.borders) continue;
+			if (format.x < colStart || format.x > colEnd || format.y < rowStart || format.y > rowEnd)
+				continue;
+			const r = offsets.getCellRect(format.x, format.y);
+			if (format.fillColor) fills.rect(r.x, r.y, r.w, r.h).fill(format.fillColor);
+			const b = format.borders;
+			if (b) {
+				if (b.top)
+					borders.moveTo(r.x, r.y).lineTo(r.x + r.w, r.y).stroke({ color: b.top, pixelLine: true });
+				if (b.bottom)
+					borders
+						.moveTo(r.x, r.y + r.h)
+						.lineTo(r.x + r.w, r.y + r.h)
+						.stroke({ color: b.bottom, pixelLine: true });
+				if (b.left)
+					borders.moveTo(r.x, r.y).lineTo(r.x, r.y + r.h).stroke({ color: b.left, pixelLine: true });
+				if (b.right)
+					borders
+						.moveTo(r.x + r.w, r.y)
+						.lineTo(r.x + r.w, r.y + r.h)
+						.stroke({ color: b.right, pixelLine: true });
+			}
+		}
+
+		// labels + code outlines
+		const outlines = this.outlines;
+		outlines.clear();
+		const cells = this.getSheet().getCellsInRect({
+			left: colStart - 40, // long text from offscreen cells can overflow in
+			top: rowStart,
+			right: colEnd,
+			bottom: rowEnd
+		});
+		let labelCount = 0;
+		for (const cell of cells) {
+			if (
+				state.showCellTypeOutlines &&
+				!state.presentationMode &&
+				cell.x >= colStart &&
+				cell.x <= colEnd
+			) {
+				let color: string | undefined;
+				if (cell.evaluation_result && cell.evaluation_result.success === false)
+					color = colors.cellColorError;
+				else if (cell.type === 'PYTHON') color = colors.cellColorUserPython;
+				else if (cell.type === 'FORMULA') color = colors.cellColorUserFormula;
+				else if (cell.type === 'JAVASCRIPT') color = colors.cellColorUserJavascript;
+				if (color) {
+					const r = offsets.getCellRect(cell.x, cell.y);
+					outlines.rect(r.x, r.y, r.w, r.h).stroke({ color, pixelLine: true });
+				}
+			}
+
+			if (labelCount >= MAX_VISIBLE_LABELS) continue;
+			const format = this.getSheet().getFormat(cell.x, cell.y);
+			const displayText = formatCellValue(cell, format);
+			if (displayText === '') continue;
+			labelCount++;
+
+			const key = coordKey(cell.x, cell.y);
+			const align = format?.alignment ?? 'left';
+			const wrapping = format?.wrapping;
+			const r = offsets.getCellRect(cell.x, cell.y);
+			// light fill colors keep dark text even in the dark theme
+			const fontColor =
+				format?.textColor ??
+				(format?.fillColor && isLightColor(format.fillColor)
+					? '#000000'
+					: colors.cellFontColor);
+			// wrapped layout depends on the cell's size, so resizes re-rasterize
+			const sizeSig = wrapping === 'wrap' ? `|${r.w}x${r.h}` : '';
+			const sig = `${displayText}|${format?.bold ? 'b' : ''}${format?.italic ? 'i' : ''}|${fontColor}|${align}|${wrapping ?? ''}${sizeSig}`;
+			let cached = this.labelCache.get(key);
+			if (cached && cached.sig !== sig) {
+				cached.text.destroy();
+				this.labelLayer.removeChild(cached.text);
+				cached = undefined;
+				this.labelCache.delete(key);
+			}
+			if (!cached && creationBudget <= 0) {
+				this.labelsPending = true; // stream the rest in on the next frame
+				continue;
+			}
+			if (!cached) {
+				creationBudget--;
+				let labelText = displayText;
+				if (wrapping === 'wrap') {
+					// pre-wrap into lines, keeping only what fits the row height
+					const m = measureWrapped(displayText, r.w, {
+						bold: format?.bold,
+						italic: format?.italic
+					});
+					const maxLines = Math.max(1, Math.floor((r.h - 2) / m.lineHeight));
+					labelText = m.lines.slice(0, maxLines).join('\n');
+				}
+				const text = new Text({
+					text: labelText,
+					style: {
+						fontFamily: 'OpenSans, sans-serif',
+						fontSize: FONT_SIZE,
+						fill: fontColor,
+						fontWeight: format?.bold ? 'bold' : 'normal',
+						fontStyle: format?.italic ? 'italic' : 'normal',
+						...(wrapping === 'wrap'
+							? { align: align as 'left' | 'center' | 'right' }
+							: {})
+					},
+					resolution: Math.max(2, window.devicePixelRatio || 1)
+				});
+
+				// overflow: truncate at the next non-empty cell (clip/wrap stay in cell)
+				const available = this.availableExtent(cell.x, cell.y, r.w, align, wrapping);
+				if (wrapping !== 'wrap' && text.width > available && displayText.length > 1) {
+					const keep = Math.max(1, Math.floor((displayText.length * available) / text.width));
+					text.text = displayText.slice(0, keep);
+				}
+
+				if (align === 'right') text.position.set(r.x + r.w - CELL_TEXT_MARGIN_LEFT - text.width, 0);
+				else if (align === 'center') text.position.set(r.x + (r.w - text.width) / 2, 0);
+				else text.position.set(r.x + CELL_TEXT_MARGIN_LEFT, 0);
+				text.y = r.y + (r.h - text.height) / 2 + 0.5;
+
+				this.labelLayer.addChild(text);
+				this.labelCache.set(key, { text, sig });
+			}
+		}
+
+		// drop labels that scrolled out of range (with margin so near-edge
+		// labels survive small pans without re-rasterizing)
+		const KEEP_MARGIN = 10;
+		for (const [key, cached] of this.labelCache) {
+			const comma = key.indexOf(',');
+			const x = Number(key.slice(0, comma));
+			const y = Number(key.slice(comma + 1));
+			if (
+				x < colStart - 40 - KEEP_MARGIN ||
+				x > colEnd + KEEP_MARGIN ||
+				y < rowStart - KEEP_MARGIN ||
+				y > rowEnd + KEEP_MARGIN
+			) {
+				cached.text.destroy();
+				this.labelLayer.removeChild(cached.text);
+				this.labelCache.delete(key);
+			}
+		}
+
+		this.drawImages(range);
+	}
+
+	/** Canvas outputs (charts) anchored at their cell's top-left, drawn at the
+	 * image's natural pixel size. The wide top/left margins keep an image
+	 * visible while its origin cell is scrolled off-screen. */
+	private drawImages(range: ReturnType<PixiGrid['visibleRange']>): void {
+		this.imageLayer.removeChildren();
+		const offsets = this.getSheet().gridOffsets;
+		const cells = this.getSheet().getCellsInRect({
+			left: range.colStart - 40,
+			top: range.rowStart - 60,
+			right: range.colEnd,
+			bottom: range.rowEnd
+		});
+		const used = new Set<string>();
+		for (const cell of cells) {
+			const url = cell.evaluation_result?.image_output;
+			if (!url) continue;
+			const key = `${url.length}:${url.slice(-40)}`;
+			used.add(key);
+			const tex = this.imageTextures.get(key);
+			if (tex === undefined) {
+				this.imageTextures.set(key, 'loading');
+				const img = new Image();
+				img.onload = () => {
+					if (this.destroyed) return;
+					this.imageTextures.set(key, Texture.from(img));
+					this.dirtyCells = true;
+				};
+				img.src = url;
+				continue;
+			}
+			if (tex === 'loading') continue;
+			const r = offsets.getCellRect(cell.x, cell.y);
+			const sprite = new Sprite(tex);
+			sprite.position.set(r.x, r.y);
+			this.imageLayer.addChild(sprite);
+		}
+		// evict textures for images that left the view or were re-run
+		for (const [key, tex] of this.imageTextures) {
+			if (!used.has(key) && tex !== 'loading') {
+				tex.destroy(true);
+				this.imageTextures.delete(key);
+			}
+		}
+	}
+
+	private availableExtent(
+		x: number,
+		y: number,
+		cellWidth: number,
+		align: string,
+		wrapping: string | undefined
+	): number {
+		let extent = cellWidth - CELL_TEXT_MARGIN_LEFT * 2;
+		if (wrapping === 'clip' || wrapping === 'wrap' || align === 'center') return extent;
+		const offsets = this.getSheet().gridOffsets;
+		const dir = align === 'right' ? -1 : 1;
+		for (let i = 1; i <= 40; i++) {
+			const neighbor = this.getSheet().getCell(x + dir * i, y);
+			if (neighbor && neighbor.value !== '') break;
+			extent += offsets.getColumnWidth(x + dir * i);
+		}
+		return extent;
+	}
+
+	private drawCursor(state: GridUIState): void {
+		const g = this.selectionGfx;
+		g.clear();
+		const offsets = this.getSheet().gridOffsets;
+		const scale = this.viewport.scale.x;
+
+		// multi-select
+		if (state.multiCursor) {
+			const sel = this.selectionRange(state);
+			const left = offsets.getColumnX(sel.x0);
+			const top = offsets.getRowY(sel.y0);
+			const right = offsets.getColumnX(sel.x1) + offsets.getColumnWidth(sel.x1);
+			const bottom = offsets.getRowY(sel.y1) + offsets.getRowHeight(sel.y1);
+			g.rect(left, top, right - left, bottom - top)
+				.fill({ color: colors.cursorCell, alpha: 0.1 })
+				.stroke({ color: colors.cursorCell, pixelLine: true });
+		}
+
+		// cursor box
+		const editorOnCursor =
+			state.editorOpen &&
+			state.editorCell.x === state.cursorPosition.x &&
+			state.editorCell.y === state.cursorPosition.y;
+		const r = offsets.getCellRect(state.cursorPosition.x, state.cursorPosition.y);
+		if (!editorOnCursor) {
+			const lw = 1.5 / scale;
+			if (state.multiCursor) {
+				g.rect(r.x, r.y, r.w, r.h).stroke({ color: colors.cursorCell, width: lw });
+			} else {
+				const gap = 5 / scale;
+				g.moveTo(r.x + r.w - gap, r.y + r.h)
+					.lineTo(r.x, r.y + r.h)
+					.lineTo(r.x, r.y)
+					.lineTo(r.x + r.w, r.y)
+					.lineTo(r.x + r.w, r.y + r.h - gap)
+					.stroke({ color: colors.cursorCell, width: lw });
+			}
+		}
+
+		// fill-handle indicator
+		if (!state.inputOpen && scale > 0.1) {
+			const endCell = state.multiCursor ? state.multiCursor.terminalPosition : state.cursorPosition;
+			const er = offsets.getCellRect(endCell.x, endCell.y);
+			const size = Math.max(8 / scale, 4);
+			g.rect(er.x + er.w - size / 2, er.y + er.h - size / 2, size, size).fill(
+				state.editorOpen && !state.multiCursor
+					? editorModeColor(state.editorMode)
+					: colors.cursorCell
+			);
+		}
+
+		// fill-handle drag preview
+		if (state.fillPreview) {
+			const p = state.fillPreview;
+			const left = offsets.getColumnX(p.x0);
+			const top = offsets.getRowY(p.y0);
+			const right = offsets.getColumnX(p.x1) + offsets.getColumnWidth(p.x1);
+			const bottom = offsets.getRowY(p.y1) + offsets.getRowHeight(p.y1);
+			g.rect(left, top, right - left, bottom - top)
+				.fill({ color: colors.cursorCell, alpha: 0.08 })
+				.stroke({ color: colors.cursorCell, alpha: 0.7, pixelLine: true });
+		}
+
+		// formula pointing-mode preview, tinted like the formula editor
+		if (state.refPreview) {
+			const p = state.refPreview;
+			const left = offsets.getColumnX(p.x0);
+			const top = offsets.getRowY(p.y0);
+			const right = offsets.getColumnX(p.x1) + offsets.getColumnWidth(p.x1);
+			const bottom = offsets.getRowY(p.y1) + offsets.getRowHeight(p.y1);
+			const color = editorModeColor('FORMULA');
+			g.rect(left, top, right - left, bottom - top)
+				.fill({ color, alpha: 0.06 })
+				.stroke({ color, width: 2 / scale });
+		}
+
+		// code editor cell highlight
+		if (state.editorOpen) {
+			const er = offsets.getCellRect(state.editorCell.x, state.editorCell.y);
+			g.rect(er.x, er.y, er.w, er.h).stroke({
+				color: editorModeColor(state.editorMode),
+				width: 2 / scale
+			});
+		}
+	}
+}
+````

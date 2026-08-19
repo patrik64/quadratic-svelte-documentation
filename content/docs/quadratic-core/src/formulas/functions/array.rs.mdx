@@ -1,0 +1,438 @@
+---
+title: "array.rs"
+description: "Array functions, backported from the modern quadratic-core's `array/operations.rs` and adapted to this engine's `Value::Array`. Cell values in this engine ar…"
+source: "quadratic-core/src/formulas/functions/array.rs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````rust array.rs -n
+//! Array functions, backported from the modern quadratic-core's
+//! `array/operations.rs` and adapted to this engine's `Value::Array`.
+//!
+//! Cell values in this engine are strings, so ordering and equality are
+//! coercion-aware: numeric strings compare as numbers, text compares
+//! case-insensitively, and blanks always sort last.
+
+use smallvec::SmallVec;
+
+use super::*;
+
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "Array functions",
+    docs: "Array results spill onto the grid from the formula's cell.\n\n",
+    get_functions,
+};
+
+const MAX_ARRAY_CELLS: i64 = 100_000;
+
+type Row = SmallVec<[Value; 1]>;
+
+/// Converts a value into rectangular rows (a scalar becomes 1×1).
+fn to_rows(v: Spanned<Value>) -> FormulaResult<Vec<Row>> {
+    let span = v.span;
+    let rows = v.inner.into_array();
+    let width = rows.first().map_or(0, |r| r.len());
+    if rows.iter().any(|r| r.len() != width) {
+        return Err(FormulaErrorMsg::NonRectangularArray.with_span(span));
+    }
+    Ok(rows)
+}
+
+/// Sort/equality classification: numbers < text < booleans, blanks last.
+enum Key {
+    Number(f64),
+    Text(String),
+    Bool(bool),
+    Blank,
+}
+
+fn classify(v: &Value) -> Key {
+    match v {
+        Value::Bool(b) => Key::Bool(*b),
+        Value::Number(n) => Key::Number(*n),
+        Value::String(s) if s.trim().is_empty() => Key::Blank,
+        other => match other.to_number() {
+            Ok(n) => Key::Number(n),
+            Err(_) => Key::Text(other.to_string().to_lowercase()),
+        },
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let rank = |k: &Key| match k {
+        Key::Number(_) => 0,
+        Key::Text(_) => 1,
+        Key::Bool(_) => 2,
+        Key::Blank => 3, // blanks sort last in both directions (handled by caller)
+    };
+    let (ka, kb) = (classify(a), classify(b));
+    match rank(&ka).cmp(&rank(&kb)) {
+        Ordering::Equal => match (ka, kb) {
+            (Key::Number(x), Key::Number(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            (Key::Text(x), Key::Text(y)) => x.cmp(&y),
+            (Key::Bool(x), Key::Bool(y)) => x.cmp(&y),
+            _ => Ordering::Equal,
+        },
+        other => other,
+    }
+}
+
+fn values_equivalent(a: &Value, b: &Value) -> bool {
+    match (classify(a), classify(b)) {
+        (Key::Number(x), Key::Number(y)) => x == y,
+        (Key::Text(x), Key::Text(y)) => x == y,
+        (Key::Bool(x), Key::Bool(y)) => x == y,
+        (Key::Blank, Key::Blank) => true,
+        _ => false,
+    }
+}
+
+/// Truthiness for FILTER's include mask: booleans, and numbers where 0 is
+/// false (matching how comparison results and cell data arrive here).
+fn truthy(v: &Spanned<Value>) -> FormulaResult<bool> {
+    if let Ok(b) = v.inner.to_bool() {
+        return Ok(b);
+    }
+    match &v.inner {
+        Value::String(s) if s.trim().is_empty() => Ok(false),
+        other => match other.to_number() {
+            Ok(n) => Ok(n != 0.0),
+            Err(_) => Err(FormulaErrorMsg::Expected {
+                expected: "boolean or number in the include mask".into(),
+                got: Some(other.type_name().into()),
+            }
+            .with_span(v.span)),
+        },
+    }
+}
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "TRANSPOSE",
+            arg_completion: "${1:array}",
+            usages: &["array"],
+            examples: &["TRANSPOSE(A0:B5)"],
+            doc: "Swaps the rows and columns of an array.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(array), None) = (a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let rows = to_rows(array)?;
+                let height = rows.len();
+                let width = rows.first().map_or(0, |r| r.len());
+                let mut out: Vec<Row> = Vec::with_capacity(width);
+                for x in 0..width {
+                    let mut row: Row = SmallVec::with_capacity(height);
+                    for y in 0..height {
+                        row.push(rows[y][x].clone());
+                    }
+                    out.push(row);
+                }
+                Ok(Value::Array(out))
+            }),
+        },
+        FormulaFunction {
+            name: "SEQUENCE",
+            arg_completion: "${1:rows}",
+            usages: &["rows", "rows, columns", "rows, columns, start, step"],
+            examples: &["SEQUENCE(5)", "SEQUENCE(3, 3, 0, 10)"],
+            doc: "Returns a rows×columns array of numbers counting from `start` \
+                  (default 1) by `step` (default 1), filling each row first.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let Some(rows_arg) = a.next() else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let rows = rows_arg.to_integer()?;
+                let cols = match a.next() {
+                    Some(v) => v.to_integer()?,
+                    None => 1,
+                };
+                let start = match a.next() {
+                    Some(v) => v.to_number()?,
+                    None => 1.0,
+                };
+                let step = match a.next() {
+                    Some(v) => v.to_number()?,
+                    None => 1.0,
+                };
+                if a.next().is_some() {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                }
+                if rows < 1 || cols < 1 || rows * cols > MAX_ARRAY_CELLS {
+                    return Err(FormulaErrorMsg::ArrayTooBig.with_span(span));
+                }
+                let mut n = start;
+                let mut out: Vec<Row> = Vec::with_capacity(rows as usize);
+                for _ in 0..rows {
+                    let mut row: Row = SmallVec::with_capacity(cols as usize);
+                    for _ in 0..cols {
+                        row.push(Value::Number(n));
+                        n += step;
+                    }
+                    out.push(row);
+                }
+                Ok(Value::Array(out))
+            }),
+        },
+        FormulaFunction {
+            name: "UNIQUE",
+            arg_completion: "${1:array}",
+            usages: &["array"],
+            examples: &["UNIQUE(A0:A20)"],
+            doc: "Removes duplicate rows, keeping first occurrences. Text \
+                  compares case-insensitively and numeric strings compare as \
+                  numbers.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(array), None) = (a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let rows = to_rows(array)?;
+                let mut out: Vec<Row> = Vec::new();
+                for row in rows {
+                    let duplicate = out.iter().any(|kept| {
+                        kept.len() == row.len()
+                            && kept.iter().zip(&row).all(|(a, b)| values_equivalent(a, b))
+                    });
+                    if !duplicate {
+                        out.push(row);
+                    }
+                }
+                Ok(Value::Array(out))
+            }),
+        },
+        FormulaFunction {
+            name: "SORT",
+            arg_completion: "${1:array}",
+            usages: &["array", "array, sort_index", "array, sort_index, sort_order"],
+            examples: &["SORT(A0:B10)", "SORT(A0:B10, 2, -1)"],
+            doc: "Sorts rows by the 1-based `sort_index` column (default 1); \
+                  `sort_order` 1 is ascending (default), -1 descending. \
+                  Numbers sort before text; blanks always sort last.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(array), index, order, None) = (a.next(), a.next(), a.next(), a.next())
+                else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let mut rows = to_rows(array)?;
+                let width = rows.first().map_or(0, |r| r.len());
+                let sort_index = match index {
+                    Some(v) => v.to_integer()?,
+                    None => 1,
+                };
+                if sort_index < 1 || sort_index as usize > width.max(1) {
+                    return Err(FormulaErrorMsg::IndexOutOfBounds.with_span(span));
+                }
+                let descending = match order {
+                    Some(v) => v.to_integer()? < 0,
+                    None => false,
+                };
+                let col = sort_index as usize - 1;
+                rows.sort_by(|a, b| {
+                    let (va, vb) = (&a[col], &b[col]);
+                    // blanks last regardless of direction
+                    match (matches!(classify(va), Key::Blank), matches!(classify(vb), Key::Blank)) {
+                        (true, true) => std::cmp::Ordering::Equal,
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Less,
+                        (false, false) => {
+                            let ord = compare_values(va, vb);
+                            if descending { ord.reverse() } else { ord }
+                        }
+                    }
+                });
+                Ok(Value::Array(rows))
+            }),
+        },
+        FormulaFunction {
+            name: "FILTER",
+            arg_completion: "${1:array}, ${2:include}",
+            usages: &["array, include", "array, include, if_empty"],
+            examples: &["FILTER(A0:B10, C0:C10)", "FILTER(A0:B10, C0:C10, \"none\")"],
+            doc: "Keeps the rows of `array` whose entry in `include` is truthy \
+                  (a matching-height column), or the columns when `include` is \
+                  a matching-width row. Returns `if_empty` when nothing passes.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(array), Some(include), if_empty, None) =
+                    (a.next(), a.next(), a.next(), a.next())
+                else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let include_span = include.span;
+                let rows = to_rows(array)?;
+                let height = rows.len();
+                let width = rows.first().map_or(0, |r| r.len());
+                let mask_rows = to_rows(include)?;
+                let mask_height = mask_rows.len();
+                let mask_width = mask_rows.first().map_or(0, |r| r.len());
+
+                let spanned = |v: &Value| Spanned {
+                    span: include_span,
+                    inner: v.clone(),
+                };
+
+                let out: Vec<Row> = if mask_height == height && mask_width <= 1 {
+                    // column mask -> keep rows
+                    let mut kept = Vec::new();
+                    for (row, mask) in rows.into_iter().zip(&mask_rows) {
+                        let flag = mask.first().map_or(Ok(false), |m| truthy(&spanned(m)))?;
+                        if flag {
+                            kept.push(row);
+                        }
+                    }
+                    kept
+                } else if mask_height == 1 && mask_width == width {
+                    // row mask -> keep columns
+                    let mut flags = Vec::with_capacity(width);
+                    for m in &mask_rows[0] {
+                        flags.push(truthy(&spanned(m))?);
+                    }
+                    rows.into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .zip(&flags)
+                                .filter(|(_, keep)| **keep)
+                                .map(|(v, _)| v)
+                                .collect::<Row>()
+                        })
+                        .filter(|row: &Row| !row.is_empty())
+                        .collect()
+                } else {
+                    return Err(FormulaErrorMsg::ArraySizeMismatch {
+                        expected: (height, 1),
+                        got: (mask_height, mask_width),
+                    }
+                    .with_span(include_span));
+                };
+
+                if out.is_empty() {
+                    return match if_empty {
+                        Some(v) => Ok(v.inner),
+                        None => Err(FormulaErrorMsg::Expected {
+                            expected: "at least one value to pass the filter".into(),
+                            got: None,
+                        }
+                        .with_span(span)),
+                    };
+                }
+                Ok(Value::Array(out))
+            }),
+        },
+        FormulaFunction {
+            name: "SUMPRODUCT",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["SUMPRODUCT(A0:A5, B0:B5)"],
+            doc: "Multiplies the arrays element-wise and sums the products. \
+                  Non-numeric entries count as 0.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                if args.inner.is_empty() {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                }
+                let mut arrays: Vec<Vec<f64>> = Vec::with_capacity(args.inner.len());
+                let mut dims: Option<(usize, usize)> = None;
+                for arg in args.inner {
+                    let rows = to_rows(arg)?;
+                    let dim = (rows.len(), rows.first().map_or(0, |r| r.len()));
+                    match dims {
+                        None => dims = Some(dim),
+                        Some(expected) if expected != dim => {
+                            return Err(FormulaErrorMsg::ArraySizeMismatch {
+                                expected,
+                                got: dim,
+                            }
+                            .with_span(span));
+                        }
+                        _ => {}
+                    }
+                    arrays.push(
+                        rows.iter()
+                            .flatten()
+                            .map(|v| v.to_number().unwrap_or(0.0))
+                            .collect(),
+                    );
+                }
+                let len = arrays.first().map_or(0, |a| a.len());
+                let mut total = 0.0;
+                for i in 0..len {
+                    total += arrays.iter().map(|a| a[i]).product::<f64>();
+                }
+                Ok(Value::Number(total))
+            }),
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::formulas::tests::*;
+
+    fn eval(s: &str) -> String {
+        eval_to_string(&mut NoGrid, s)
+    }
+
+    #[test]
+    fn test_transpose() {
+        assert_eq!("{1, 3; 2, 4}", eval("TRANSPOSE({1, 2; 3, 4})"));
+        assert_eq!("{1; 2; 3}", eval("TRANSPOSE({1, 2, 3})"));
+    }
+
+    #[test]
+    fn test_sequence() {
+        assert_eq!("{1; 2; 3}", eval("SEQUENCE(3)"));
+        assert_eq!("{0, 10, 20; 30, 40, 50}", eval("SEQUENCE(2, 3, 0, 10)"));
+    }
+
+    #[test]
+    fn test_unique() {
+        assert_eq!("{1; 2; 3}", eval("UNIQUE({1; 2; 1; 3; 2})"));
+        // case-insensitive text, numeric-string awareness
+        assert_eq!("{a; b}", eval("UNIQUE({'a'; 'A'; 'b'})"));
+        assert_eq!("{1}", eval("UNIQUE({1; '1'})"));
+    }
+
+    #[test]
+    fn test_sort() {
+        assert_eq!("{1; 2; 3}", eval("SORT({3; 1; 2})"));
+        assert_eq!("{3; 2; 1}", eval("SORT({3; 1; 2}, 1, -1)"));
+        // sort rows by second column
+        assert_eq!("{b, 1; a, 2}", eval("SORT({'a', 2; 'b', 1}, 2)"));
+        // numbers before text, blanks last even descending
+        assert_eq!("{5; x; }", eval("SORT({'x'; ''; 5})"));
+        assert_eq!("{x; 5; }", eval("SORT({'x'; ''; 5}, 1, -1)"));
+    }
+
+    #[test]
+    fn test_filter() {
+        // the old parser's array literals only take atoms, so masks are
+        // numeric here; real ranges deliver booleans, which truthy() accepts
+        assert_eq!("{1; 3}", eval("FILTER({1; 2; 3}, {1; 0; 1})"));
+        assert_eq!("{2, 20}", eval("FILTER({1, 10; 2, 20}, {0; 1})"));
+        assert_eq!("none", eval("FILTER({1; 2}, {0; 0}, 'none')"));
+    }
+
+    #[test]
+    fn test_sumproduct() {
+        assert_eq!("32", eval("SUMPRODUCT({1; 2; 3}, {4; 5; 6})"));
+        assert_eq!("6", eval("SUMPRODUCT({1, 2, 3})"));
+    }
+}
+````

@@ -1,0 +1,86 @@
+---
+title: "GridOffsets.test.ts"
+description: "Unit tests for GridOffsets.ts."
+source: "src/lib/core/GridOffsets.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts GridOffsets.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { GridOffsets } from './GridOffsets';
+import { CELL_HEIGHT, CELL_WIDTH } from './types';
+
+describe('GridOffsets', () => {
+	it('returns defaults for untouched columns and rows', () => {
+		const g = new GridOffsets();
+		expect(g.getColumnWidth(7)).toBe(CELL_WIDTH);
+		expect(g.getRowHeight(-3)).toBe(CELL_HEIGHT);
+	});
+
+	it('accumulates custom widths in getColumnX', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(1, 150);
+		expect(g.getColumnX(0)).toBe(0);
+		expect(g.getColumnX(1)).toBe(CELL_WIDTH);
+		expect(g.getColumnX(2)).toBe(CELL_WIDTH + 150);
+	});
+
+	it('handles negative coordinates', () => {
+		const g = new GridOffsets();
+		expect(g.getColumnX(-1)).toBe(-CELL_WIDTH);
+		expect(g.getRowY(-2)).toBe(-2 * CELL_HEIGHT);
+		g.setColumnWidth(-1, 60);
+		expect(g.getColumnX(-1)).toBe(-60);
+	});
+
+	it('roundtrips world coordinates through getColumnIndex/getRowIndex', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(2, 40);
+		for (const col of [-3, -1, 0, 2, 5]) {
+			const left = g.getColumnX(col);
+			expect(g.getColumnIndex(left)).toBe(col);
+			expect(g.getColumnIndex(left + g.getColumnWidth(col) - 1)).toBe(col);
+		}
+		expect(g.getRowIndex(g.getRowY(4))).toBe(4);
+		expect(g.getRowIndex(g.getRowY(-4))).toBe(-4);
+	});
+
+	it('clamps sizes to a 10px minimum', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(0, 5);
+		expect(g.getColumnWidth(0)).toBe(10);
+	});
+
+	it('drops entries reset to the default size', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(0, 200);
+		g.setColumnWidth(0, CELL_WIDTH);
+		expect(g.exportColumns()).toEqual([]);
+		g.setRowHeight(1, 50);
+		g.setRowHeight(1, undefined);
+		expect(g.exportRows()).toEqual([]);
+	});
+
+	it('exports and imports headings', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(3, 120);
+		g.setRowHeight(-1, 42);
+
+		const g2 = new GridOffsets();
+		g2.importHeadings(g.exportColumns(), g.exportRows());
+		expect(g2.getColumnWidth(3)).toBe(120);
+		expect(g2.getRowHeight(-1)).toBe(42);
+	});
+
+	it('getCellRect combines position and size', () => {
+		const g = new GridOffsets();
+		g.setColumnWidth(1, 80);
+		g.setRowHeight(1, 30);
+		expect(g.getCellRect(1, 1)).toEqual({ x: CELL_WIDTH, y: CELL_HEIGHT, w: 80, h: 30 });
+	});
+});
+````

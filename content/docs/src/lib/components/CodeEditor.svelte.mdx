@@ -1,0 +1,638 @@
+---
+title: "CodeEditor.svelte"
+description: "The CodeEditor Svelte component."
+source: "src/lib/components/CodeEditor.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte CodeEditor.svelte -n
+<script lang="ts">
+	import { getCellA1Notation } from '../core/a1';
+	import { editorModeColor } from '../grid/colors';
+	import { tokenizeCode } from '../helpers/codeHighlight';
+	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
+	import { pythonStatus } from '../python/pythonRunner';
+	import type { FormulaCompletion } from '../formulas/runFormula';
+	import { app, saveCellCode, sheetController } from '../state.svelte';
+
+	let code = $state('');
+	let running = $state(false);
+	let textareaEl: HTMLTextAreaElement | undefined = $state();
+
+	// syntax highlighting: a <pre> of colored tokens sits behind the textarea,
+	// whose own text is transparent (same layering trick as the caret mirror)
+	let highlightEl: HTMLPreElement | undefined = $state();
+	const hlTokens = $derived(tokenizeCode(app.editorMode, code));
+
+	function syncHighlightScroll(): void {
+		if (highlightEl && textareaEl) {
+			highlightEl.scrollTop = textareaEl.scrollTop;
+			highlightEl.scrollLeft = textareaEl.scrollLeft;
+		}
+	}
+
+	// re-sync after content changes that produce no scroll event (cell switch)
+	$effect(() => {
+		void hlTokens;
+		syncHighlightScroll();
+	});
+
+	// ---------- formula autocomplete (fed by the core's LSP module) ----------
+
+	let completions: FormulaCompletion[] = $state([]);
+	$effect(() => {
+		if (app.editorMode === 'FORMULA' && completions.length === 0) {
+			void import('../formulas/runFormula').then(async (m) => {
+				completions = await m.getFormulaCompletions();
+			});
+		}
+	});
+
+	let caretPos = $state(0);
+	let acDismissed = $state(false);
+	let acIndex = $state(0);
+	let acPos = $state({ left: 0, top: 0 });
+
+	// identifier ending at the caret, unless the caret sits inside a string
+	const acWord = $derived.by(() => {
+		if (app.editorMode !== 'FORMULA') return null;
+		const upto = code.slice(0, caretPos);
+		let quote: string | null = null;
+		for (const ch of upto) {
+			if (quote) {
+				if (ch === quote) quote = null;
+			} else if (ch === '"' || ch === "'") quote = ch;
+		}
+		if (quote) return null;
+		const m = /[A-Za-z_][A-Za-z0-9_]*$/.exec(upto);
+		return m ? { start: caretPos - m[0].length, text: m[0] } : null;
+	});
+
+	const acItems = $derived.by(() => {
+		if (!acWord || acDismissed || completions.length === 0) return [];
+		const prefix = acWord.text.toUpperCase();
+		return completions.filter((c) => c.label.startsWith(prefix));
+	});
+	const acOpen = $derived(acItems.length > 0);
+	const acSel = $derived(Math.min(acIndex, Math.max(acItems.length - 1, 0)));
+
+	/** Flattens a Monaco `${n:placeholder}` snippet to plain text, keeping the
+	 * first placeholder's range so it can be selected for type-over. */
+	function expandSnippet(snippet: string): { text: string; selStart: number; selEnd: number } {
+		let text = '';
+		let sel: { start: number; end: number } | undefined;
+		let i = 0;
+		const re = /\$\{\d+:([^}]*)\}|\$\d+/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(snippet))) {
+			text += snippet.slice(i, m.index);
+			const ph = m[1] ?? '';
+			if (!sel) sel = { start: text.length, end: text.length + ph.length };
+			text += ph;
+			i = m.index + m[0].length;
+		}
+		text += snippet.slice(i);
+		const at = sel ?? { start: text.length, end: text.length };
+		return { text, selStart: at.start, selEnd: at.end };
+	}
+
+	function acceptCompletion(item: FormulaCompletion): void {
+		if (!acWord || !textareaEl) return;
+		const { text, selStart, selEnd } = expandSnippet(item.insertText ?? `${item.label}()`);
+		const start = acWord.start;
+		code = code.slice(0, start) + text + code.slice(caretPos);
+		acDismissed = true; // stay closed until the user types again
+		queueMicrotask(() => {
+			textareaEl?.focus();
+			textareaEl?.setSelectionRange(start + selStart, start + selEnd);
+			caretPos = start + selEnd;
+		});
+	}
+
+	function acDocText(item: FormulaCompletion): string {
+		const doc = item.documentation;
+		const raw = typeof doc === 'string' ? doc : (doc?.value ?? '');
+		// keep the prose: drop the leading "# Description" header, the examples
+		// section, and code ticks
+		const cut = raw.split(/\n#/)[0];
+		return cut
+			.replace(/^#[^\n]*\n?/, '')
+			.replace(/`/g, '')
+			.trim();
+	}
+
+	// caret pixel position via a hidden mirror of the textarea's text layout
+	let mirror: HTMLDivElement | undefined;
+	function refreshAcPos(): void {
+		const el = textareaEl;
+		if (!el) return;
+		const upto = el.value.slice(0, el.selectionStart ?? 0);
+		const wordLen = /[A-Za-z_][A-Za-z0-9_]*$/.exec(upto)?.[0].length ?? 0;
+		if (!mirror) {
+			mirror = document.createElement('div');
+			el.parentElement?.appendChild(mirror);
+		}
+		const cs = getComputedStyle(el);
+		for (const p of [
+			'fontFamily',
+			'fontSize',
+			'fontWeight',
+			'lineHeight',
+			'letterSpacing',
+			'tabSize',
+			'padding'
+		] as const) {
+			mirror.style[p] = cs[p];
+		}
+		Object.assign(mirror.style, {
+			position: 'absolute',
+			top: '0',
+			left: '0',
+			visibility: 'hidden',
+			whiteSpace: 'pre-wrap',
+			overflowWrap: 'break-word',
+			pointerEvents: 'none',
+			width: `${el.clientWidth}px`
+		});
+		mirror.textContent = upto.slice(0, upto.length - wordLen);
+		const marker = document.createElement('span');
+		marker.textContent = '\u200b';
+		mirror.appendChild(marker);
+		const lineHeight = parseFloat(cs.lineHeight) || 18;
+		const left = Math.max(
+			0,
+			Math.min(marker.offsetLeft - el.scrollLeft, el.clientWidth - 290)
+		);
+		acPos = { left, top: marker.offsetTop - el.scrollTop + lineHeight + 2 };
+	}
+
+	function updateCaret(): void {
+		caretPos = textareaEl?.selectionStart ?? 0;
+		refreshAcPos();
+	}
+
+	function keepSelectedInView(): void {
+		queueMicrotask(() =>
+			document
+				.querySelector('.code-editor .ac li.sel')
+				?.scrollIntoView({ block: 'nearest' })
+		);
+	}
+
+	// reload the buffer whenever the editor targets a different cell/mode
+	let loadedKey = $state('');
+	$effect(() => {
+		const key = `${app.editorCell.x},${app.editorCell.y},${app.editorMode}`;
+		if (key !== loadedKey) {
+			loadedKey = key;
+			const cell = sheetController.sheet.getCell(app.editorCell.x, app.editorCell.y);
+			code =
+				app.editorMode === 'FORMULA'
+					? (cell?.formula_code ?? '')
+					: app.editorMode === 'JAVASCRIPT'
+						? (cell?.javascript_code ?? '')
+						: (cell?.python_code ?? '');
+			queueMicrotask(() => textareaEl?.focus());
+		}
+	});
+
+	// insert requests from the formula reference (FormulaDocs) and from
+	// grid pointing mode. A pointed ref remembers its span so pointing at a
+	// different cell REPLACES the previous ref (Excel-style repointing);
+	// typing anything clears the marker.
+	let lastRefSpan: { start: number; end: number } | undefined;
+	$effect(() => {
+		const text = app.pendingEditorInsert;
+		if (text && textareaEl) {
+			const isRef = app.pendingInsertIsRef;
+			let start = textareaEl.selectionStart ?? code.length;
+			let end = textareaEl.selectionEnd ?? start;
+			if (isRef && lastRefSpan && start === lastRefSpan.end && end === lastRefSpan.end) {
+				start = lastRefSpan.start;
+			}
+			code = code.slice(0, start) + text + code.slice(end);
+			lastRefSpan = isRef ? { start, end: start + text.length } : undefined;
+			app.pendingEditorInsert = '';
+			app.pendingInsertIsRef = false;
+			const caret = start + text.length;
+			queueMicrotask(() => {
+				textareaEl?.focus();
+				textareaEl?.setSelectionRange(caret, caret);
+				caretPos = caret;
+			});
+		}
+	});
+
+	const cell = $derived.by(() => {
+		void app.redraw;
+		return sheetController.sheet.getCell(app.editorCell.x, app.editorCell.y);
+	});
+	const result = $derived(cell?.evaluation_result);
+	const modeColor = $derived(editorModeColor(app.editorMode));
+	const modeName = $derived(
+		app.editorMode === 'FORMULA'
+			? 'Formula'
+			: app.editorMode === 'JAVASCRIPT'
+				? 'JavaScript'
+				: 'Python'
+	);
+
+	async function run(): Promise<void> {
+		if (running) return;
+		running = true;
+		try {
+			await saveCellCode(app.editorCell.x, app.editorCell.y, app.editorMode, code);
+		} finally {
+			running = false;
+		}
+	}
+
+	function close(): void {
+		app.showCodeEditor = false;
+	}
+
+	// swallow only the keys handled here; everything else bubbles so global
+	// shortcuts (⌘., ⌘P, zoom, …) keep working while the editor is focused
+	function onKeyDown(e: KeyboardEvent): void {
+		if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+			e.preventDefault();
+			e.stopPropagation();
+			void run();
+			return;
+		}
+		// autocomplete owns navigation keys while its dropdown is open
+		if (acOpen && e.target === textareaEl) {
+			if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+				e.preventDefault();
+				e.stopPropagation();
+				acIndex = (acSel + (e.key === 'ArrowDown' ? 1 : -1) + acItems.length) % acItems.length;
+				keepSelectedInView();
+				return;
+			}
+			if (e.key === 'Tab' || e.key === 'Enter') {
+				e.preventDefault();
+				e.stopPropagation();
+				acceptCompletion(acItems[acSel]);
+				return;
+			}
+			if (e.key === 'Escape') {
+				e.preventDefault();
+				e.stopPropagation();
+				acDismissed = true;
+				return;
+			}
+		}
+		if (e.key === 'Escape') {
+			e.preventDefault();
+			e.stopPropagation();
+			close();
+			return;
+		}
+		if (e.key === 'Tab' && e.target === textareaEl && textareaEl) {
+			e.preventDefault();
+			e.stopPropagation();
+			const start = textareaEl.selectionStart;
+			const end = textareaEl.selectionEnd;
+			code = code.slice(0, start) + '    ' + code.slice(end);
+			queueMicrotask(() => textareaEl?.setSelectionRange(start + 4, start + 4));
+		}
+	}
+</script>
+
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="code-editor" onkeydown={onKeyDown}>
+	<div class="header" style:border-top="3px solid {modeColor}">
+		<div class="title">
+			<span class="mode" style:color={modeColor}>{modeName}</span>
+			<span class="cellref">
+				Cell ({app.editorCell.x}, {app.editorCell.y})
+				<span class="a1">{getCellA1Notation(app.editorCell.x, app.editorCell.y)}</span>
+			</span>
+		</div>
+		<div class="actions">
+			{#if app.editorMode === 'FORMULA'}
+				<button
+					class="fx"
+					onclick={() => (app.showFormulaDocs = true)}
+					title="Browse all formula functions"
+				>
+					ƒx Functions
+				</button>
+			{/if}
+			<button class="run" onclick={() => void run()} disabled={running} title="Run ({KeyboardSymbols.Cmd}{KeyboardSymbols.Enter})">
+				{#if running}Running…{:else}▶ Run{/if}
+			</button>
+			<button class="close" onclick={close} title="Close (Esc)">✕</button>
+		</div>
+	</div>
+
+	{#if app.editorMode === 'PYTHON' && ($pythonStatus.state === 'loading' || $pythonStatus.detail)}
+		<div class="python-loading">
+			{$pythonStatus.detail ??
+				'Loading Python runtime (Pyodide + pandas)… first run may take a moment.'}
+		</div>
+	{/if}
+
+	<div class="editor-area">
+		<pre class="highlight" aria-hidden="true" bind:this={highlightEl}>{#each hlTokens as t}{#if t.type === 'plain'}{t.text}{:else}<span class="syn-{t.type}">{t.text}</span>{/if}{/each}{'\n'}</pre>
+		<textarea
+			bind:this={textareaEl}
+			bind:value={code}
+			class="code"
+			spellcheck="false"
+			oninput={() => {
+				acDismissed = false;
+				acIndex = 0;
+				lastRefSpan = undefined; // typing ends ref repointing
+				updateCaret();
+			}}
+			onclick={updateCaret}
+			onkeyup={(e) => {
+				if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(e.key))
+					updateCaret();
+			}}
+			onscroll={() => {
+				syncHighlightScroll();
+				refreshAcPos();
+			}}
+			onblur={() => (acDismissed = true)}
+			placeholder={app.editorMode === 'FORMULA'
+				? 'e.g.  SUM(A0:A5) * 2'
+				: app.editorMode === 'JAVASCRIPT'
+					? "e.g.\nlet total = q.cells('D6');\nreturn total * 2;"
+					: 'e.g.\nresult = cell(0, 0)\nresult * 2'}
+		></textarea>
+		{#if acOpen}
+			<div class="ac" style:left="{acPos.left}px" style:top="{acPos.top}px">
+				<ul>
+					{#each acItems as item, i (item.label)}
+						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+						<li
+							class:sel={i === acSel}
+							onmousedown={(e) => {
+								e.preventDefault();
+								acceptCompletion(item);
+							}}
+							onmousemove={() => (acIndex = i)}
+						>
+							<span class="ac-fx">ƒ</span>{item.label}
+						</li>
+					{/each}
+				</ul>
+				{#if acItems[acSel]}
+					<div class="ac-doc">
+						<div class="ac-usage">{acItems[acSel].detail?.split('\n')[0]}</div>
+						<div class="ac-text">{acDocText(acItems[acSel])}</div>
+					</div>
+				{/if}
+			</div>
+		{/if}
+	</div>
+
+	<div class="output">
+		<div class="output-header">OUTPUT</div>
+		{#if result}
+			{#if result.success}
+				{#if result.image_output}
+					<img class="output-image" src={result.image_output} alt="Canvas output" />
+				{/if}
+				{#if result.output_value !== null && result.output_value !== undefined}
+					<div class="output-value">{result.output_value}</div>
+				{/if}
+				{#if result.array_output}
+					<div class="output-note">
+						Array output spilled onto the grid ({cell?.array_cells?.length ?? 0} cells)
+					</div>
+				{/if}
+				{#if result.std_out}
+					<pre class="stdout">{result.std_out}</pre>
+				{/if}
+			{:else}
+				<pre class="stderr">{result.std_err ?? 'Error'}</pre>
+			{/if}
+		{:else}
+			<div class="output-note">Not run yet.</div>
+		{/if}
+	</div>
+</div>
+
+<style>
+	.code-editor {
+		width: min(420px, 45vw);
+		border-left: 1px solid var(--border);
+		background: var(--panel);
+		display: flex;
+		flex-direction: column;
+		font-size: 0.85rem;
+	}
+	.header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 0.5rem 0.75rem;
+		border-bottom: 1px solid var(--border-light);
+	}
+	.title {
+		display: flex;
+		flex-direction: column;
+		gap: 0.1rem;
+	}
+	.mode {
+		font-weight: 600;
+	}
+	.cellref {
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	.a1 {
+		color: var(--faint-2);
+		margin-left: 0.4rem;
+	}
+	.actions {
+		display: flex;
+		gap: 0.5rem;
+		align-items: center;
+	}
+	.run {
+		background: #6cd4ff;
+		color: #003a52;
+		border: none;
+		border-radius: 3px;
+		padding: 0.3rem 0.8rem;
+		font: inherit;
+		font-weight: 600;
+		cursor: pointer;
+	}
+	.run:disabled {
+		opacity: 0.6;
+		cursor: default;
+	}
+	.fx {
+		background: none;
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		color: var(--formula);
+		padding: 0.3rem 0.6rem;
+		font: inherit;
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+	.fx:hover {
+		background: var(--hover);
+		border-color: var(--formula);
+	}
+	.close {
+		background: none;
+		border: none;
+		font-size: 1rem;
+		color: var(--muted);
+		cursor: pointer;
+		padding: 0.2rem 0.4rem;
+	}
+	.python-loading {
+		padding: 0.4rem 0.75rem;
+		background: var(--warn-bg);
+		color: var(--warn-text);
+		font-size: 0.75rem;
+	}
+	.editor-area {
+		position: relative;
+		flex: 1;
+		display: flex;
+		min-height: 8rem;
+	}
+	/* the textarea and the highlight layer must share identical text metrics
+	 * so their glyphs overlap exactly */
+	.code,
+	.highlight {
+		padding: 0.75rem;
+		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+		font-size: 0.8rem;
+		line-height: 1.5;
+		tab-size: 4;
+		white-space: pre-wrap;
+		overflow-wrap: break-word;
+	}
+	.code {
+		flex: 1;
+		width: 100%;
+		border: none;
+		outline: none;
+		resize: none;
+		position: relative; /* paints above the absolutely-positioned highlight */
+		color: transparent; /* the highlight layer renders the glyphs */
+		background: transparent;
+	}
+	.code::placeholder {
+		color: var(--faint);
+	}
+	.highlight {
+		position: absolute;
+		inset: 0;
+		margin: 0;
+		overflow: hidden;
+		pointer-events: none;
+		color: var(--text);
+	}
+	.ac {
+		position: absolute;
+		z-index: 70;
+		width: 280px;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		box-shadow: 0 6px 20px var(--shadow);
+		font-size: 0.78rem;
+		overflow: hidden;
+	}
+	.ac ul {
+		list-style: none;
+		margin: 0;
+		padding: 0.2rem 0;
+		max-height: 11rem;
+		overflow-y: auto;
+	}
+	.ac li {
+		padding: 0.22rem 0.6rem;
+		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+		font-size: 0.75rem;
+		cursor: pointer;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.ac li.sel {
+		background: var(--accent-soft);
+	}
+	.ac-fx {
+		color: var(--formula);
+		margin-right: 0.45rem;
+		font-style: italic;
+	}
+	.ac-doc {
+		border-top: 1px solid var(--border-light);
+		padding: 0.4rem 0.6rem;
+		background: var(--panel-2);
+	}
+	.ac-usage {
+		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+		font-size: 0.7rem;
+		color: var(--accent);
+		margin-bottom: 0.25rem;
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+	.ac-text {
+		color: var(--muted);
+		font-size: 0.72rem;
+		line-height: 1.4;
+		display: -webkit-box;
+		-webkit-line-clamp: 3;
+		line-clamp: 3;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.output {
+		border-top: 1px solid var(--border-light);
+		max-height: 40%;
+		overflow: auto;
+		padding: 0.5rem 0.75rem;
+	}
+	.output-header {
+		font-size: 0.65rem;
+		letter-spacing: 0.08em;
+		color: var(--faint-2);
+		margin-bottom: 0.3rem;
+	}
+	.output-value {
+		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
+		font-size: 0.8rem;
+	}
+	.output-image {
+		max-width: 100%;
+		height: auto;
+		border: 1px solid var(--border-light);
+		border-radius: 3px;
+		margin-bottom: 0.3rem;
+	}
+	.output-note {
+		color: var(--muted);
+		font-size: 0.75rem;
+	}
+	pre.stdout,
+	pre.stderr {
+		margin: 0.3rem 0 0;
+		font-size: 0.75rem;
+		white-space: pre-wrap;
+		word-break: break-word;
+	}
+	pre.stderr {
+		color: var(--error);
+	}
+</style>
+````

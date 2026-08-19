@@ -1,0 +1,276 @@
+---
+title: "generate-examples.mjs"
+description: "Generates .grid v1.3 example files with pre-computed outputs, so the examples display correctly before anything is re-run."
+source: "scripts/generate-examples.mjs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````js generate-examples.mjs -n
+// Generates .grid v1.3 example files with pre-computed outputs, so the
+// examples display correctly before anything is re-run.
+import { writeFileSync } from 'node:fs';
+
+const NOW = '2026-08-06T12:00:00.000Z';
+
+const cell = (x, y, value, extra = {}) => ({
+	x,
+	y,
+	type: 'TEXT',
+	value: String(value),
+	last_modified: NOW,
+	...extra
+});
+
+const formula = (x, y, code, display, accessed) =>
+	cell(x, y, display, {
+		type: 'FORMULA',
+		formula_code: code,
+		evaluation_result: {
+			success: true,
+			output_value: String(display),
+			cells_accessed: accessed,
+			error_span: null
+		}
+	});
+
+const fmt = (x, y, props) => ({ x, y, ...props });
+
+// range helpers -> cells_accessed lists
+const colRange = (x, y0, y1) => {
+	const out = [];
+	for (let y = y0; y <= y1; y++) out.push([x, y]);
+	return out;
+};
+
+// ---------- date helpers (mirror the Rust core) ----------
+const day = (iso) => Math.round(Date.parse(iso + 'T00:00:00Z') / 86400000);
+const isoOf = (d) => new Date(d * 86400000).toISOString().slice(0, 10);
+const weekdayIso = (d) => ((d + 3) % 7) + 1; // Mon=1..Sun=7
+const networkdays = (a, b) => {
+	let n = 0;
+	for (let d = day(a); d <= day(b); d++) if (weekdayIso(d) < 6) n++;
+	return n;
+};
+const isoWeek = (iso) => {
+	const d = day(iso);
+	const thu = d + 4 - weekdayIso(d);
+	const y = new Date(thu * 86400000).getUTCFullYear();
+	return Math.floor((thu - day(`${y}-01-01`)) / 7) + 1;
+};
+
+// =========================================================== formulas tour
+{
+	const cells = [];
+	const formats = [];
+
+	cells.push(cell(0, 0, 'Formula tour'));
+	formats.push(fmt(0, 0, { bold: true, textColor: '#8c1a6a' }));
+	cells.push(cell(0, 1, 'Every result below is computed by the Rust/WASM core. Click a cell to see its formula.'));
+	formats.push(fmt(0, 1, { italic: true, textColor: '#55606b' }));
+
+	// --- data table ---
+	const head = ['Rep', 'Region', 'Sales', 'Signed'];
+	head.forEach((h, i) => {
+		cells.push(cell(i, 3, h));
+		formats.push(fmt(i, 3, { bold: true, fillColor: '#e7f7ff' }));
+	});
+	const data = [
+		['Ada', 'North', 1200, '2026-01-15'],
+		['Brij', 'South', 950, '2026-02-03'],
+		['Cleo', 'North', 1875, '2026-03-21'],
+		['Dane', 'East', 620, '2026-04-02'],
+		['Eli', 'South', 1340, '2026-05-19'],
+		['Fay', 'North', 2100, '2026-06-30']
+	];
+	data.forEach((row, i) => {
+		row.forEach((v, x) => cells.push(cell(x, 4 + i, v)));
+		formats.push(fmt(2, 4 + i, { textFormat: { type: 'NUMBER', decimalPlaces: 0 } }));
+	});
+	const y0 = 4;
+	const y1 = 4 + data.length - 1;
+	const sales = data.map((r) => r[2]);
+	const salesRange = colRange(2, y0, y1);
+	const repRange = colRange(0, y0, y1);
+	const regionRange = colRange(1, y0, y1);
+
+	// --- summary block ---
+	let y = 3;
+	const label = (text) => {
+		cells.push(cell(5, y, text));
+		formats.push(fmt(5, y, { textColor: '#55606b' }));
+	};
+	const section = (title) => {
+		cells.push(cell(5, y, title));
+		formats.push(fmt(5, y, { bold: true }));
+		y++;
+	};
+
+	section('Aggregates');
+	const total = sales.reduce((a, b) => a + b, 0);
+	label('SUM'); cells.push(formula(6, y, `SUM(C${y0}:C${y1})`, total, salesRange)); y++;
+	label('ROUND(AVERAGE)');
+	cells.push(formula(6, y, `ROUND(AVERAGE(C${y0}:C${y1}), 2)`, Math.round((total / sales.length) * 100) / 100, salesRange)); y++;
+	label('MAX'); cells.push(formula(6, y, `MAX(C${y0}:C${y1})`, Math.max(...sales), salesRange)); y++;
+	y++;
+
+	section('Criteria (SUMIF / COUNTIF)');
+	const northTotal = data.filter((r) => r[1] === 'North').reduce((a, r) => a + r[2], 0);
+	label('SUMIF "North"');
+	cells.push(formula(6, y, `SUMIF(B${y0}:B${y1}, "North", C${y0}:C${y1})`, northTotal, [...regionRange, ...salesRange])); y++;
+	label('COUNTIF ">1000"');
+	cells.push(formula(6, y, `COUNTIF(C${y0}:C${y1}, ">1000")`, sales.filter((s) => s > 1000).length, salesRange)); y++;
+	label('COUNTIF wildcard "*a*"');
+	cells.push(formula(6, y, `COUNTIF(A${y0}:A${y1}, "*a*")`, data.filter((r) => r[0].toLowerCase().includes('a')).length, repRange)); y++;
+	y++;
+
+	section('Lookup');
+	const best = data.reduce((a, b) => (b[2] > a[2] ? b : a));
+	label('INDEX + MATCH (top rep)');
+	cells.push(formula(6, y, `INDEX(A${y0}:A${y1}, MATCH(MAX(C${y0}:C${y1}), C${y0}:C${y1}, 0))`, best[0], [...repRange, ...salesRange])); y++;
+	label('VLOOKUP "Cleo"');
+	cells.push(formula(6, y, `VLOOKUP("Cleo", A${y0}:B${y1}, 2)`, 'North', [...repRange, ...regionRange])); y++;
+	label('IFERROR');
+	cells.push(formula(6, y, 'IFERROR(1/0, "safe")', 'safe', [])); y++;
+	label('TEXTJOIN');
+	cells.push(formula(6, y, `TEXTJOIN(", ", TRUE, A${y0}:A${y1})`, data.map((r) => r[0]).join(', '), repRange)); y++;
+	y++;
+
+	section('Dates');
+	const first = data[0][3];
+	const last = data[data.length - 1][3];
+	label('DAYS (first → last)');
+	cells.push(formula(6, y, `DAYS(D${y1}, D${y0})`, day(last) - day(first), [[3, y0], [3, y1]])); y++;
+	label('EDATE (+12 months)');
+	cells.push(formula(6, y, `EDATE(D${y0}, 12)`, '2027-01-15', [[3, y0]])); y++;
+	label('EOMONTH');
+	cells.push(formula(6, y, `EOMONTH(D${y0}, 0)`, '2026-01-31', [[3, y0]])); y++;
+	label('WEEKDAY (Sun=1)');
+	cells.push(formula(6, y, `WEEKDAY(D${y0})`, (weekdayIso(day(first)) % 7) + 1, [[3, y0]])); y++;
+	label('ISOWEEKNUM');
+	cells.push(formula(6, y, `ISOWEEKNUM(D${y0})`, isoWeek(first), [[3, y0]])); y++;
+	label('NETWORKDAYS (Q1)');
+	cells.push(formula(6, y, 'NETWORKDAYS("2026-01-01", "2026-03-31")', networkdays('2026-01-01', '2026-03-31'), [])); y++;
+	label('DATEDIF years');
+	cells.push(formula(6, y, `DATEDIF(D${y0}, "2029-03-01", "Y")`, 3, [[3, y0]])); y++;
+
+	cells.push(cell(5, y + 1, 'Browse every function: Help → Formula reference'));
+	formats.push(fmt(5, y + 1, { italic: true, textColor: '#8c1a6a' }));
+
+	writeFileSync(
+		'static/examples/formula_tour.grid',
+		JSON.stringify({
+			sheets: [{ name: 'Formulas', order: 0, borders: [], cells, formats, columns: [{ id: 5, size: 190 }, { id: 6, size: 190 }, { id: 3, size: 110 }], rows: [], cell_dependency: '[]' }],
+			created: Date.parse(NOW),
+			filename: 'Formula tour (example)',
+			id: '3f9a1c22-0000-4000-8000-00000000f001',
+			modified: Date.parse(NOW),
+			version: '1.3'
+		}, null, 1)
+	);
+	console.log('formula_tour.grid written');
+}
+
+// =========================================================== javascript
+{
+	const cells = [];
+	const formats = [];
+
+	cells.push(cell(0, 0, 'JavaScript cells'));
+	formats.push(fmt(0, 0, { bold: true, textColor: '#ca8a04' }));
+	cells.push(cell(0, 1, 'Return a value from a JS cell and it lands on the grid. Arrays spill.'));
+	formats.push(fmt(0, 1, { italic: true, textColor: '#55606b' }));
+
+	cells.push(cell(0, 3, 'Rows to build'));
+	formats.push(fmt(0, 3, { bold: true }));
+	cells.push(cell(1, 3, 7));
+	formats.push(fmt(1, 3, { fillColor: '#fff3cd' }));
+	cells.push(cell(2, 3, '← edit me, the table below rebuilds'));
+	formats.push(fmt(2, 3, { italic: true, textColor: '#55606b' }));
+
+	// JS cell spilling a table
+	const n = 7;
+	const table = [['n', 'squared', 'cubed']];
+	for (let i = 1; i <= n; i++) table.push([i, i * i, i * i * i]);
+
+	const jsCode =
+		"const n = q.cells('B3');\n" +
+		"console.log('building', n, 'rows');\n" +
+		"const rows = [['n', 'squared', 'cubed']];\n" +
+		'for (let i = 1; i <= n; i++) rows.push([i, i * i, i * i * i]);\n' +
+		'return rows;';
+
+	const arrayCells = [];
+	table.forEach((row, dy) =>
+		row.forEach((_, dx) => arrayCells.push([dx, 5 + dy]))
+	);
+	cells.push(
+		cell(0, 5, table[0][0], {
+			type: 'JAVASCRIPT',
+			javascript_code: jsCode,
+			array_cells: arrayCells,
+			evaluation_result: {
+				success: true,
+				output_value: String(table[0][0]),
+				std_out: `building ${n} rows`,
+				cells_accessed: [[1, 3]],
+				array_output: table,
+				error_span: null
+			}
+		})
+	);
+	// spilled COMPUTED cells (everything except the origin)
+	table.forEach((row, dy) =>
+		row.forEach((v, dx) => {
+			if (dx === 0 && dy === 0) return;
+			cells.push(cell(dx, 5 + dy, v, { type: 'COMPUTED' }));
+		})
+	);
+	[0, 1, 2].forEach((x) => formats.push(fmt(x, 5, { bold: true, fillColor: '#fdf6e3' })));
+
+	// a formula reading the spilled output
+	const squares = table.slice(1).map((r) => r[1]);
+	cells.push(cell(4, 5, 'Formula over JS output'));
+	formats.push(fmt(4, 5, { bold: true }));
+	cells.push(cell(4, 6, 'SUM of squares'));
+	formats.push(fmt(4, 6, { textColor: '#55606b' }));
+	cells.push(
+		formula(5, 6, `SUM(B6:B${5 + n})`, squares.reduce((a, b) => a + b, 0), colRange(1, 6, 5 + n))
+	);
+
+	// scalar JS cell
+	cells.push(cell(4, 8, 'Scalar return'));
+	formats.push(fmt(4, 8, { bold: true }));
+	cells.push(
+		cell(5, 8, 14, {
+			type: 'JAVASCRIPT',
+			javascript_code: "const n = q.cells('B3');\nreturn n * 2;",
+			evaluation_result: {
+				success: true,
+				output_value: '14',
+				cells_accessed: [[1, 3]],
+				error_span: null
+			}
+		})
+	);
+
+	cells.push(cell(4, 10, 'API: q.cells(a1), q.pos(), console.log'));
+	formats.push(fmt(4, 10, { italic: true, textColor: '#ca8a04' }));
+
+	writeFileSync(
+		'static/examples/javascript.grid',
+		JSON.stringify({
+			sheets: [{ name: 'JavaScript', order: 0, borders: [], cells, formats, columns: [{ id: 2, size: 210 }, { id: 4, size: 170 }], rows: [], cell_dependency: '[]' }],
+			created: Date.parse(NOW),
+			filename: 'JavaScript (example)',
+			id: '3f9a1c22-0000-4000-8000-00000000f002',
+			modified: Date.parse(NOW),
+			version: '1.3'
+		}, null, 1)
+	);
+	console.log('javascript.grid written');
+}
+````

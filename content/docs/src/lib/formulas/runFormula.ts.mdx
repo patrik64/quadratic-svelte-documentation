@@ -1,0 +1,143 @@
+---
+title: "runFormula.ts"
+description: "Glue to the Rust/WASM formula engine (quadratic-core), port of the original's src/grid/computations/formulas/runFormula.ts."
+source: "src/lib/formulas/runFormula.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts runFormula.ts -n
+// Glue to the Rust/WASM formula engine (quadratic-core), port of the
+// original's src/grid/computations/formulas/runFormula.ts.
+
+import init, {
+	adjust_formula,
+	relocate_formula,
+	eval_formula,
+	formula_docs,
+	provideCompletionItems,
+	hello
+} from '../../../quadratic-core/pkg/quadratic_core.js';
+import wasmUrl from '../../../quadratic-core/pkg/quadratic_core_bg.wasm?url';
+
+export interface FormulaDoc {
+	category: string;
+	name: string;
+	usages: string[];
+	examples: string[];
+	doc: string;
+}
+
+export interface RunFormulaResult {
+	cells_accessed: [number, number][];
+	success: boolean;
+	error_span: [number, number] | null;
+	error_msg: string | null;
+	output_value: string | null;
+	array_output: string[][] | null;
+}
+
+let initPromise: Promise<void> | undefined;
+
+export function loadFormulaCore(): Promise<void> {
+	if (!initPromise) {
+		// explicit asset URL so Vite serves/bundles the wasm in dev and build
+		initPromise = init({ module_or_path: wasmUrl }).then(() => hello());
+	}
+	return initPromise;
+}
+
+/** Rewrites A1 refs in a formula after a row/column shift (Rust core).
+ * Sheet-qualified refs are masked first — they point at another sheet, so
+ * this sheet's shifts must not rewrite them. */
+export async function adjustFormula(
+	code: string,
+	cell: { x: number; y: number },
+	axis: 'x' | 'y',
+	at: number,
+	delta: number
+): Promise<string> {
+	await loadFormulaCore();
+	const { maskSheetRefs } = await import('./sheetRefs');
+	const { masked, unmask } = maskSheetRefs(code);
+	return unmask(adjust_formula(masked, cell.x, cell.y, axis === 'x', at, delta));
+}
+
+/** Rewrites A1 refs for a copy (fill/paste): relative follow, $ stays.
+ * Sheet-qualified refs are masked and kept verbatim (Excel keeps them
+ * pointing at the same foreign cells on copy). */
+export async function relocateFormula(
+	code: string,
+	from: { x: number; y: number },
+	to: { x: number; y: number }
+): Promise<string> {
+	await loadFormulaCore();
+	const { maskSheetRefs } = await import('./sheetRefs');
+	const { masked, unmask } = maskSheetRefs(code);
+	return unmask(relocate_formula(masked, from.x, from.y, to.x, to.y));
+}
+
+/** Monaco-shaped completion item from the core's LSP module. */
+export interface FormulaCompletion {
+	label: string;
+	detail?: string;
+	insertText?: string;
+	insertTextRules?: number;
+	documentation?: string | { value: string };
+	kind?: number;
+}
+
+let completionsCache: FormulaCompletion[] | undefined;
+
+/** Completion items for every formula function, from the Rust core's LSP
+ * module (the Monaco text-model arguments are unused by the core). */
+export async function getFormulaCompletions(): Promise<FormulaCompletion[]> {
+	if (!completionsCache) {
+		await loadFormulaCore();
+		const list = provideCompletionItems(undefined, undefined, undefined, undefined) as {
+			suggestions: FormulaCompletion[];
+		};
+		completionsCache = [...list.suggestions].sort((a, b) => a.label.localeCompare(b.label));
+	}
+	return completionsCache;
+}
+
+let docsCache: FormulaDoc[] | undefined;
+
+/** Documentation for every formula function, from the Rust core. */
+export async function getFormulaDocs(): Promise<FormulaDoc[]> {
+	if (!docsCache) {
+		await loadFormulaCore();
+		docsCache = formula_docs() as FormulaDoc[];
+	}
+	return docsCache;
+}
+
+export async function runFormula(
+	formula_code: string,
+	pos: { x: number; y: number },
+	getCellValue: (x: number, y: number) => string | undefined
+): Promise<RunFormulaResult> {
+	await loadFormulaCore();
+
+	// Same contract as the original's GetCellsDB: an async rect accessor
+	// returning the existing cells with their values. The core awaits it and
+	// reads `[0].value`; an empty array means the cell is empty.
+	const gridAccessor = async (x0: number, y0: number, x1: number, y1: number) => {
+		const cells: { x: number; y: number; value: string }[] = [];
+		for (let y = y0; y <= y1; y++) {
+			for (let x = x0; x <= x1; x++) {
+				const value = getCellValue(x, y);
+				if (value !== undefined && value !== '') cells.push({ x, y, value });
+			}
+		}
+		return cells;
+	};
+
+	const output = await eval_formula(formula_code, pos.x, pos.y, gridAccessor);
+	return output as RunFormulaResult;
+}
+````

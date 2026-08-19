@@ -1,0 +1,89 @@
+---
+title: "+page.svelte"
+description: "The +page Svelte component."
+source: "src/routes/+page.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte +page.svelte -n
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import BottomBar from '$lib/components/BottomBar.svelte';
+	import CellTypeMenu from '$lib/components/CellTypeMenu.svelte';
+	import CodeEditor from '$lib/components/CodeEditor.svelte';
+	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import FileMenu from '$lib/components/FileMenu.svelte';
+	import FormulaDocs from '$lib/components/FormulaDocs.svelte';
+	import GoTo from '$lib/components/GoTo.svelte';
+	import GridCanvas from '$lib/components/GridCanvas.svelte';
+	import SheetBar from '$lib/components/SheetBar.svelte';
+	import TopBar from '$lib/components/TopBar.svelte';
+	import { app, loadInitialFile } from '$lib/state.svelte';
+
+	onMount(() => {
+		void loadInitialFile();
+	});
+</script>
+
+<div class="app">
+	{#if app.showCellTypeMenu}<CellTypeMenu />{/if}
+	{#if !app.presentationMode}<TopBar />{/if}
+	{#if app.showCommandPalette}<CommandPalette />{/if}
+	{#if app.showGoToMenu}<GoTo />{/if}
+	{#if app.showFileMenu}<FileMenu />{/if}
+	{#if app.showFormulaDocs}<FormulaDocs />{/if}
+
+	<div class="main">
+		<GridCanvas />
+		{#if app.showCodeEditor}<CodeEditor />{/if}
+	</div>
+
+	{#if !app.presentationMode}<SheetBar />{/if}
+	{#if !app.presentationMode}<BottomBar />{/if}
+	{#if app.presentationMode}
+		<div class="presentation-hint">Press Esc to exit presentation mode</div>
+	{/if}
+</div>
+
+<style>
+	.app {
+		width: 100%;
+		height: 100vh;
+		display: flex;
+		flex-direction: column;
+		overflow: hidden;
+	}
+	.main {
+		flex: 1;
+		display: flex;
+		overflow: hidden;
+		position: relative;
+	}
+	.presentation-hint {
+		position: fixed;
+		bottom: 1rem;
+		left: 50%;
+		transform: translateX(-50%);
+		background: rgba(0, 0, 0, 0.75);
+		color: white;
+		font-size: 0.8rem;
+		padding: 0.4rem 0.9rem;
+		border-radius: 4px;
+		pointer-events: none;
+		animation: fade-out 4s forwards;
+	}
+	@keyframes fade-out {
+		0%,
+		75% {
+			opacity: 1;
+		}
+		100% {
+			opacity: 0;
+		}
+	}
+</style>
+````

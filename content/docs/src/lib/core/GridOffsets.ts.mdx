@@ -1,0 +1,180 @@
+---
+title: GridOffsets.ts
+description: Maps between cell coordinates and world (pixel) coordinates, with sparse per-column widths and per-row heights
+source: src/lib/core/GridOffsets.ts
+full: true
+---
+
+Every part of the app that touches the screen needs to answer two questions:
+*where does cell (x, y) sit in pixels?* and *which cell is under this pixel?*
+`GridOffsets` is that translation layer — a port of Quadratic's class of the
+same name, without the incremental cache. Column 0 starts at world x = 0 and
+the grid extends infinitely in all four directions.
+
+<Scrollycoding>
+
+## !!steps Two sparse maps
+
+The grid is infinite, so storing a width for every column is impossible.
+Instead only the *exceptions* are stored: two `Map`s from index to size, and
+anything absent falls back to the `CELL_WIDTH` / `CELL_HEIGHT` constants from
+[types.ts](/docs/src/lib/core/types.ts). Reading a size is a lookup with a
+default — cheap enough to call in every render loop.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	// !mark(1:2)
+	private columns = new Map<number, number>(); // column index -> width
+	private rows = new Map<number, number>(); // row index -> height
+
+	getColumnWidth(x: number): number {
+		return this.columns.get(x) ?? CELL_WIDTH;
+	}
+
+	getRowHeight(y: number): number {
+		return this.rows.get(y) ?? CELL_HEIGHT;
+	}
+}
+```
+
+## !!steps Writing sizes keeps the maps sparse
+
+Setting a size back to the default (or to `undefined`, when a resize is
+undone) *deletes* the entry instead of storing it — the maps only ever hold
+real exceptions. Sizes are clamped to a 10px minimum so a column can never be
+dragged to zero width and become un-grabbable.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	setColumnWidth(x: number, width: number | undefined): void {
+		// !mark
+		if (width === undefined || width === CELL_WIDTH) this.columns.delete(x);
+		else this.columns.set(x, Math.max(10, width));
+	}
+
+	setRowHeight(y: number, height: number | undefined): void {
+		if (height === undefined || height === CELL_HEIGHT) this.rows.delete(y);
+		else this.rows.set(y, Math.max(10, height));
+	}
+}
+```
+
+## !!steps Cell → world: walk from the origin
+
+The left edge of column x is the sum of all column widths between it and the
+origin. Positive columns accumulate widths of columns `0 … x-1`; negative
+columns walk the other way and *subtract*, so column −1 ends at exactly 0 and
+starts at `-width(-1)`. Rows work identically on the y axis.
+
+Linear in the distance from the origin — fine here because sheets stay within
+thousands of cells of it, and the viewport calls this once per visible
+column, not per cell.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	/** World x of the left edge of column x (column 0 starts at 0). */
+	getColumnX(x: number): number {
+		let pos = 0;
+		if (x >= 0) {
+			for (let i = 0; i < x; i++) pos += this.getColumnWidth(i);
+		} else {
+			// !mark
+			for (let i = x; i < 0; i++) pos -= this.getColumnWidth(i);
+		}
+		return pos;
+	}
+}
+```
+
+## !!steps World → cell: walk until you pass it
+
+The inverse — *which column contains world coordinate wx?* — can't be a
+division because widths vary. So it walks outward from the origin,
+accumulating widths until the running edge passes `wx`. The loops are
+unbounded (`for (;;)`) because the grid is: any finite coordinate is reached
+in finitely many steps. The negative side subtracts first, then checks, so
+the boundary lands on the correct cell.
+
+This is what turns a mouse click into a cell.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	/** Column containing world coordinate wx. */
+	getColumnIndex(wx: number): number {
+		if (wx >= 0) {
+			let pos = 0;
+			let i = 0;
+			// !mark(1:6)
+			for (;;) {
+				const w = this.getColumnWidth(i);
+				if (wx < pos + w) return i;
+				pos += w;
+				i++;
+			}
+		} else {
+			let pos = 0;
+			let i = -1;
+			for (;;) {
+				pos -= this.getColumnWidth(i);
+				if (wx >= pos) return i;
+				i--;
+			}
+		}
+	}
+}
+```
+
+## !!steps A cell's rectangle
+
+`getCellRect` composes the four primitives into the rectangle everything else
+consumes: [CellInput.svelte](/docs/src/lib/components/CellInput.svelte)
+positions the floating editor with it, and the Pixi renderer
+([PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts)) uses the same math to
+draw cells, cursors and selection outlines — one source of truth for layout.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	/** Screen rectangle of the cell at (x, y) in world coordinates. */
+	getCellRect(x: number, y: number): { x: number; y: number; w: number; h: number } {
+		return {
+			x: this.getColumnX(x),
+			y: this.getRowY(y),
+			w: this.getColumnWidth(x),
+			h: this.getRowHeight(y)
+		};
+	}
+}
+```
+
+## !!steps Persistence is just the exceptions
+
+Because the maps are sparse, saving is trivial: export the entries as
+`Heading` records (`{ id, size }`), and import clears and refills. This is
+what lands in the `.grid` file via
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) — a sheet with default sizing
+serializes to two empty arrays.
+
+```ts ! GridOffsets.ts
+export class GridOffsets {
+	exportColumns(): Heading[] {
+		return [...this.columns.entries()].map(([id, size]) => ({ id, size }));
+	}
+
+	exportRows(): Heading[] {
+		return [...this.rows.entries()].map(([id, size]) => ({ id, size }));
+	}
+
+	importHeadings(columns: Heading[], rows: Heading[]): void {
+		this.columns.clear();
+		this.rows.clear();
+		for (const c of columns) if (c.size !== undefined) this.columns.set(c.id, c.size);
+		for (const r of rows) if (r.size !== undefined) this.rows.set(r.id, r.size);
+	}
+}
+```
+
+</Scrollycoding>
+
+The behavior is pinned down in
+[GridOffsets.test.ts](/docs/src/lib/core/GridOffsets.test.ts), including the
+negative-axis edge cases around the origin.

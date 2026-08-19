@@ -1,0 +1,6 @@
+{
+  "title": "bin",
+  "pages": [
+    "docgen.rs"
+  ]
+}

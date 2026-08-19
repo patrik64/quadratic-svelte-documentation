@@ -1,0 +1,20 @@
+{
+  "title": "components",
+  "pages": [
+    "BottomBar.svelte",
+    "CellInput.svelte",
+    "CellTypeMenu.svelte",
+    "CodeEditor.svelte",
+    "CommandPalette.svelte",
+    "DropdownMenu.svelte",
+    "FileMenu.svelte",
+    "FormulaDocs.svelte",
+    "GoTo.svelte",
+    "GridCanvas.svelte",
+    "GridContextMenu.svelte",
+    "Modal.svelte",
+    "SearchBar.svelte",
+    "SheetBar.svelte",
+    "TopBar.svelte"
+  ]
+}

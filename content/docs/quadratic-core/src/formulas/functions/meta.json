@@ -1,0 +1,20 @@
+{
+  "title": "functions",
+  "pages": [
+    "array.rs",
+    "database.rs",
+    "datetime.rs",
+    "engineering.rs",
+    "excel.rs",
+    "financial.rs",
+    "logic.rs",
+    "lookup.rs",
+    "mathematics.rs",
+    "mod.rs",
+    "operators.rs",
+    "statistics.rs",
+    "string.rs",
+    "trigonometry.rs",
+    "util.rs"
+  ]
+}

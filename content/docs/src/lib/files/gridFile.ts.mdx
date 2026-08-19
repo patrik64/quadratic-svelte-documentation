@@ -1,0 +1,282 @@
+---
+title: "gridFile.ts"
+description: "Source file src/lib/files/gridFile.ts of quadratic-svelte."
+source: "src/lib/files/gridFile.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts gridFile.ts -n
+import { Sheet } from '../core/Sheet';
+import type { SheetController } from '../core/SheetController';
+import type { GridFile } from '../core/types';
+
+export const DEFAULT_FILE_NAME = 'Untitled';
+const LEGACY_LOCAL_STORAGE_KEY = 'quadratic-svelte-file';
+const DB_NAME = 'quadratic-svelte';
+const DB_STORE = 'files';
+/** Pre-multi-file single slot; migrated to a per-id record on first load. */
+const LEGACY_SINGLE_KEY = 'current-file';
+/** Points at the id of the file that should open on the next visit. */
+const CURRENT_ID_KEY = 'current-id';
+
+export interface StoredFileMeta {
+	id: string;
+	filename: string;
+	modified: number;
+	sheets: number;
+}
+
+export function exportGridFile(sc: SheetController, filename: string, id: string): GridFile {
+	return {
+		sheets: sc.sheets.map((sheet, order) => {
+			const data = sheet.export();
+			return {
+				name: sheet.name,
+				order,
+				color: sheet.color,
+				borders: [],
+				cells: data.cells,
+				formats: data.formats,
+				columns: data.columns,
+				rows: data.rows,
+				cell_dependency: data.cell_dependency
+			};
+		}),
+		created: Date.now(),
+		filename,
+		id,
+		modified: Date.now(),
+		version: '1.3'
+	};
+}
+
+export function importGridFile(sc: SheetController, file: GridFile): void {
+	// v1.3 files nest content under sheets[]; v1.0–1.2 keep it at the top level
+	const legacy = file as unknown as {
+		cells?: unknown[];
+		formats?: unknown[];
+		columns?: unknown[];
+		rows?: unknown[];
+		cell_dependency?: string;
+	};
+	const sheetDatas =
+		file.sheets && file.sheets.length > 0 ? file.sheets : legacy.cells ? [legacy] : undefined;
+	if (!sheetDatas) throw new Error('Grid file has no sheets');
+
+	sc.sheets = sheetDatas.map((raw, i) => {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const f = raw as any;
+		const sheet = new Sheet();
+		sheet.name = f.name ?? `Sheet${i + 1}`;
+		sheet.color = f.color ?? undefined;
+		sheet.import({
+			cells: f.cells ?? [],
+			formats: f.formats ?? [],
+			columns: f.columns ?? [],
+			rows: f.rows ?? [],
+			cell_dependency: typeof f.cell_dependency === 'string' ? f.cell_dependency : '[]'
+		});
+		// files from the original app store borders separately, one entry per
+		// cell with `horizontal` = top edge and `vertical` = left edge; fold
+		// them into our per-format borders
+		if (Array.isArray(f.borders)) {
+			for (const b of f.borders as {
+				x: number;
+				y: number;
+				horizontal?: { color?: string };
+				vertical?: { color?: string };
+			}[]) {
+				if (!b || (b.horizontal === undefined && b.vertical === undefined)) continue;
+				const existing = sheet.getFormat(b.x, b.y) ?? { x: b.x, y: b.y };
+				const borders = { ...(existing.borders ?? {}) };
+				if (b.horizontal)
+					borders.top = typeof b.horizontal.color === 'string' ? b.horizontal.color : '#000000';
+				if (b.vertical)
+					borders.left = typeof b.vertical.color === 'string' ? b.vertical.color : '#000000';
+				sheet.setFormat(b.x, b.y, { ...existing, borders });
+			}
+		}
+		sheet.rebuildDependencies();
+		return sheet;
+	});
+	sc.currentSheetIndex = 0;
+}
+
+// IndexedDB persistence (localStorage's ~5MB quota silently truncated
+// larger sheets — the Monte Carlo example alone is ~3MB on disk).
+function openDb(): Promise<IDBDatabase> {
+	return new Promise((resolve, reject) => {
+		const req = indexedDB.open(DB_NAME, 1);
+		req.onupgradeneeded = () => {
+			if (!req.result.objectStoreNames.contains(DB_STORE)) {
+				req.result.createObjectStore(DB_STORE);
+			}
+		};
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error ?? new Error('IndexedDB open failed'));
+	});
+}
+
+/** Runs `use` inside one transaction; resolves when the transaction commits. */
+async function withStore<T>(
+	mode: IDBTransactionMode,
+	use: (store: IDBObjectStore, collect: (req: IDBRequest) => void) => void
+): Promise<T | undefined> {
+	const db = await openDb();
+	try {
+		return await new Promise<T | undefined>((resolve, reject) => {
+			const tx = db.transaction(DB_STORE, mode);
+			let last: IDBRequest | undefined;
+			use(tx.objectStore(DB_STORE), (req) => (last = req));
+			tx.oncomplete = () => resolve(last?.result as T | undefined);
+			tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
+			tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+		});
+	} finally {
+		db.close();
+	}
+}
+
+/** Persists a file under its id without touching which file is current. */
+export async function saveStoredFile(file: GridFile): Promise<void> {
+	await withStore('readwrite', (store) => store.put(file, file.id));
+}
+
+/** Persists the current file and marks it as the one to reopen.
+ * Throws on failure so callers can surface it. */
+export async function saveCurrentFile(file: GridFile): Promise<void> {
+	await withStore('readwrite', (store) => {
+		store.put(file, file.id);
+		store.put(file.id, CURRENT_ID_KEY);
+	});
+}
+
+export async function loadStoredFile(id: string): Promise<GridFile | undefined> {
+	return withStore<GridFile>('readonly', (store, collect) => collect(store.get(id)));
+}
+
+export async function deleteStoredFile(id: string): Promise<void> {
+	await withStore('readwrite', (store) => store.delete(id));
+}
+
+/** All stored files, newest-modified first. */
+export async function listStoredFiles(): Promise<StoredFileMeta[]> {
+	const db = await openDb();
+	try {
+		return await new Promise<StoredFileMeta[]>((resolve, reject) => {
+			const out: StoredFileMeta[] = [];
+			const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).openCursor();
+			req.onsuccess = () => {
+				const cursor = req.result;
+				if (!cursor) {
+					resolve(out.sort((a, b) => b.modified - a.modified));
+					return;
+				}
+				const v = cursor.value as GridFile;
+				// skip the current-id pointer (a bare string) and anything odd
+				if (v && typeof v === 'object' && Array.isArray(v.sheets)) {
+					out.push({
+						id: String(cursor.key),
+						filename: v.filename || DEFAULT_FILE_NAME,
+						modified: v.modified ?? 0,
+						sheets: v.sheets.length
+					});
+				}
+				cursor.continue();
+			};
+			req.onerror = () => reject(req.error ?? new Error('IndexedDB cursor failed'));
+		});
+	} finally {
+		db.close();
+	}
+}
+
+/** Loads the file to reopen, migrating both legacy layouts: the single-slot
+ * IndexedDB record from before multi-file support, and the pre-IndexedDB
+ * localStorage copy. */
+export async function loadCurrentFile(): Promise<GridFile | undefined> {
+	try {
+		const currentId = await withStore<string>('readonly', (store, collect) =>
+			collect(store.get(CURRENT_ID_KEY))
+		);
+		if (typeof currentId === 'string') {
+			const file = await loadStoredFile(currentId);
+			if (file) return file;
+		}
+		const legacy = await withStore<GridFile>('readonly', (store, collect) =>
+			collect(store.get(LEGACY_SINGLE_KEY))
+		);
+		if (legacy) {
+			if (!legacy.id) legacy.id = crypto.randomUUID();
+			await withStore('readwrite', (store) => {
+				store.put(legacy, legacy.id);
+				store.put(legacy.id, CURRENT_ID_KEY);
+				store.delete(LEGACY_SINGLE_KEY);
+			});
+			return legacy;
+		}
+	} catch {
+		// fall through to the localStorage copy
+	}
+	try {
+		const raw = localStorage.getItem(LEGACY_LOCAL_STORAGE_KEY);
+		if (!raw) return undefined;
+		const legacy = JSON.parse(raw) as GridFile;
+		if (!legacy.id) legacy.id = crypto.randomUUID();
+		await saveCurrentFile(legacy).catch(() => {});
+		localStorage.removeItem(LEGACY_LOCAL_STORAGE_KEY);
+		return legacy;
+	} catch {
+		return undefined;
+	}
+}
+
+export function downloadGridFile(file: GridFile): void {
+	const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement('a');
+	a.href = url;
+	a.download = `${file.filename}.grid`;
+	a.click();
+	URL.revokeObjectURL(url);
+}
+
+/** Minimal CSV parser (quotes, escaped quotes, CRLF). */
+export function parseCSV(text: string): string[][] {
+	const rows: string[][] = [];
+	let row: string[] = [];
+	let field = '';
+	let inQuotes = false;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (inQuotes) {
+			if (ch === '"') {
+				if (text[i + 1] === '"') {
+					field += '"';
+					i++;
+				} else inQuotes = false;
+			} else field += ch;
+		} else if (ch === '"') {
+			inQuotes = true;
+		} else if (ch === ',') {
+			row.push(field);
+			field = '';
+		} else if (ch === '\n' || ch === '\r') {
+			if (ch === '\r' && text[i + 1] === '\n') i++;
+			row.push(field);
+			field = '';
+			rows.push(row);
+			row = [];
+		} else field += ch;
+	}
+	if (field !== '' || row.length > 0) {
+		row.push(field);
+		rows.push(row);
+	}
+	return rows.filter((r) => !(r.length === 1 && r[0] === ''));
+}
+````

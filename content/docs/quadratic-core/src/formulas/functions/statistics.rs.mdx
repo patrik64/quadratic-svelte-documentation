@@ -1,0 +1,334 @@
+---
+title: "statistics.rs"
+description: "Rust module statistics.rs of the quadratic-core formula engine."
+source: "quadratic-core/src/formulas/functions/statistics.rs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````rust statistics.rs -n
+use super::*;
+
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "Statistics functions",
+    docs: "",
+    get_functions,
+};
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "AVERAGE",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["AVERAGE(A1:A6)", "AVERAGE(A1, A3, A5, B1:B6)"],
+            doc: "Returns the arithmetic mean of all values.",
+            eval: util::pure_fn(|args| {
+                Ok(Value::Number(
+                    util::sum(&args.inner) / util::count_numeric(&args.inner) as f64,
+                ))
+            }),
+        },
+        FormulaFunction {
+            name: "COUNT",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["COUNT(A1:C42, E17)", "SUM(A1:A10) / COUNT(A1:A10)"],
+            doc: "Returns the number of numeric values.",
+            eval: util::pure_fn(|args| Ok(Value::Number(util::count_numeric(&args.inner) as f64))),
+        },
+        FormulaFunction {
+            name: "MIN",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["MIN(A1:A6)", "MIN(0, A1:A6)"],
+            doc: "Returns the smallest value.\nReturns +∞ if given no values.",
+            eval: util::pure_fn(|args| {
+                Ok(Value::Number(
+                    util::flat_iter_numbers(&args.inner).fold(f64::INFINITY, f64::min),
+                ))
+            }),
+        },
+        FormulaFunction {
+            name: "MAX",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["MAX(A1:A6)", "MAX(0, A1:A6)"],
+            doc: "Returns the largest value.\nReturns -∞ if given no values.",
+            eval: util::pure_fn(|args| {
+                Ok(Value::Number(
+                    util::flat_iter_numbers(&args.inner).fold(-f64::INFINITY, f64::max),
+                ))
+            }),
+        },
+        FormulaFunction {
+            name: "COUNTA",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["COUNTA(A1:A10)"],
+            doc: "Returns the number of non-empty values.",
+            eval: util::pure_fn(|args| {
+                let count: usize = args
+                    .inner
+                    .iter()
+                    .flat_map(|v| flatten_values(&v.inner))
+                    .filter(|v| !matches!(v, Value::String(s) if s.is_empty()))
+                    .count();
+                Ok(Value::Number(count as f64))
+            }),
+        },
+        FormulaFunction {
+            name: "COUNTBLANK",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["COUNTBLANK(A1:A10)"],
+            doc: "Returns the number of empty values.",
+            eval: util::pure_fn(|args| {
+                let count: usize = args
+                    .inner
+                    .iter()
+                    .flat_map(|v| flatten_values(&v.inner))
+                    .filter(|v| matches!(v, Value::String(s) if s.is_empty()))
+                    .count();
+                Ok(Value::Number(count as f64))
+            }),
+        },
+        FormulaFunction {
+            name: "COUNTIF",
+            arg_completion: "${1:range}, ${2:criteria}",
+            usages: &["range, criteria"],
+            examples: &["COUNTIF(A1:A10, \">5\")", "COUNTIF(B1:B10, \"apple*\")"],
+            doc: "Returns the number of values in `range` matching `criteria`. \
+                  Criteria may be a value, a comparison like `\">=10\"` or `\"<>x\"`, \
+                  or text with the wildcards `*` and `?`.",
+            eval: util::pure_fn(|args| {
+                let (range, criteria) = two_args(args)?;
+                let criterion = Criterion::parse(&criteria);
+                let count = flatten_values(&range.inner)
+                    .iter()
+                    .filter(|v| criterion.matches(v))
+                    .count();
+                Ok(Value::Number(count as f64))
+            }),
+        },
+        FormulaFunction {
+            name: "SUMIF",
+            arg_completion: "${1:range}, ${2:criteria}",
+            usages: &["range, criteria", "range, criteria, sum_range"],
+            examples: &["SUMIF(A1:A10, \">5\")", "SUMIF(A1:A10, \"apple\", B1:B10)"],
+            doc: "Adds the values in `range` (or the corresponding values in \
+                  `sum_range`, if given) whose `range` entry matches `criteria`.",
+            eval: util::pure_fn(|args| {
+                let (range, criteria, other) = two_or_three_args(args)?;
+                let criterion = Criterion::parse(&criteria);
+                let test_values = flatten_values(&range.inner);
+                let sum_values = match &other {
+                    Some(v) => flatten_values(&v.inner),
+                    None => test_values.clone(),
+                };
+                let total: f64 = test_values
+                    .iter()
+                    .zip(sum_values.iter())
+                    .filter(|(test, _)| criterion.matches(test))
+                    .filter_map(|(_, v)| v.to_number().ok())
+                    .sum();
+                Ok(Value::Number(total))
+            }),
+        },
+        FormulaFunction {
+            name: "AVERAGEIF",
+            arg_completion: "${1:range}, ${2:criteria}",
+            usages: &["range, criteria", "range, criteria, average_range"],
+            examples: &["AVERAGEIF(A1:A10, \">0\")"],
+            doc: "Averages the values in `range` (or the corresponding values in \
+                  `average_range`, if given) whose `range` entry matches `criteria`.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let (range, criteria, other) = two_or_three_args(args)?;
+                let criterion = Criterion::parse(&criteria);
+                let test_values = flatten_values(&range.inner);
+                let avg_values = match &other {
+                    Some(v) => flatten_values(&v.inner),
+                    None => test_values.clone(),
+                };
+                let numbers: Vec<f64> = test_values
+                    .iter()
+                    .zip(avg_values.iter())
+                    .filter(|(test, _)| criterion.matches(test))
+                    .filter_map(|(_, v)| v.to_number().ok())
+                    .collect();
+                if numbers.is_empty() {
+                    return Err(FormulaErrorMsg::DivideByZero.with_span(span));
+                }
+                Ok(Value::Number(numbers.iter().sum::<f64>() / numbers.len() as f64))
+            }),
+        },
+    ]
+}
+
+/// Flattens a value (possibly an array) into a list of scalar values.
+fn flatten_values(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Array(rows) => rows.iter().flatten().cloned().collect(),
+        other => vec![other.clone()],
+    }
+}
+
+fn two_args(args: Spanned<Vec<Spanned<Value>>>) -> FormulaResult<(Spanned<Value>, String)> {
+    let span = args.span;
+    let mut a = args.inner.into_iter();
+    match (a.next(), a.next(), a.next()) {
+        (Some(range), Some(criteria), None) => Ok((range, criteria.to_string())),
+        _ => Err(FormulaErrorMsg::BadArgumentCount.with_span(span)),
+    }
+}
+
+fn two_or_three_args(
+    args: Spanned<Vec<Spanned<Value>>>,
+) -> FormulaResult<(Spanned<Value>, String, Option<Spanned<Value>>)> {
+    let span = args.span;
+    let mut a = args.inner.into_iter();
+    match (a.next(), a.next(), a.next(), a.next()) {
+        (Some(range), Some(criteria), third, None) => Ok((range, criteria.to_string(), third)),
+        _ => Err(FormulaErrorMsg::BadArgumentCount.with_span(span)),
+    }
+}
+
+/// Excel-style criteria for COUNTIF/SUMIF/AVERAGEIF: a comparison prefix
+/// (`>`, `>=`, `<`, `<=`, `<>`, `=`) followed by a number or text, or a bare
+/// value; text comparison is case-insensitive and supports `*`/`?` wildcards.
+pub(super) enum Criterion {
+    CompareNumber(CompareOp, f64),
+    CompareText(CompareOp, String),
+    MatchText(String), // lowercase, may contain wildcards
+    MatchNumber(f64),
+}
+
+#[derive(Copy, Clone, PartialEq)]
+pub(super) enum CompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Criterion {
+    pub(super) fn parse(criteria: &str) -> Self {
+        let (op, rest) = if let Some(rest) = criteria.strip_prefix(">=") {
+            (Some(CompareOp::Ge), rest)
+        } else if let Some(rest) = criteria.strip_prefix("<=") {
+            (Some(CompareOp::Le), rest)
+        } else if let Some(rest) = criteria.strip_prefix("<>") {
+            (Some(CompareOp::Ne), rest)
+        } else if let Some(rest) = criteria.strip_prefix('>') {
+            (Some(CompareOp::Gt), rest)
+        } else if let Some(rest) = criteria.strip_prefix('<') {
+            (Some(CompareOp::Lt), rest)
+        } else if let Some(rest) = criteria.strip_prefix('=') {
+            (Some(CompareOp::Eq), rest)
+        } else {
+            (None, criteria)
+        };
+        match op {
+            Some(op) => match rest.trim().parse::<f64>() {
+                Ok(n) => Criterion::CompareNumber(op, n),
+                Err(_) => Criterion::CompareText(op, rest.to_lowercase()),
+            },
+            None => match criteria.trim().parse::<f64>() {
+                Ok(n) => Criterion::MatchNumber(n),
+                Err(_) => Criterion::MatchText(criteria.to_lowercase()),
+            },
+        }
+    }
+
+    pub(super) fn matches(&self, value: &Value) -> bool {
+        match self {
+            Criterion::CompareNumber(op, n) => match value.to_number() {
+                Ok(v) => {
+                    // empty cells never match numeric comparisons
+                    if matches!(value, Value::String(s) if s.trim().is_empty()) {
+                        return false;
+                    }
+                    compare(*op, v, *n)
+                }
+                Err(_) => false,
+            },
+            Criterion::CompareText(op, text) => {
+                let v = value.to_string().to_lowercase();
+                match op {
+                    CompareOp::Eq => v == *text,
+                    CompareOp::Ne => v != *text,
+                    CompareOp::Lt => v < *text,
+                    CompareOp::Le => v <= *text,
+                    CompareOp::Gt => v > *text,
+                    CompareOp::Ge => v >= *text,
+                }
+            }
+            Criterion::MatchNumber(n) => value.to_number().is_ok_and(|v| {
+                !matches!(value, Value::String(s) if s.trim().is_empty()) && v == *n
+            }),
+            Criterion::MatchText(pattern) => {
+                util::wildcard_match(pattern, &value.to_string().to_lowercase())
+            }
+        }
+    }
+}
+
+fn compare(op: CompareOp, a: f64, b: f64) -> bool {
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::formulas::tests::*;
+
+    #[test]
+    fn test_formula_average() {
+        let form = parse_formula("AVERAGE(3, B1:D3)", pos![nAn1]).unwrap();
+
+        let mut g = FnGrid(|pos| {
+            if (1..=3).contains(&pos.x) && (1..=3).contains(&pos.y) {
+                Some((pos.x * 3 + pos.y).to_string()) // 4 .. 12
+            } else {
+                panic!("cell {pos} shouldn't be accessed")
+            }
+        });
+
+        assert_eq!(
+            "7.5".to_string(),
+            form.eval_blocking(&mut g, pos![nAn1]).unwrap().to_string(),
+        );
+
+        assert_eq!(
+            "17",
+            eval_to_string(&mut g, "AVERAGE(\"\", \"a\", 12, -3.5, 42.5)"),
+        );
+        assert_eq!("5.5", eval_to_string(&mut g, "AVERAGE(1..10)"));
+        assert_eq!("5", eval_to_string(&mut g, "AVERAGE(0..10)"));
+    }
+
+    #[test]
+    fn test_count() {
+        let g = &mut NoGrid;
+        assert_eq!("0", eval_to_string(g, "COUNT()"));
+        assert_eq!("3", eval_to_string(g, "COUNT(\"\", \"a\", 12, -3.5, 42.5)"));
+        assert_eq!("10", eval_to_string(g, "COUNT(1..10)"));
+        assert_eq!("11", eval_to_string(g, "COUNT(0..10)"));
+    }
+}
+````

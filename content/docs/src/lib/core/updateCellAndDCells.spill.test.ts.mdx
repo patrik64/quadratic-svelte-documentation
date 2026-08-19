@@ -1,0 +1,178 @@
+---
+title: "updateCellAndDCells.spill.test.ts"
+description: "Spill semantics, exercised through JAVASCRIPT cells: the JS runner is a pure AsyncFunction wrapper, so the whole recompute pipeline runs in node without wasm…"
+source: "src/lib/core/updateCellAndDCells.spill.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts updateCellAndDCells.spill.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { SheetController } from './SheetController';
+import type { Cell } from './types';
+import { updateCellAndDCells } from './updateCellAndDCells';
+
+// Spill semantics, exercised through JAVASCRIPT cells: the JS runner is a
+// pure AsyncFunction wrapper, so the whole recompute pipeline runs in node
+// without wasm or Pyodide.
+
+async function runCode(sc: SheetController, x: number, y: number, code: string): Promise<void> {
+	// mirrors saveCellCode: re-saving a same-type code cell keeps its fields
+	// (array_cells carries spill ownership across re-runs)
+	const existing = sc.sheet.getCell(x, y);
+	const cell: Cell = {
+		...(existing && existing.type === 'JAVASCRIPT' ? existing : {}),
+		x,
+		y,
+		type: 'JAVASCRIPT',
+		value: existing?.value ?? '',
+		javascript_code: code,
+		last_modified: '2026-01-01T00:00:00.000Z'
+	};
+	sc.startTransaction();
+	await updateCellAndDCells({ starting_cells: [cell], sheetController: sc });
+	sc.endTransaction();
+}
+
+async function typeText(sc: SheetController, x: number, y: number, value: string): Promise<void> {
+	const cell: Cell = { x, y, type: 'TEXT', value, last_modified: '2026-01-01T00:00:00.000Z' };
+	sc.startTransaction();
+	await updateCellAndDCells({ starting_cells: [cell], sheetController: sc });
+	sc.endTransaction();
+}
+
+async function deleteCell(sc: SheetController, x: number, y: number): Promise<void> {
+	const existing = sc.sheet.getCell(x, y);
+	if (!existing) return;
+	sc.startTransaction();
+	await updateCellAndDCells({
+		starting_cells: [existing],
+		sheetController: sc,
+		delete_starting_cells: true
+	});
+	sc.endTransaction();
+}
+
+describe('spill', () => {
+	it('spills arrays onto empty cells', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
+		expect(sc.sheet.getCell(0, 2)?.value).toBe('3');
+		expect(sc.sheet.getCell(0, 0)?.array_cells).toHaveLength(3);
+	});
+
+	it('blocks instead of overwriting a foreign cell', async () => {
+		const sc = new SheetController();
+		await typeText(sc, 0, 1, 'precious');
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+
+		const origin = sc.sheet.getCell(0, 0);
+		expect(origin?.value).toBe('#SPILL!');
+		expect(origin?.evaluation_result?.success).toBe(false);
+		expect(origin?.evaluation_result?.std_err).toContain('A1');
+		expect(origin?.array_cells).toBeUndefined();
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('precious');
+		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
+	});
+
+	it('records blockers in cells_accessed so the dep survives rebuilds', async () => {
+		const sc = new SheetController();
+		await typeText(sc, 0, 1, 'x');
+		await runCode(sc, 0, 0, 'return [1, 2];');
+
+		expect(sc.sheet.getCell(0, 0)?.evaluation_result?.cells_accessed).toContainEqual([0, 1]);
+		sc.sheet.rebuildDependencies();
+		expect(sc.sheet.getDependents(0, 1)).toContainEqual({ x: 0, y: 0 });
+	});
+
+	it('un-spills automatically when the blocker is deleted', async () => {
+		const sc = new SheetController();
+		await typeText(sc, 0, 1, 'x');
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
+
+		await deleteCell(sc, 0, 1);
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
+		expect(sc.sheet.getCell(0, 2)?.value).toBe('3');
+	});
+
+	it('flips the owner to #SPILL! when a value is typed into a live spill', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+		await typeText(sc, 0, 1, 'mine now');
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('mine now');
+		// the rest of the stale spill is cleaned up
+		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
+	});
+
+	it('re-spills when a spilled COMPUTED cell is deleted directly', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+		await deleteCell(sc, 0, 1);
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
+	});
+
+	it('two origins fight over a cell and release cleanly', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2];'); // spills (0,0),(0,1)
+		// B's origin lands on A's spill: A must block, B takes over
+		await runCode(sc, 0, 1, 'return [9];');
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('9');
+
+		await deleteCell(sc, 0, 1);
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
+	});
+
+	it('undo restores the pre-block state and redo re-blocks', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+		await typeText(sc, 0, 1, 'blocker');
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
+
+		sc.undo();
+		sc.sheet.rebuildDependencies();
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
+		expect(sc.sheet.getCell(0, 2)?.value).toBe('3');
+
+		sc.redo();
+		sc.sheet.rebuildDependencies();
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('blocker');
+	});
+
+	it('single-value output never blocks', async () => {
+		const sc = new SheetController();
+		await typeText(sc, 0, 1, 'neighbor');
+		await runCode(sc, 0, 0, 'return [42];');
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('42');
+		expect(sc.sheet.getCell(0, 0)?.evaluation_result?.success).toBe(true);
+		expect(sc.sheet.getCell(0, 1)?.value).toBe('neighbor');
+	});
+
+	it('a shrinking spill cleans only its own cells', async () => {
+		const sc = new SheetController();
+		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+		await runCode(sc, 0, 0, 'return [7];');
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('7');
+		expect(sc.sheet.getCell(0, 1)).toBeUndefined();
+		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
+	});
+});
+````

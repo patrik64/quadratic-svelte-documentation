@@ -1,0 +1,71 @@
+---
+title: "grid_proxy.rs"
+description: "The one-method async GridProxy trait that lets the formula engine read cells without knowing where the grid actually lives."
+source: "quadratic-core/src/formulas/grid_proxy.rs"
+full: true
+---
+
+The formula engine never owns the spreadsheet. Instead it evaluates against
+anything that implements `GridProxy` — a sixteen-line trait with a single
+async method. On the web that implementation is `JsGridProxy` in
+[lib.rs](/docs/quadratic-core/src/lib.rs), which forwards each read to the
+JavaScript grid-accessor callback the app passes into `eval_formula`.
+
+<Scrollycoding>
+
+## !!steps One async method
+
+`get` fetches the contents of one cell as an optional string — `None` means
+the cell is empty. Note what it deliberately does *not* do: check for
+circular references. That guard lives one layer up, in
+`Ctx::get_cell` ([ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs)), so
+every proxy implementation stays trivial. It takes `&mut self` because
+implementations may record state — `JsGridProxy` logs every position it
+touches to build the `cells_accessed` dependency list.
+
+```rust ! grid_proxy.rs
+use async_trait::async_trait;
+
+use crate::Pos;
+
+// ...
+#[async_trait(?Send)]
+pub trait GridProxy {
+    /// Fetches the contents of the cell at `pos`, not checking whether it
+    /// results in a circular reference.
+    // !mark
+    async fn get(&mut self, pos: Pos) -> Option<String>;
+}
+```
+
+## !!steps Why Send is opted out
+
+Async methods in traits are desugared by the `async_trait` macro into boxed
+futures, and the doc comment insists on the `?Send` variant: the returned
+futures must *not* be required to be thread-safe. The reason is the wasm
+target — resolving a cell awaits a JavaScript function, and `JsValue` cannot
+be sent between threads, so a `Send` bound would make the web implementation
+impossible.
+
+```rust ! grid_proxy.rs
+/// Something that acts like a read-only spreadsheet grid.
+///
+/// Implement this using `#[async_trait(?Send)]`; see this link for why:
+/// https://rust-lang.github.io/async-book/07_workarounds/05_async_in_traits.html
+///
+// !mark
+/// `?Send` is necessary because `JsValue` can't be sent between threads.
+#[async_trait(?Send)]
+pub trait GridProxy {
+    // ...
+}
+```
+
+</Scrollycoding>
+
+The trait is consumed as `&mut dyn GridProxy` by
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs), which layers
+circular-reference detection on top. The production implementation —
+`JsGridProxy` wrapping a `js_sys::Function` — is in
+[lib.rs](/docs/quadratic-core/src/lib.rs), and the accessor it calls is built
+by [runFormula.ts](/docs/src/lib/formulas/runFormula.ts).

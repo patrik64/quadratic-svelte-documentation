@@ -1,0 +1,196 @@
+---
+title: "SheetController.test.ts"
+description: "Unit tests for SheetController.ts."
+source: "src/lib/core/SheetController.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts SheetController.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { SheetController } from './SheetController';
+import type { Cell } from './types';
+
+function textCell(x: number, y: number, value: string): Cell {
+	return { x, y, type: 'TEXT', value, last_modified: '2026-01-01T00:00:00.000Z' };
+}
+
+describe('transactions and undo/redo', () => {
+	it('undoes and redoes a setCell', () => {
+		const sc = new SheetController();
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'a') });
+		sc.endTransaction();
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('a');
+		sc.undo();
+		expect(sc.sheet.getCell(0, 0)).toBeUndefined();
+		sc.redo();
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('a');
+	});
+
+	it('applies inverse ops in reverse order within a transaction', () => {
+		const sc = new SheetController();
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'first') });
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'second') });
+		sc.endTransaction();
+
+		expect(sc.sheet.getCell(0, 0)?.value).toBe('second');
+		sc.undo(); // must unwind second → first → gone, not leave 'first' behind
+		expect(sc.sheet.getCell(0, 0)).toBeUndefined();
+	});
+
+	it('clears the redo stack when a new transaction lands', () => {
+		const sc = new SheetController();
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'a') });
+		sc.endTransaction();
+		sc.undo();
+		expect(sc.hasRedo).toBe(true);
+
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 1, y: 1, cell: textCell(1, 1, 'b') });
+		sc.endTransaction();
+		expect(sc.hasRedo).toBe(false);
+	});
+
+	it('drops empty transactions', () => {
+		const sc = new SheetController();
+		sc.startTransaction();
+		sc.endTransaction();
+		expect(sc.hasUndo).toBe(false);
+	});
+
+	it('restores a previous format on undo', () => {
+		const sc = new SheetController();
+		sc.sheet.setFormat(2, 2, { bold: true });
+		sc.startTransaction();
+		sc.execute({ type: 'setFormat', x: 2, y: 2, format: { x: 2, y: 2, italic: true } });
+		sc.endTransaction();
+
+		expect(sc.sheet.getFormat(2, 2)?.italic).toBe(true);
+		expect(sc.sheet.getFormat(2, 2)?.bold).toBeUndefined();
+		sc.undo();
+		expect(sc.sheet.getFormat(2, 2)?.bold).toBe(true);
+	});
+
+	it('restores heading sizes on undo', () => {
+		const sc = new SheetController();
+		sc.startTransaction();
+		sc.execute({ type: 'setHeading', kind: 'column', id: 3, size: 200 });
+		sc.endTransaction();
+
+		expect(sc.sheet.gridOffsets.getColumnWidth(3)).toBe(200);
+		sc.undo();
+		expect(sc.sheet.gridOffsets.exportColumns()).toEqual([]);
+	});
+
+	it('routes ops to the tagged sheet, not the current one', () => {
+		const sc = new SheetController();
+		sc.addSheet(); // becomes current (index 1)
+		sc.switchSheet(0);
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'other'), sheetIndex: 1 });
+		sc.endTransaction();
+
+		expect(sc.sheets[0].getCell(0, 0)).toBeUndefined();
+		expect(sc.sheets[1].getCell(0, 0)?.value).toBe('other');
+		sc.undo();
+		expect(sc.sheets[1].getCell(0, 0)).toBeUndefined();
+	});
+
+	it('undo/redo on empty stacks is a no-op', () => {
+		const sc = new SheetController();
+		expect(() => {
+			sc.undo();
+			sc.redo();
+		}).not.toThrow();
+	});
+});
+
+describe('sheet management', () => {
+	it('names new sheets with the next free number', () => {
+		const sc = new SheetController();
+		expect(sc.addSheet().name).toBe('Sheet2');
+		expect(sc.addSheet().name).toBe('Sheet3');
+		sc.renameSheet(1, 'Data');
+		expect(sc.addSheet().name).toBe('Sheet2');
+	});
+
+	it('refuses duplicate or empty names and clamps to 31 chars', () => {
+		const sc = new SheetController();
+		sc.addSheet();
+		sc.renameSheet(1, 'Sheet1'); // duplicate → refused
+		expect(sc.sheets[1].name).toBe('Sheet2');
+		sc.renameSheet(1, '   '); // empty → refused
+		expect(sc.sheets[1].name).toBe('Sheet2');
+		sc.renameSheet(1, 'x'.repeat(40));
+		expect(sc.sheets[1].name).toBe('x'.repeat(31));
+	});
+
+	it('never deletes the last sheet, and clears undo history on delete', () => {
+		const sc = new SheetController();
+		sc.deleteSheet(0);
+		expect(sc.sheets.length).toBe(1);
+
+		sc.addSheet();
+		sc.startTransaction();
+		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'a') });
+		sc.endTransaction();
+		expect(sc.hasUndo).toBe(true);
+		sc.deleteSheet(1);
+		expect(sc.sheets.length).toBe(1);
+		expect(sc.hasUndo).toBe(false);
+	});
+
+	it('duplicates a sheet as a deep copy', () => {
+		const sc = new SheetController();
+		sc.sheet.setCell(textCell(1, 1, 'source'));
+		sc.duplicateSheet(0);
+
+		expect(sc.sheets[1].name).toBe('Sheet1 copy');
+		expect(sc.sheets[1].getCell(1, 1)?.value).toBe('source');
+		sc.sheets[1].setCell(textCell(1, 1, 'changed'));
+		expect(sc.sheets[0].getCell(1, 1)?.value).toBe('source');
+	});
+
+	it('moves sheets and keeps the current index tracking the sheet', () => {
+		const sc = new SheetController();
+		sc.addSheet();
+		sc.addSheet(); // current index 2 (Sheet3)
+		sc.moveSheet(2, -1);
+		expect(sc.sheets.map((s) => s.name)).toEqual(['Sheet1', 'Sheet3', 'Sheet2']);
+		expect(sc.currentSheetIndex).toBe(1);
+	});
+});
+
+describe('cross-sheet dependency graph', () => {
+	it('finds dependents whose rects contain the changed cell', () => {
+		const sc = new SheetController();
+		sc.setCrossSheetDeps({ sheetIndex: 1, x: 5, y: 5 }, [
+			{ sheetName: 'Sheet1', x0: 0, y0: 0, x1: 2, y1: 2 }
+		]);
+
+		expect(sc.getCrossSheetDependents('Sheet1', 1, 1)).toEqual([{ sheetIndex: 1, x: 5, y: 5 }]);
+		expect(sc.getCrossSheetDependents('Sheet1', 3, 1)).toEqual([]);
+		expect(sc.getCrossSheetDependents('Other', 1, 1)).toEqual([]);
+	});
+
+	it('replaces previous deps for the same dependent cell', () => {
+		const sc = new SheetController();
+		sc.setCrossSheetDeps({ sheetIndex: 1, x: 5, y: 5 }, [
+			{ sheetName: 'Sheet1', x0: 0, y0: 0, x1: 0, y1: 0 }
+		]);
+		sc.setCrossSheetDeps({ sheetIndex: 1, x: 5, y: 5 }, [
+			{ sheetName: 'Sheet1', x0: 9, y0: 9, x1: 9, y1: 9 }
+		]);
+
+		expect(sc.getCrossSheetDependents('Sheet1', 0, 0)).toEqual([]);
+		expect(sc.getCrossSheetDependents('Sheet1', 9, 9)).toEqual([{ sheetIndex: 1, x: 5, y: 5 }]);
+	});
+});
+````

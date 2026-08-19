@@ -1,0 +1,6 @@
+{
+  "title": "scripts",
+  "pages": [
+    "generate-examples.mjs"
+  ]
+}

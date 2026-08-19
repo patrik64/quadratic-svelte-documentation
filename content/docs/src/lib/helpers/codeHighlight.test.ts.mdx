@@ -1,0 +1,161 @@
+---
+title: "codeHighlight.test.ts"
+description: "Unit tests for codeHighlight.ts."
+source: "src/lib/helpers/codeHighlight.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts codeHighlight.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { tokenizeJs, tokenizePython, type CodeToken } from './codeHighlight';
+
+const rejoin = (tokens: CodeToken[]): string => tokens.map((t) => t.text).join('');
+const typedJs = (code: string): CodeToken[] =>
+	tokenizeJs(code).filter((t) => t.type !== 'plain');
+const typedPy = (code: string): CodeToken[] =>
+	tokenizePython(code).filter((t) => t.type !== 'plain');
+
+describe('tokenizeJs', () => {
+	it('round-trips the input exactly', () => {
+		const code = [
+			"let total = q.cells('D6');",
+			'// comment',
+			'const s = `sum: ${total * 2}`;',
+			'return s;'
+		].join('\n');
+		expect(rejoin(tokenizeJs(code))).toBe(code);
+	});
+
+	it('classifies keywords and literals', () => {
+		expect(typedJs('const x = null;')).toEqual([
+			{ type: 'keyword', text: 'const' },
+			{ type: 'literal', text: 'null' }
+		]);
+	});
+
+	it('does not treat property names as keywords', () => {
+		expect(typedJs('a.new').length).toBe(0);
+		expect(typedJs('b .delete').length).toBe(0);
+	});
+
+	it('marks identifiers followed by ( as function calls', () => {
+		expect(typedJs("q.cells('D6')")).toEqual([
+			{ type: 'function', text: 'cells' },
+			{ type: 'string', text: "'D6'" }
+		]);
+	});
+
+	it('handles line and block comments', () => {
+		expect(typedJs('// hi\nlet x')).toEqual([
+			{ type: 'comment', text: '// hi' },
+			{ type: 'keyword', text: 'let' }
+		]);
+		expect(typedJs('/* a\nb */ 1')).toEqual([
+			{ type: 'comment', text: '/* a\nb */' },
+			{ type: 'number', text: '1' }
+		]);
+	});
+
+	it('handles escaped quotes inside strings', () => {
+		expect(typedJs("'it\\'s'")).toEqual([{ type: 'string', text: "'it\\'s'" }]);
+	});
+
+	it('terminates unclosed strings at the newline', () => {
+		expect(typedJs('"abc\nlet x')).toEqual([
+			{ type: 'string', text: '"abc' },
+			{ type: 'keyword', text: 'let' }
+		]);
+	});
+
+	it('tokenizes template literal interpolations as code', () => {
+		expect(typedJs('`a${x + 1}b`')).toEqual([
+			{ type: 'string', text: '`a' },
+			{ type: 'number', text: '1' },
+			{ type: 'string', text: 'b`' }
+		]);
+	});
+
+	it('recognizes number formats', () => {
+		expect(typedJs('0xFF 1.5e3 10n .25')).toEqual([
+			{ type: 'number', text: '0xFF' },
+			{ type: 'number', text: '1.5e3' },
+			{ type: 'number', text: '10n' },
+			{ type: 'number', text: '.25' }
+		]);
+	});
+
+	it('round-trips unterminated templates and strings', () => {
+		for (const code of ['`abc${x', '`abc', '"abc', "'a\\"]) {
+			expect(rejoin(tokenizeJs(code))).toBe(code);
+		}
+	});
+});
+
+describe('tokenizePython', () => {
+	it('round-trips the input exactly', () => {
+		const code = ['# fetch a cell', 'total = cell(0, 0)', "msg = f'total: {total}'"].join('\n');
+		expect(rejoin(tokenizePython(code))).toBe(code);
+	});
+
+	it('classifies keywords and literals', () => {
+		expect(typedPy('if x is None:')).toEqual([
+			{ type: 'keyword', text: 'if' },
+			{ type: 'keyword', text: 'is' },
+			{ type: 'literal', text: 'None' }
+		]);
+	});
+
+	it('does not treat attribute names as keywords', () => {
+		expect(typedPy('df.import_')).toEqual([]);
+		expect(typedPy('obj.pass')).toEqual([]);
+	});
+
+	it('marks calls and hash comments', () => {
+		expect(typedPy('cell(0, 0)  # ref')).toEqual([
+			{ type: 'function', text: 'cell' },
+			{ type: 'number', text: '0' },
+			{ type: 'number', text: '0' },
+			{ type: 'comment', text: '# ref' }
+		]);
+	});
+
+	it('handles triple-quoted strings across lines', () => {
+		expect(typedPy('"""a\nb"""\nreturn')).toEqual([
+			{ type: 'string', text: '"""a\nb"""' },
+			{ type: 'keyword', text: 'return' }
+		]);
+	});
+
+	it('treats prefixed strings as strings', () => {
+		expect(typedPy("f'total: {t}'")).toEqual([{ type: 'string', text: "f'total: {t}'" }]);
+		expect(typedPy('rb"\\d+"')).toEqual([{ type: 'string', text: 'rb"\\d+"' }]);
+	});
+
+	it('terminates unclosed single-quoted strings at the newline', () => {
+		expect(typedPy("'abc\npass")).toEqual([
+			{ type: 'string', text: "'abc" },
+			{ type: 'keyword', text: 'pass' }
+		]);
+	});
+
+	it('recognizes number formats', () => {
+		expect(typedPy('0xFF 1_000 1.5e3 2j .25')).toEqual([
+			{ type: 'number', text: '0xFF' },
+			{ type: 'number', text: '1_000' },
+			{ type: 'number', text: '1.5e3' },
+			{ type: 'number', text: '2j' },
+			{ type: 'number', text: '.25' }
+		]);
+	});
+
+	it('round-trips unterminated strings', () => {
+		for (const code of ['"""abc\ndef', "'abc", "f'a{b", "'a\\"]) {
+			expect(rejoin(tokenizePython(code))).toBe(code);
+		}
+	});
+});
+````

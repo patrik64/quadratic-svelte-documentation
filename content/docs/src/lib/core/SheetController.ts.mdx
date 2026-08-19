@@ -1,0 +1,282 @@
+---
+title: "SheetController.ts"
+description: "Operation-based transactions with captured inverses, replacing Quadratic's statement/runner architecture. Ops are tagged with the sheet they ran on so undo/r…"
+source: "src/lib/core/SheetController.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts SheetController.ts -n
+import { Sheet } from './Sheet';
+import type { Cell, CellFormat } from './types';
+
+// Operation-based transactions with captured inverses, replacing Quadratic's
+// statement/runner architecture. Ops are tagged with the sheet they ran on so
+// undo/redo lands on the right sheet in a multi-sheet file.
+
+export type Op = (
+	| { type: 'setCell'; x: number; y: number; cell: Cell | undefined }
+	| { type: 'setFormat'; x: number; y: number; format: CellFormat | undefined }
+	| { type: 'setHeading'; kind: 'column' | 'row'; id: number; size: number | undefined }
+) & { sheetIndex?: number };
+
+interface Transaction {
+	ops: Op[]; // inverse ops, in execution order (undo applies them reversed)
+}
+
+export class SheetController {
+	sheets: Sheet[] = [new Sheet()];
+	currentSheetIndex = 0;
+
+	private undoStack: Transaction[] = [];
+	private redoStack: Transaction[] = [];
+	private activeTransaction: Transaction | undefined;
+
+	/** Cross-sheet formula dependencies: rect on a named sheet → dependent
+	 * cell. Kept as rects so huge ranges cost one entry; rebuilt from formula
+	 * text on load, so it is not persisted in the file. */
+	private crossDeps: {
+		sheetName: string;
+		x0: number;
+		y0: number;
+		x1: number;
+		y1: number;
+		depSheetIndex: number;
+		depX: number;
+		depY: number;
+	}[] = [];
+
+	setCrossSheetDeps(
+		dependent: { sheetIndex: number; x: number; y: number },
+		refs: { sheetName: string; x0: number; y0: number; x1: number; y1: number }[]
+	): void {
+		this.crossDeps = this.crossDeps.filter(
+			(d) =>
+				!(
+					d.depSheetIndex === dependent.sheetIndex &&
+					d.depX === dependent.x &&
+					d.depY === dependent.y
+				)
+		);
+		for (const ref of refs) {
+			this.crossDeps.push({
+				...ref,
+				depSheetIndex: dependent.sheetIndex,
+				depX: dependent.x,
+				depY: dependent.y
+			});
+		}
+	}
+
+	/** Cells (possibly on other sheets) whose formulas read (x, y) on `sheetName`. */
+	getCrossSheetDependents(
+		sheetName: string,
+		x: number,
+		y: number
+	): { sheetIndex: number; x: number; y: number }[] {
+		return this.crossDeps
+			.filter(
+				(d) =>
+					d.sheetName === sheetName && x >= d.x0 && x <= d.x1 && y >= d.y0 && y <= d.y1
+			)
+			.map((d) => ({ sheetIndex: d.depSheetIndex, x: d.depX, y: d.depY }));
+	}
+
+	/** Re-derives cross-sheet deps by scanning formula text (used on load). */
+	rebuildCrossSheetDeps(findRefs: (code: string) => { sheetName: string; x0: number; y0: number; x1: number; y1: number }[]): void {
+		this.crossDeps = [];
+		this.sheets.forEach((sheet, sheetIndex) => {
+			for (const cell of sheet.getAllCells()) {
+				if (cell.type !== 'FORMULA' || !cell.formula_code) continue;
+				const refs = findRefs(cell.formula_code);
+				if (refs.length > 0) {
+					this.setCrossSheetDeps({ sheetIndex, x: cell.x, y: cell.y }, refs);
+				}
+			}
+		});
+	}
+
+	/** Called after any model mutation so the UI can re-render/persist. */
+	onChange: () => void = () => {};
+
+	/** The active sheet; all grid actions operate on this. */
+	get sheet(): Sheet {
+		return this.sheets[this.currentSheetIndex] ?? this.sheets[0];
+	}
+
+	// ---------- sheet management (not undoable, matching v0.3) ----------
+
+	private nextSheetName(base = 'Sheet'): string {
+		let n = 1;
+		const names = new Set(this.sheets.map((s) => s.name));
+		while (names.has(`${base}${n}`)) n++;
+		return `${base}${n}`;
+	}
+
+	addSheet(): Sheet {
+		const sheet = new Sheet();
+		sheet.name = this.nextSheetName();
+		this.sheets.push(sheet);
+		this.currentSheetIndex = this.sheets.length - 1;
+		this.onChange();
+		return sheet;
+	}
+
+	deleteSheet(index: number): void {
+		if (this.sheets.length <= 1) return;
+		this.sheets.splice(index, 1);
+		this.currentSheetIndex = Math.min(this.currentSheetIndex, this.sheets.length - 1);
+		// undo history may reference the removed sheet; clear to stay consistent
+		this.undoStack = [];
+		this.redoStack = [];
+		this.onChange();
+	}
+
+	duplicateSheet(index: number): void {
+		const source = this.sheets[index];
+		if (!source) return;
+		const copy = new Sheet();
+		const names = new Set(this.sheets.map((s) => s.name));
+		let name = `${source.name} copy`;
+		for (let n = 2; names.has(name); n++) name = `${source.name} copy ${n}`;
+		copy.name = name;
+		copy.color = source.color;
+		copy.import(JSON.parse(JSON.stringify(source.export())));
+		copy.rebuildDependencies();
+		this.sheets.splice(index + 1, 0, copy);
+		this.currentSheetIndex = index + 1;
+		this.onChange();
+	}
+
+	renameSheet(index: number, name: string): void {
+		const trimmed = name.trim().slice(0, 31);
+		if (!trimmed || this.sheets.some((s, i) => i !== index && s.name === trimmed)) return;
+		this.sheets[index].name = trimmed;
+		this.onChange();
+	}
+
+	moveSheet(index: number, direction: -1 | 1): void {
+		const target = index + direction;
+		if (target < 0 || target >= this.sheets.length) return;
+		const [sheet] = this.sheets.splice(index, 1);
+		this.sheets.splice(target, 0, sheet);
+		if (this.currentSheetIndex === index) this.currentSheetIndex = target;
+		else if (this.currentSheetIndex === target) this.currentSheetIndex = index;
+		this.onChange();
+	}
+
+	setSheetColor(index: number, color: string | undefined): void {
+		this.sheets[index].color = color;
+		this.onChange();
+	}
+
+	switchSheet(index: number): void {
+		if (index < 0 || index >= this.sheets.length) return;
+		this.currentSheetIndex = index;
+		this.onChange();
+	}
+
+	// ---------- transactions ----------
+
+	startTransaction(): void {
+		if (this.activeTransaction) this.endTransaction();
+		this.activeTransaction = { ops: [] };
+	}
+
+	endTransaction(): void {
+		if (!this.activeTransaction) return;
+		if (this.activeTransaction.ops.length > 0) {
+			this.undoStack.push(this.activeTransaction);
+			this.redoStack = [];
+		}
+		this.activeTransaction = undefined;
+		this.onChange();
+	}
+
+	/** Apply op, recording its inverse in the active transaction. */
+	execute(op: Op): void {
+		if (op.sheetIndex === undefined) op.sheetIndex = this.currentSheetIndex;
+		const inverse = this.applyOp(op);
+		this.activeTransaction?.ops.push(inverse);
+	}
+
+	private applyOp(op: Op): Op {
+		const sheet = this.sheets[op.sheetIndex ?? this.currentSheetIndex] ?? this.sheet;
+		const sheetIndex = op.sheetIndex ?? this.currentSheetIndex;
+		switch (op.type) {
+			case 'setCell': {
+				const prev = sheet.getCell(op.x, op.y);
+				const inverse: Op = {
+					type: 'setCell',
+					x: op.x,
+					y: op.y,
+					cell: prev ? { ...prev } : undefined,
+					sheetIndex
+				};
+				if (op.cell) sheet.setCell({ ...op.cell });
+				else sheet.deleteCell(op.x, op.y);
+				return inverse;
+			}
+			case 'setFormat': {
+				const prev = sheet.getFormat(op.x, op.y);
+				const inverse: Op = {
+					type: 'setFormat',
+					x: op.x,
+					y: op.y,
+					format: prev ? { ...prev } : undefined,
+					sheetIndex
+				};
+				if (op.format) {
+					sheet.clearFormat(op.x, op.y);
+					sheet.setFormat(op.x, op.y, op.format);
+				} else sheet.clearFormat(op.x, op.y);
+				return inverse;
+			}
+			case 'setHeading': {
+				const prev =
+					op.kind === 'column'
+						? sheet.gridOffsets.exportColumns().find((c) => c.id === op.id)?.size
+						: sheet.gridOffsets.exportRows().find((r) => r.id === op.id)?.size;
+				const inverse: Op = {
+					type: 'setHeading',
+					kind: op.kind,
+					id: op.id,
+					size: prev,
+					sheetIndex
+				};
+				if (op.kind === 'column') sheet.gridOffsets.setColumnWidth(op.id, op.size);
+				else sheet.gridOffsets.setRowHeight(op.id, op.size);
+				return inverse;
+			}
+		}
+	}
+
+	get hasUndo(): boolean {
+		return this.undoStack.length > 0;
+	}
+	get hasRedo(): boolean {
+		return this.redoStack.length > 0;
+	}
+
+	undo(): void {
+		const tx = this.undoStack.pop();
+		if (!tx) return;
+		const redo: Transaction = { ops: [] };
+		for (let i = tx.ops.length - 1; i >= 0; i--) redo.ops.push(this.applyOp(tx.ops[i]));
+		this.redoStack.push(redo);
+		this.onChange();
+	}
+
+	redo(): void {
+		const tx = this.redoStack.pop();
+		if (!tx) return;
+		const undo: Transaction = { ops: [] };
+		for (let i = tx.ops.length - 1; i >= 0; i--) undo.ops.push(this.applyOp(tx.ops[i]));
+		this.undoStack.push(undo);
+		this.onChange();
+	}
+}
+````

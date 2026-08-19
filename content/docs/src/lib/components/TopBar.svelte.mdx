@@ -1,0 +1,595 @@
+---
+title: "TopBar.svelte"
+description: "Menubar layout following the modern client's TopBar: [logo] File · Edit · View · Insert · Format · Help | filename | controls"
+source: "src/lib/components/TopBar.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte TopBar.svelte -n
+<script lang="ts">
+	// Menubar layout following the modern client's TopBar:
+	// [logo] File · Edit · View · Insert · Format · Help | filename | controls
+	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
+	import {
+		addSheet,
+		app,
+		changeDecimals,
+		clearFormatting,
+		copySelection,
+		copySelectionAsPng,
+		downloadSelectionAsCsv,
+		fillDown,
+		fillRight,
+		importCSVAt,
+		insertTodayDate,
+		newFile,
+		openCodeEditorAt,
+		pasteFromClipboard,
+		redo,
+		rerunAllCode,
+		saveFile,
+		copyFormat,
+		pasteFormat,
+		setAlignment,
+		setBorders,
+		setFormat,
+		setWrapping,
+		setTextFormat,
+		setZoom,
+		toggleBold,
+		toggleItalic,
+		undo,
+		zoomIn,
+		zoomOut,
+		zoomTo100,
+		zoomToFit,
+		zoomToSelection
+	} from '../state.svelte';
+	import DropdownMenu from './DropdownMenu.svelte';
+
+	const C = KeyboardSymbols.Cmd;
+	const S = KeyboardSymbols.Shift;
+
+	let editingName = $state(false);
+	let nameDraft = $state('');
+	let nameInput: HTMLInputElement | undefined = $state();
+	let csvInput: HTMLInputElement | undefined = $state();
+	let borderColor = $state('#000000');
+
+	const TEXT_COLORS = ['#000000', 'var(--error)', '#ffc800', '#8ecb89', 'var(--python)', 'var(--formula)', '#5d576b', '#ffffff'];
+	const FILL_COLORS = ['#fde8e8', 'var(--warn-bg)', '#e2f0d9', 'var(--accent-soft)', '#ece3f0', 'var(--panel-2)', '#ffffff'];
+
+	function startRename(): void {
+		nameDraft = app.filename;
+		editingName = true;
+		queueMicrotask(() => {
+			nameInput?.focus();
+			nameInput?.select();
+		});
+	}
+
+	function commitRename(): void {
+		if (editingName && nameDraft.trim() !== '') app.filename = nameDraft.trim();
+		editingName = false;
+	}
+
+	async function onCsvChosen(e: Event): Promise<void> {
+		const file = (e.target as HTMLInputElement).files?.[0];
+		if (!file) return;
+		await importCSVAt(await file.text(), app.cursorPosition);
+		(e.target as HTMLInputElement).value = '';
+	}
+
+	const zoomPercent = $derived(`${Math.round(app.viewport.scale * 100)}%`);
+	const atZoom = (scale: number) => Math.abs(app.viewport.scale - scale) < 0.005;
+</script>
+
+<div class="topbar" oncontextmenu={(e) => e.preventDefault()}>
+	<div class="group left">
+		<span class="logo" aria-hidden="true">
+			<svg width="18" height="18" viewBox="0 0 24 24">
+				<rect x="2" y="2" width="9" height="9" fill="#6cd4ff" />
+				<rect x="13" y="2" width="9" height="9" fill="#8ecb89" />
+				<rect x="2" y="13" width="9" height="9" fill="#cb8999" />
+				<rect x="13" y="13" width="9" height="9" fill="#5d576b" />
+			</svg>
+		</span>
+
+		<DropdownMenu label="File">
+			<button class="menu-item" onclick={newFile}>New grid</button>
+			<button class="menu-item" onclick={() => (app.showFileMenu = true)}>
+				<span>Open…</span><span class="shortcut">{C}O</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showFileMenu = true)}>
+				<span>Examples…</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => csvInput?.click()}>Import CSV…</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={saveFile}>Download local copy (.grid)</button>
+			<button class="menu-item" onclick={downloadSelectionAsCsv}>
+				<span>Download as CSV</span><span class="shortcut">{C}{S}E</span>
+			</button>
+		</DropdownMenu>
+
+		<DropdownMenu label="Edit">
+			<button class="menu-item" onclick={undo}>
+				<span>Undo</span><span class="shortcut">{C}Z</span>
+			</button>
+			<button class="menu-item" onclick={redo}>
+				<span>Redo</span><span class="shortcut">{C}{S}Z</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => void copySelection(true)}>
+				<span>Cut</span><span class="shortcut">{C}X</span>
+			</button>
+			<button class="menu-item" onclick={() => void copySelection(false)}>
+				<span>Copy</span><span class="shortcut">{C}C</span>
+			</button>
+			<button class="menu-item" onclick={() => void pasteFromClipboard()}>
+				<span>Paste</span><span class="shortcut">{C}V</span>
+			</button>
+			<button class="menu-item" onclick={() => void copySelectionAsPng()}>
+				<span>Copy selection as PNG</span><span class="shortcut">{C}{S}C</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => void rerunAllCode()}>
+				<span>Rerun all code</span><span class="shortcut">{C}{S}↵</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button
+				class="menu-item"
+				onclick={() => {
+					app.searchAllSheets = false;
+					app.showSearch = true;
+				}}
+			>
+				<span>Find…</span><span class="shortcut">{C}F</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showGoToMenu = true)}>
+				<span>Go to cell</span><span class="shortcut">{C}G</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => void fillDown()}>
+				<span>Fill down</span><span class="shortcut">{C}D</span>
+			</button>
+			<button class="menu-item" onclick={() => void fillRight()}>
+				<span>Fill right</span><span class="shortcut">{C}R</span>
+			</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={copyFormat}>
+				<span>Copy format</span><span class="shortcut">{C}⌥C</span>
+			</button>
+			<button class="menu-item" onclick={pasteFormat}>
+				<span>Paste format</span><span class="shortcut">{C}⌥V</span>
+			</button>
+		</DropdownMenu>
+
+		<DropdownMenu label="View">
+			<button class="menu-item" onclick={() => (app.showHeadings = !app.showHeadings)}>
+				<span>{app.showHeadings ? '✓' : ' '} Show row and column headings</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showGridAxes = !app.showGridAxes)}>
+				<span>{app.showGridAxes ? '✓' : ' '} Show grid axis</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showGridLines = !app.showGridLines)}>
+				<span>{app.showGridLines ? '✓' : ' '} Show grid lines</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showCellTypeOutlines = !app.showCellTypeOutlines)}>
+				<span>{app.showCellTypeOutlines ? '✓' : ' '} Show code cell outlines</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.showA1Notation = !app.showA1Notation)}>
+				<span>{app.showA1Notation ? '✓' : ' '} Show A1 notation on headings</span>
+			</button>
+			<button class="menu-item" onclick={() => (app.theme = app.theme === 'dark' ? 'light' : 'dark')}>
+				<span>{app.theme === 'dark' ? '✓' : ' '} Dark theme</span>
+			</button>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Zoom</div>
+			<button class="menu-item" onclick={zoomIn}>
+				<span>Zoom in</span><span class="shortcut">{C}+</span>
+			</button>
+			<button class="menu-item" onclick={zoomOut}>
+				<span>Zoom out</span><span class="shortcut">{C}−</span>
+			</button>
+			<button class="menu-item" onclick={zoomToSelection}>
+				<span>Zoom to selection</span><span class="shortcut">{C}8</span>
+			</button>
+			<button class="menu-item" onclick={zoomToFit}>
+				<span>Zoom to fit</span><span class="shortcut">{C}9</span>
+			</button>
+			<button class="menu-item" onclick={() => setZoom(0.5)}>Zoom to 50%</button>
+			<button class="menu-item" onclick={zoomTo100}>
+				<span>Zoom to 100%</span><span class="shortcut">{C}0</span>
+			</button>
+			<button class="menu-item" onclick={() => setZoom(2)}>Zoom to 200%</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => (app.presentationMode = !app.presentationMode)}>
+				<span>Presentation mode</span><span class="shortcut">{C}.</span>
+			</button>
+		</DropdownMenu>
+
+		<DropdownMenu label="Insert">
+			<div class="menu-header">Code</div>
+			<button class="menu-item" onclick={() => openCodeEditorAt('PYTHON')}>
+				<span><i class="lang python"></i> Python</span>
+			</button>
+			<button class="menu-item" onclick={() => openCodeEditorAt('JAVASCRIPT')}>
+				<span><i class="lang javascript"></i> JavaScript</span>
+			</button>
+			<button class="menu-item" onclick={() => openCodeEditorAt('FORMULA')}>
+				<span><i class="lang formula"></i> Formula</span><span class="shortcut">=</span>
+			</button>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Data</div>
+			<button class="menu-item" onclick={() => csvInput?.click()}>From file (CSV)…</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={addSheet}>Sheet</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={() => void insertTodayDate(false)}>
+				<span>Today's date</span><span class="shortcut">{C};</span>
+			</button>
+			<button class="menu-item" onclick={() => void insertTodayDate(true)}>
+				<span>Date and time</span><span class="shortcut">{C}{S};</span>
+			</button>
+		</DropdownMenu>
+
+		<DropdownMenu label="Format">
+			<div class="menu-header">Number</div>
+			<button class="menu-item" onclick={() => setTextFormat(undefined)}>
+				<span>Automatic</span><span class="shortcut">Abc</span>
+			</button>
+			<button class="menu-item" onclick={() => setTextFormat({ type: 'NUMBER', decimalPlaces: 2 })}>
+				<span>Number</span><span class="shortcut">9,999.99</span>
+			</button>
+			<button
+				class="menu-item"
+				onclick={() => setTextFormat({ type: 'CURRENCY', display: 'CURRENCY', symbol: '$', decimalPlaces: 2 })}
+			>
+				<span>Currency</span><span class="shortcut">$9,999.99</span>
+			</button>
+			<button class="menu-item" onclick={() => setTextFormat({ type: 'PERCENTAGE', decimalPlaces: 2 })}>
+				<span>Percent</span><span class="shortcut">99.99%</span>
+			</button>
+			<button class="menu-item" onclick={() => setTextFormat({ type: 'EXPONENTIAL', decimalPlaces: 2 })}>
+				<span>Scientific</span><span class="shortcut">6.02E+23</span>
+			</button>
+			<button class="menu-item" onclick={() => changeDecimals(1)}>Increase decimals</button>
+			<button class="menu-item" onclick={() => changeDecimals(-1)}>Decrease decimals</button>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Text</div>
+			<button class="menu-item" onclick={toggleBold}>
+				<span>Bold</span><span class="shortcut">{C}B</span>
+			</button>
+			<button class="menu-item" onclick={toggleItalic}>
+				<span>Italic</span><span class="shortcut">{C}I</span>
+			</button>
+			<div class="menu-header">Text color</div>
+			<div class="swatches">
+				{#each TEXT_COLORS as color (color)}
+					<button
+						class="swatch"
+						style:background={color}
+						aria-label="text color {color}"
+						onclick={() => setFormat({ textColor: color === '#000000' ? undefined : color })}
+					></button>
+				{/each}
+			</div>
+			<div class="menu-header">Fill color</div>
+			<div class="swatches">
+				{#each FILL_COLORS as color (color)}
+					<button
+						class="swatch"
+						style:background={color}
+						aria-label="fill color {color}"
+						onclick={() => setFormat({ fillColor: color === '#ffffff' ? undefined : color })}
+					></button>
+				{/each}
+			</div>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Alignment</div>
+			<button class="menu-item" onclick={() => setAlignment('left')}>Align left</button>
+			<button class="menu-item" onclick={() => setAlignment('center')}>Align center</button>
+			<button class="menu-item" onclick={() => setAlignment('right')}>Align right</button>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Wrapping</div>
+			<button class="menu-item" onclick={() => setWrapping(undefined)}>Overflow</button>
+			<button class="menu-item" onclick={() => setWrapping('wrap')}>Wrap</button>
+			<button class="menu-item" onclick={() => setWrapping('clip')}>Clip</button>
+			<div class="menu-divider"></div>
+			<div class="menu-header">Borders</div>
+			<div class="swatches">
+				{#each TEXT_COLORS as color (color)}
+					<button
+						class="swatch"
+						class:active={borderColor === color}
+						style:background={color}
+						aria-label="border color {color}"
+						onclick={(e) => {
+							e.stopPropagation(); // picking a color keeps the menu open
+							borderColor = color;
+						}}
+					></button>
+				{/each}
+			</div>
+			<button class="menu-item" onclick={() => setBorders('all', borderColor)}>All borders</button>
+			<button class="menu-item" onclick={() => setBorders('outer', borderColor)}>Outer borders</button>
+			<button class="menu-item" onclick={() => setBorders('inner', borderColor)}>Inner borders</button>
+			<button class="menu-item" onclick={() => setBorders('top', borderColor)}>Top border</button>
+			<button class="menu-item" onclick={() => setBorders('bottom', borderColor)}>Bottom border</button>
+			<button class="menu-item" onclick={() => setBorders('left', borderColor)}>Left border</button>
+			<button class="menu-item" onclick={() => setBorders('right', borderColor)}>Right border</button>
+			<button class="menu-item" onclick={() => setBorders('clear')}>Clear borders</button>
+			<div class="menu-divider"></div>
+			<button class="menu-item" onclick={clearFormatting}>
+				<span>Clear formatting</span><span class="shortcut">{C}\</span>
+			</button>
+		</DropdownMenu>
+
+		<DropdownMenu label="Help">
+			<button class="menu-item" onclick={() => (app.showFileMenu = true)}>
+				Example files
+			</button>
+			<button class="menu-item" onclick={() => (app.showFormulaDocs = true)}>
+				Formula reference
+			</button>
+			<button
+				class="menu-item"
+				onclick={() => window.open('https://docs.quadratichq.com', '_blank')}
+			>
+				Read the docs ↗
+			</button>
+			<button
+				class="menu-item"
+				onclick={() => window.open('https://github.com/patrik64/quadratic-svelte', '_blank')}
+			>
+				Quadratic on GitHub ↗
+			</button>
+		</DropdownMenu>
+	</div>
+
+	<div class="group center">
+		{#if editingName}
+			<input
+				bind:this={nameInput}
+				bind:value={nameDraft}
+				class="name-input"
+				onkeydown={(e) => {
+					if (e.key === 'Enter') commitRename();
+					if (e.key === 'Escape') editingName = false;
+					e.stopPropagation();
+				}}
+				onblur={commitRename}
+			/>
+		{:else}
+			<span class="local">Local /&nbsp;</span>
+			<button class="filename" title="Rename file" onclick={startRename}>{app.filename}</button>
+		{/if}
+	</div>
+
+	<div class="group right">
+		<div class="cluster">
+			<button
+				class="tool"
+				class:on={app.showCellTypeOutlines}
+				aria-pressed={app.showCellTypeOutlines}
+				title="Code cell outlines{app.showCellTypeOutlines ? ' (on)' : ' (off)'}"
+				aria-label="Toggle code cell outlines"
+				onclick={() => (app.showCellTypeOutlines = !app.showCellTypeOutlines)}
+			>
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<path d="M8 6 3 12l5 6" />
+					<path d="m16 6 5 6-5 6" />
+				</svg>
+			</button>
+			<button
+				class="tool"
+				title="Command palette ({C}P)"
+				aria-label="Open command palette"
+				onclick={() => (app.showCommandPalette = true)}
+			>
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+					<path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
+				</svg>
+			</button>
+		</div>
+
+		<div class="cluster zoom">
+			<button class="tool" title="Zoom out ({C}−)" aria-label="Zoom out" onclick={zoomOut}>
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+					<path d="M5 12h14" />
+				</svg>
+			</button>
+			<DropdownMenu align="right" title="Zoom level">
+				{#snippet label()}<span class="zoom-label">{zoomPercent}</span>{/snippet}
+				<button class="menu-item" onclick={zoomIn}>
+					<span>Zoom in</span><span class="shortcut">{C}+</span>
+				</button>
+				<button class="menu-item" onclick={zoomOut}>
+					<span>Zoom out</span><span class="shortcut">{C}−</span>
+				</button>
+				<div class="menu-divider"></div>
+				<button class="menu-item" onclick={zoomToSelection}>
+					<span>Zoom to selection</span><span class="shortcut">{C}8</span>
+				</button>
+				<button class="menu-item" onclick={zoomToFit}>
+					<span>Zoom to fit</span><span class="shortcut">{C}9</span>
+				</button>
+				<div class="menu-divider"></div>
+				<button class="menu-item" onclick={() => setZoom(0.5)}>
+					<span>{atZoom(0.5) ? '✓' : '\u2007'} 50%</span>
+				</button>
+				<button class="menu-item" onclick={zoomTo100}>
+					<span>{atZoom(1) ? '✓' : '\u2007'} 100%</span><span class="shortcut">{C}0</span>
+				</button>
+				<button class="menu-item" onclick={() => setZoom(2)}>
+					<span>{atZoom(2) ? '✓' : '\u2007'} 200%</span>
+				</button>
+			</DropdownMenu>
+			<button class="tool" title="Zoom in ({C}+)" aria-label="Zoom in" onclick={zoomIn}>
+				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+					<path d="M12 5v14M5 12h14" />
+				</svg>
+			</button>
+		</div>
+	</div>
+
+	<input
+		bind:this={csvInput}
+		type="file"
+		accept=".csv"
+		style="display: none"
+		onchange={onCsvChosen}
+	/>
+</div>
+
+<style>
+	.topbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		background: var(--panel);
+		border-bottom: 1px solid var(--border);
+		color: var(--muted);
+		padding: 0.15rem 1rem 0.15rem 0.75rem;
+		font-size: 0.85rem;
+		user-select: none;
+		gap: 1rem;
+	}
+	.group {
+		display: flex;
+		align-items: center;
+	}
+	.group.left {
+		gap: 0.1rem;
+	}
+	.logo {
+		display: inline-flex;
+		align-items: center;
+		padding: 0 0.4rem 0 0.1rem;
+	}
+	.group.center {
+		flex: 1;
+		justify-content: center;
+		min-width: 0;
+	}
+	.group.right {
+		gap: 0.5rem;
+	}
+	/* toolbar clusters: grouped controls sharing one bordered pill */
+	.cluster {
+		display: inline-flex;
+		align-items: center;
+		border: 1px solid var(--border-light);
+		border-radius: 6px;
+		background: var(--panel-2);
+		padding: 1px;
+		gap: 1px;
+	}
+	.tool {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 26px;
+		height: 24px;
+		padding: 0;
+		border: none;
+		border-radius: 5px;
+		background: none;
+		color: var(--muted);
+		cursor: pointer;
+	}
+	.tool:hover {
+		background: #e9eef3;
+		color: var(--text);
+	}
+	.tool:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: -1px;
+	}
+	.tool.on {
+		background: #e4edff;
+		color: var(--accent);
+	}
+	.zoom :global(.trigger) {
+		padding: 0.15rem 0.35rem;
+		border-radius: 5px;
+	}
+	.zoom :global(.trigger:hover),
+	.zoom :global(.trigger.active) {
+		background: #e9eef3;
+	}
+	.local {
+		color: var(--border);
+	}
+	.filename {
+		background: none;
+		border: none;
+		font: inherit;
+		color: var(--muted);
+		cursor: pointer;
+		max-width: 25vw;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		padding: 0.2rem 0.3rem;
+		border-radius: 3px;
+	}
+	.filename:hover {
+		background: var(--panel-2);
+	}
+	.name-input {
+		font: inherit;
+		text-align: center;
+		border: 1px solid var(--accent);
+		border-radius: 3px;
+		outline: none;
+		padding: 0.15rem 0.4rem;
+		width: 16rem;
+	}
+	.zoom-label {
+		display: inline-block;
+		min-width: 2.9rem;
+		text-align: center;
+		font-variant-numeric: tabular-nums;
+		font-size: 0.8rem;
+	}
+	.lang {
+		display: inline-block;
+		width: 9px;
+		height: 9px;
+		border-radius: 2px;
+		margin-right: 0.35rem;
+	}
+	.lang.python {
+		background: var(--python);
+	}
+	.lang.javascript {
+		background: var(--javascript);
+	}
+	.lang.formula {
+		background: var(--formula);
+	}
+	.swatches {
+		display: flex;
+		gap: 4px;
+		padding: 2px 1rem 8px;
+	}
+	.swatch {
+		width: 20px;
+		height: 20px;
+		border: 1px solid var(--border);
+		border-radius: 3px;
+		cursor: pointer;
+		padding: 0;
+	}
+	.swatch.active {
+		outline: 2px solid var(--accent);
+		outline-offset: 1px;
+	}
+</style>
+````

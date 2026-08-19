@@ -1,0 +1,168 @@
+---
+title: CellInput.svelte
+description: The floating cell editor — an absolutely positioned input that tracks the viewport and commits on spreadsheet keys
+source: src/lib/components/CellInput.svelte
+full: true
+---
+
+When you start typing in a cell, the grid itself can't host a text field — it's
+a Pixi canvas. Instead this component overlays a real `<input>` exactly on top
+of the cell, keeps it glued there while you pan and zoom, and translates
+spreadsheet keys (Enter, Tab, arrows, Escape) into commit-and-move actions.
+
+<Scrollycoding>
+
+## !!steps A snapshot of the cell
+
+The edited cell is captured **once**, at open time — `{ ...app.cursorPosition }`
+is a plain copy, not reactive state. If the cursor state changes while the
+editor is open, the input stays put; only its *screen position* tracks the
+viewport. The initial text comes from the store (empty for typing, the
+current value for F2/double-click), and `closed` guards against the close
+sequence running twice.
+
+```svelte ! CellInput.svelte
+<script lang="ts">
+	import { app, commitCellValue, ensureCursorVisible, sheetController } from '../state.svelte';
+
+	// cell is fixed at open time; the input pans/zooms with the viewport
+	// !mark
+	const cell = { ...app.cursorPosition };
+	let value = $state(app.inputInitialValue);
+	let inputEl: HTMLInputElement | undefined = $state();
+	let closed = false;
+</script>
+```
+
+## !!steps Deriveds glue it to the grid
+
+Three `$derived` runes do the geometry. `getCellRect` (from
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts)) gives the cell's world
+rectangle; subtracting the viewport origin and multiplying by scale converts
+world → screen. Because `app.viewport` is reactive state updated on every
+pan/zoom frame, the input follows the grid with no event wiring at all —
+that's the whole point of runes here.
+
+```svelte ! CellInput.svelte
+<script lang="ts">
+	// !mark(1:3)
+	const rect = $derived(sheetController.sheet.gridOffsets.getCellRect(cell.x, cell.y));
+	const left = $derived((rect.x - app.viewport.x) * app.viewport.scale);
+	const top = $derived((rect.y - app.viewport.y) * app.viewport.scale);
+	const scale = $derived(app.viewport.scale);
+</script>
+```
+
+## !!steps Focus once mounted
+
+An `$effect` focuses the input as soon as the element binding is populated
+and parks the caret at the end — so typing continues where the initial value
+stops, matching spreadsheet muscle memory.
+
+```svelte ! CellInput.svelte
+<script lang="ts">
+	$effect(() => {
+		if (inputEl) {
+			inputEl.focus();
+			inputEl.setSelectionRange(value.length, value.length);
+		}
+	});
+</script>
+```
+
+## !!steps One exit path: close()
+
+Every way out funnels through `close(commit, move?)`. The `closed` flag
+matters because closing via Enter also blurs the input, and the blur handler
+calls `close` again — without the guard the value would commit twice.
+Committing runs the full recompute pipeline
+([updateCellAndDCells](/docs/src/lib/core/updateCellAndDCells.ts) behind
+`commitCellValue`), then the optional `move` advances the cursor and scrolls
+it into view.
+
+```svelte ! CellInput.svelte
+<script lang="ts">
+	async function close(commit: boolean, move?: { dx: number; dy: number }): Promise<void> {
+		// !mark(1:2)
+		if (closed) return;
+		closed = true;
+		app.showInput = false;
+		if (commit) await commitCellValue(cell.x, cell.y, value);
+		if (move) {
+			const pos = { x: cell.x + move.dx, y: cell.y + move.dy };
+			app.cursorPosition = pos;
+			app.keyboardMovePosition = pos;
+			app.multiCursor = undefined;
+			ensureCursorVisible();
+		}
+	}
+</script>
+```
+
+## !!steps Spreadsheet keys
+
+`stopPropagation` keeps keystrokes away from the grid's global handler
+([keyboard.ts](/docs/src/lib/grid/keyboard.ts)) while editing. Then the
+classic bindings: Enter commits and moves down, Tab commits and moves right
+(Shift+Tab left), arrows commit in their direction, Escape discards. The last
+branch swallows cmd+P so the browser's print dialog can't interrupt editing —
+the app uses that chord for the command palette.
+
+```svelte ! CellInput.svelte
+<script lang="ts">
+	function onKeyDown(e: KeyboardEvent): void {
+		e.stopPropagation();
+		if (e.key === 'Enter') {
+			e.preventDefault();
+			void close(true, { dx: 0, dy: 1 });
+		} else if (e.key === 'Tab') {
+			e.preventDefault();
+			// !mark
+			void close(true, { dx: e.shiftKey ? -1 : 1, dy: 0 });
+		} else if (e.key === 'Escape') {
+			e.preventDefault();
+			void close(false);
+		} else if (e.key === 'ArrowUp') {
+			e.preventDefault();
+			void close(true, { dx: 0, dy: -1 });
+		} else if (e.key === 'ArrowDown') {
+			e.preventDefault();
+			void close(true, { dx: 0, dy: 1 });
+		} else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'p') {
+			e.preventDefault();
+		}
+	}
+</script>
+```
+
+## !!steps The floating input itself
+
+The markup wires it all up: the derived pixels land in `style:` directives,
+`min-width` (rather than `width`) lets the field grow past the cell edge for
+long values — like real spreadsheets — and the font size multiplies by the
+viewport scale so text in the editor matches the zoomed cell text underneath.
+Blur commits, matching the grid's click-away behavior.
+
+```svelte ! CellInput.svelte
+<input
+	bind:this={inputEl}
+	bind:value
+	class="cell-input"
+	style:left="{left}px"
+	style:top="{top}px"
+	style:min-width="{rect.w * scale}px"
+	style:height="{rect.h * scale}px"
+	style:font-size="{14 * scale}px"
+	spellcheck="false"
+	onkeydown={onKeyDown}
+	onblur={() => void close(true)}
+/>
+```
+
+</Scrollycoding>
+
+The component is conditionally rendered by
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) whenever
+`app.showInput` is set — typing a character, pressing Enter/F2, or
+double-clicking a cell all flip that flag in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).

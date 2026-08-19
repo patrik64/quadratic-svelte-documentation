@@ -1,0 +1,33 @@
+---
+title: Overview
+description: Annotated source tour of quadratic-svelte, file by file
+---
+
+**quadratic-svelte** is a SvelteKit reimplementation of
+[Quadratic](https://github.com/quadratichq/quadratic) — the data-science
+spreadsheet with an infinite grid, formulas, JavaScript and Python cells. It is
+live at [quadratic-svelte.vercel.app](https://quadratic-svelte.vercel.app), and
+the source lives at
+[github.com/patrik64/quadratic-svelte](https://github.com/patrik64/quadratic-svelte).
+
+This site documents that codebase **file by file**: the sidebar mirrors the
+project's directory tree, and every page corresponds to one source file.
+
+## How to read these docs
+
+- **Walkthrough pages** step through a file with a scroll-driven code panel
+  (Code Hike *scrollycoding*): as you scroll the explanation on the left, the
+  code on the right follows along and highlights what the text refers to. Start
+  with [a1.ts](/docs/src/lib/core/a1.ts),
+  [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts),
+  [series.ts](/docs/src/lib/core/series.ts) or
+  [CellInput.svelte](/docs/src/lib/components/CellInput.svelte).
+- **Source pages** (everything else, for now) show the file's summary and its
+  full, syntax-highlighted contents. They are auto-generated and will be
+  promoted to walkthroughs over time.
+- Every page has a **View source on GitHub** button linking to the exact file
+  in the repository.
+
+For the big picture — how the store, the PixiJS grid, the sheet model and the
+three language runtimes fit together — read the
+[Architecture](/docs/architecture) page first.

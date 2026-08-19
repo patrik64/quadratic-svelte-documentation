@@ -1,0 +1,64 @@
+---
+title: "plotlyImage.ts"
+description: "Renders a plotly figure spec to a PNG using plotly.js in a detached div. Pyodide can't export images itself — plotly's static export needs kaleido, which is …"
+source: "src/lib/python/plotlyImage.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts plotlyImage.ts -n
+// Renders a plotly figure spec to a PNG using plotly.js in a detached div.
+// Pyodide can't export images itself — plotly's static export needs kaleido,
+// which is a native binary with no wasm build — so the figure crosses over as
+// JSON and is rasterized by the JS library instead.
+
+const PLOTLY_URL = 'https://esm.sh/plotly.js-dist-min@3.0.1';
+
+interface PlotlyModule {
+	newPlot: (el: HTMLElement, data: unknown, layout: unknown, config: unknown) => Promise<unknown>;
+	toImage: (el: HTMLElement, opts: Record<string, unknown>) => Promise<string>;
+	purge: (el: HTMLElement) => void;
+}
+
+let plotlyPromise: Promise<PlotlyModule> | undefined;
+
+function loadPlotly(): Promise<PlotlyModule> {
+	if (!plotlyPromise) {
+		plotlyPromise = import(/* @vite-ignore */ PLOTLY_URL)
+			.then((m) => ((m as { default?: PlotlyModule }).default ?? m) as PlotlyModule)
+			.catch((e) => {
+				plotlyPromise = undefined; // let the next run retry a failed fetch
+				throw e;
+			});
+	}
+	return plotlyPromise;
+}
+
+/** Rasterizes `fig.to_json()` output to a PNG data URL. */
+export async function figureToPng(figureJson: string): Promise<string> {
+	const fig = JSON.parse(figureJson) as { data: unknown; layout?: Record<string, unknown> };
+	const layout = fig.layout ?? {};
+	// figures usually autosize; pick a chart-shaped default when they do
+	const width = Number(layout.width) || 800;
+	const height = Number(layout.height) || 450;
+
+	const Plotly = await loadPlotly();
+	const div = document.createElement('div');
+	div.style.cssText = `position:absolute;left:-10000px;top:0;width:${width}px;height:${height}px`;
+	document.body.appendChild(div);
+	try {
+		await Plotly.newPlot(div, fig.data, layout, { staticPlot: true, displayModeBar: false });
+		return await Plotly.toImage(div, { format: 'png', width, height });
+	} finally {
+		try {
+			Plotly.purge(div);
+		} catch {
+			// purge failing shouldn't mask a render error
+		}
+		div.remove();
+	}
+}
+````

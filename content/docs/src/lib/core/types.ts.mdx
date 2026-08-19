@@ -1,0 +1,134 @@
+---
+title: "types.ts"
+description: "Core data model, mirroring Quadratic's GridFile v1.3 schema shapes."
+source: "src/lib/core/types.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts types.ts -n
+// Core data model, mirroring Quadratic's GridFile v1.3 schema shapes.
+
+export type CellType = 'TEXT' | 'FORMULA' | 'PYTHON' | 'JAVASCRIPT' | 'COMPUTED';
+
+/** Cell types whose content is code opened in the code editor. */
+export function isCodeCellType(type: CellType): type is 'FORMULA' | 'PYTHON' | 'JAVASCRIPT' {
+	return type === 'FORMULA' || type === 'PYTHON' || type === 'JAVASCRIPT';
+}
+
+export type Coordinate = { x: number; y: number };
+
+export interface CellEvaluationResult {
+	success: boolean;
+	std_out?: string;
+	std_err?: string;
+	output_value: string | null;
+	cells_accessed: [number, number][];
+	array_output?: ArrayOutput;
+	/** PNG data URL of a returned canvas, drawn over the grid at the cell. */
+	image_output?: string;
+	error_span: [number, number] | null;
+}
+
+export type ArrayOutputValue = string | number | boolean;
+export type ArrayOutput = ArrayOutputValue[] | ArrayOutputValue[][];
+
+export interface Cell {
+	x: number;
+	y: number;
+	type: CellType;
+	value: string;
+	formula_code?: string;
+	python_code?: string;
+	javascript_code?: string;
+	evaluation_result?: CellEvaluationResult;
+	array_cells?: [number, number][];
+	dependent_cells?: [number, number][];
+	last_modified?: string;
+}
+
+export type CellAlignment = 'left' | 'right' | 'center';
+export type CellWrapping = 'wrap' | 'clip';
+
+export type CellTextFormat =
+	| { type: 'NUMBER'; decimalPlaces?: number }
+	| { type: 'CURRENCY'; display: 'CURRENCY'; symbol?: string; decimalPlaces?: number }
+	| { type: 'PERCENTAGE'; decimalPlaces?: number }
+	| { type: 'EXPONENTIAL'; decimalPlaces?: number };
+
+/** Per-edge border colors; an absent edge means no border. */
+export interface CellBorders {
+	top?: string;
+	bottom?: string;
+	left?: string;
+	right?: string;
+}
+
+export interface CellFormat {
+	x: number;
+	y: number;
+	alignment?: CellAlignment;
+	bold?: boolean;
+	italic?: boolean;
+	textColor?: string;
+	fillColor?: string;
+	textFormat?: CellTextFormat;
+	wrapping?: CellWrapping;
+	borders?: CellBorders;
+}
+
+export interface Heading {
+	id: number;
+	size?: number;
+}
+
+export interface GridFileData {
+	cells: Cell[];
+	formats: CellFormat[];
+	columns: Heading[];
+	rows: Heading[];
+	cell_dependency: string;
+}
+
+export interface GridFile {
+	sheets: {
+		name: string;
+		order: number;
+		color?: string;
+		borders: unknown[];
+		cells: Cell[];
+		formats: CellFormat[];
+		columns: Heading[];
+		rows: Heading[];
+		cell_dependency: string;
+	}[];
+	created: number;
+	filename: string;
+	id: string;
+	modified: number;
+	version: '1.3';
+}
+
+export interface Rect {
+	left: number;
+	top: number;
+	right: number;
+	bottom: number;
+}
+
+export const CELL_WIDTH = 100;
+export const CELL_HEIGHT = 20;
+export const HEADING_SIZE = 20;
+
+export function coordKey(x: number, y: number): string {
+	return `${x},${y}`;
+}
+
+export function parseCoordKey(key: string): Coordinate {
+	const [x, y] = key.split(',').map(Number);
+	return { x, y };
+}
+````

@@ -1,0 +1,143 @@
+---
+title: series.ts
+description: Fill-series detection for the fill handle and cmd+D/R — arithmetic sequences and day/month name cycles
+source: src/lib/core/series.ts
+full: true
+---
+
+Drag the fill handle down from `1, 2` and you expect `3, 4, 5`. Drag from
+`Mon, Tue` and you expect `Wed`. This module is the brain behind that: given
+the selected sample values, `seriesNext` returns the continuation at any
+distance past the end — or `undefined`, which tells the caller to fall back to
+plain copying. It's extracted from
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) precisely so it stays pure
+and unit-testable.
+
+<Scrollycoding>
+
+## !!steps The known text series
+
+Four hard-coded cycles: day names and month names, each in long and
+abbreviated form. The single exported function takes the sample `values` and a
+0-based `step` past the end — the fill handle calls it once per cell being
+filled.
+
+```ts ! series.ts
+const TEXT_SERIES: string[][] = [
+	['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'],
+	['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+	['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
+	['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+];
+
+/** Continuation of `values` at 0-based `step` past the end, or undefined. */
+export function seriesNext(values: string[], step: number): string | undefined {
+	// ...
+}
+```
+
+## !!steps Arithmetic series over numbers
+
+If *every* sample parses as a number, the delta between the first two defines
+the series (a single sample means delta 0 — constant fill). Each consecutive
+pair must match that delta within `1e-9`, guarding against float noise in
+inputs like `0.1, 0.2, 0.3`.
+
+Note the branch returns `undefined` when numbers *don't* form an arithmetic
+series — it deliberately does not fall through to the text matcher, since
+numbers can never match day names anyway.
+
+```ts ! series.ts
+export function seriesNext(values: string[], step: number): string | undefined {
+	// arithmetic series over numbers
+	if (values.length > 0 && values.every((v) => v.trim() !== '' && !Number.isNaN(Number(v)))) {
+		const nums = values.map(Number);
+		// !mark
+		const delta = nums.length > 1 ? nums[1] - nums[0] : 0;
+		if (nums.every((n, i) => i === 0 || Math.abs(n - nums[i - 1] - delta) < 1e-9)) {
+			const value = nums[nums.length - 1] + delta * (step + 1);
+			return String(Math.abs(value) < 1e-12 ? 0 : parseFloat(value.toPrecision(13)));
+		}
+		return undefined;
+	}
+	// ...
+}
+```
+
+## !!steps Cleaning up the extrapolated number
+
+The returned value gets two touch-ups before stringifying: values within
+`1e-12` of zero snap to exactly `0` (so `0.3, 0.2, 0.1` continues with `0`,
+not `1.4e-17`), and `toPrecision(13)` + `parseFloat` rounds away accumulated
+binary-float error (`0.1 + 0.2`-style artifacts) while dropping trailing
+zeros.
+
+```ts ! series.ts
+export function seriesNext(values: string[], step: number): string | undefined {
+	if (values.length > 0 && values.every((v) => v.trim() !== '' && !Number.isNaN(Number(v)))) {
+		const nums = values.map(Number);
+		const delta = nums.length > 1 ? nums[1] - nums[0] : 0;
+		if (nums.every((n, i) => i === 0 || Math.abs(n - nums[i - 1] - delta) < 1e-9)) {
+			const value = nums[nums.length - 1] + delta * (step + 1);
+			// !mark
+			return String(Math.abs(value) < 1e-12 ? 0 : parseFloat(value.toPrecision(13)));
+		}
+		return undefined;
+	}
+	// ...
+}
+```
+
+## !!steps Matching a text series
+
+For each known cycle, every sample is located case-insensitively. Two ways to
+bail: a sample that isn't in the cycle at all (`idx < 0`), or samples that
+aren't *consecutive* in it. The consecutive check is modular —
+`(idx[i-1] + 1) % length` — so `Sat, Sun, Mon` counts as consecutive and the
+fill wraps around the week.
+
+```ts ! series.ts
+export function seriesNext(values: string[], step: number): string | undefined {
+	// ...
+	// day/month name series (case of the first sample wins)
+	for (const series of TEXT_SERIES) {
+		const idx = values.map((v) => series.findIndex((s) => s.toLowerCase() === v.toLowerCase()));
+		if (idx.some((i) => i < 0)) continue;
+		// !mark
+		const consecutive = idx.every((v, i) => i === 0 || v === (idx[i - 1] + 1) % series.length);
+		if (!consecutive) continue;
+		// ...
+	}
+	return undefined;
+}
+```
+
+## !!steps Wrap-around and case preservation
+
+The continuation index also wraps with a modulo, so filling far past December
+cycles back to January forever. Finally, the *case of the first sample wins*:
+`MON, TUE` continues `WED`, `mon, tue` continues `wed`, and mixed-case
+samples get the canonical spelling from the table.
+
+```ts ! series.ts
+export function seriesNext(values: string[], step: number): string | undefined {
+	// ...
+	for (const series of TEXT_SERIES) {
+		// ...
+		// !mark
+		const next = series[(idx[idx.length - 1] + 1 + step) % series.length];
+		const sample = values[0];
+		if (sample === sample.toUpperCase()) return next.toUpperCase();
+		if (sample === sample.toLowerCase()) return next.toLowerCase();
+		return next;
+	}
+	return undefined;
+}
+```
+
+</Scrollycoding>
+
+The callers live in [state.svelte.ts](/docs/src/lib/state.svelte.ts): the
+fill-handle drag and the cmd+D / cmd+R fill shortcuts. The edge cases —
+wrap-around, float noise, case handling — are locked in by
+[series.test.ts](/docs/src/lib/core/series.test.ts).

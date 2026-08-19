@@ -1,0 +1,21 @@
+---
+title: "keyboardSymbols.ts"
+description: "Source file src/lib/helpers/keyboardSymbols.ts of quadratic-svelte."
+source: "src/lib/helpers/keyboardSymbols.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts keyboardSymbols.ts -n
+const isMac = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+
+export const KeyboardSymbols = {
+	Cmd: isMac ? '⌘' : 'Ctrl+',
+	Shift: '⇧',
+	Enter: '↵',
+	Escape: '⎋'
+};
+````

@@ -1,0 +1,182 @@
+---
+title: "GridHeadings.ts"
+description: "Screen-space row/column headings, drawn over the viewport (port of src/gridGL/UI/gridHeadings/GridHeadings.ts)."
+source: "src/lib/grid/pixi/GridHeadings.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts GridHeadings.ts -n
+// Screen-space row/column headings, drawn over the viewport
+// (port of src/gridGL/UI/gridHeadings/GridHeadings.ts).
+
+import { CanvasTextMetrics, Container, Graphics, Text, TextStyle } from 'pixi.js';
+import type { Viewport } from 'pixi-viewport';
+import { getColumnA1Notation, getRowA1Notation } from '../../core/a1';
+import type { Sheet } from '../../core/Sheet';
+import { HEADING_SIZE } from '../../core/types';
+import { colors } from '../colors';
+
+export interface HeadingsState {
+	showHeadings: boolean;
+	showA1Notation: boolean;
+	presentationMode: boolean;
+	selection: { x0: number; y0: number; x1: number; y1: number };
+}
+
+const LABEL_STYLE = new TextStyle({
+	fontFamily: 'OpenSans, sans-serif',
+	fontSize: 10,
+	fill: colors.darkGray
+});
+
+/** Re-reads theme colors into the shared label style (TextStyle changes
+ * propagate to every pooled Text instance). */
+export function refreshHeadingLabelStyle(): void {
+	LABEL_STYLE.fill = colors.darkGray;
+}
+
+export class GridHeadings {
+	container = new Container();
+	rowHeadingWidth = HEADING_SIZE;
+
+	private graphics = new Graphics();
+	private labels = new Container();
+	private labelPool: Text[] = [];
+	private labelsUsed = 0;
+
+	constructor(
+		private getSheet: () => Sheet,
+		private getViewport: () => Viewport
+	) {
+		this.container.addChild(this.graphics, this.labels);
+	}
+
+	private label(text: string, x: number, y: number): void {
+		let t = this.labelPool[this.labelsUsed];
+		if (!t) {
+			t = new Text({ text, style: LABEL_STYLE });
+			t.anchor.set(0.5);
+			this.labelPool.push(t);
+			this.labels.addChild(t);
+		}
+		if (t.text !== text) t.text = text;
+		t.position.set(x, y);
+		t.visible = true;
+		this.labelsUsed++;
+	}
+
+	draw(state: HeadingsState): void {
+		const g = this.graphics;
+		g.clear();
+		this.labelsUsed = 0;
+
+		if (!state.showHeadings || state.presentationMode) {
+			this.rowHeadingWidth = 0;
+			this.container.visible = false;
+			return;
+		}
+		this.container.visible = true;
+
+		const viewport = this.getViewport();
+		const scale = viewport.scale.x;
+		const width = viewport.screenWidth;
+		const height = viewport.screenHeight;
+		const offsets = this.getSheet().gridOffsets;
+		const sel = state.selection;
+
+		const rowStart = offsets.getRowIndex(viewport.top);
+		const rowEnd = offsets.getRowIndex(viewport.top + height / scale);
+
+		// row-heading width adapts to the widest visible label
+		let rowWidth = HEADING_SIZE;
+		const widestRow = [rowStart, rowEnd, sel.y0, sel.y1].reduce(
+			(a, b) => (String(Math.abs(b)).length > String(Math.abs(a)).length ? b : a),
+			0
+		);
+		const widestLabel = state.showA1Notation ? getRowA1Notation(widestRow) : String(widestRow);
+		rowWidth = Math.max(
+			rowWidth,
+			CanvasTextMetrics.measureText(widestLabel, LABEL_STYLE).width + 10
+		);
+		this.rowHeadingWidth = rowWidth;
+
+		// backgrounds
+		g.rect(0, 0, width, HEADING_SIZE).fill(colors.headerBackground);
+		g.rect(0, HEADING_SIZE, rowWidth, height - HEADING_SIZE).fill(colors.headerBackground);
+
+		const colStart = offsets.getColumnIndex(viewport.left);
+		const colEnd = offsets.getColumnIndex(viewport.left + width / scale);
+
+		// selected ranges highlight
+		for (let x = Math.max(sel.x0, colStart); x <= Math.min(sel.x1, colEnd); x++) {
+			const sx = (offsets.getColumnX(x) - viewport.left) * scale;
+			const sw = offsets.getColumnWidth(x) * scale;
+			g.rect(sx, 0, sw, HEADING_SIZE).fill(colors.headerSelectedBackground);
+		}
+		for (let y = Math.max(sel.y0, rowStart); y <= Math.min(sel.y1, rowEnd); y++) {
+			const sy = (offsets.getRowY(y) - viewport.top) * scale;
+			const sh = offsets.getRowHeight(y) * scale;
+			if (sy + sh > HEADING_SIZE)
+				g.rect(0, Math.max(sy, HEADING_SIZE), rowWidth, sh).fill(colors.headerSelectedBackground);
+		}
+
+		// column labels (skip when narrow)
+		const labelSkip = Math.max(1, Math.ceil(24 / (100 * scale)));
+		for (let x = colStart; x <= colEnd; x++) {
+			if (x % labelSkip !== 0 && !(x >= sel.x0 && x <= sel.x1)) continue;
+			const sx = (offsets.getColumnX(x) - viewport.left) * scale;
+			const sw = offsets.getColumnWidth(x) * scale;
+			if (sx + sw / 2 < rowWidth) continue;
+			this.label(
+				state.showA1Notation ? getColumnA1Notation(x) : String(x),
+				sx + sw / 2,
+				HEADING_SIZE / 2 + 0.5
+			);
+		}
+
+		// row labels
+		const rowLabelSkip = Math.max(1, Math.ceil(14 / (20 * scale)));
+		for (let y = rowStart; y <= rowEnd; y++) {
+			if (y % rowLabelSkip !== 0 && !(y >= sel.y0 && y <= sel.y1)) continue;
+			const sy = (offsets.getRowY(y) - viewport.top) * scale;
+			const sh = offsets.getRowHeight(y) * scale;
+			if (sy + sh / 2 < HEADING_SIZE) continue;
+			this.label(
+				state.showA1Notation ? getRowA1Notation(y) : String(y),
+				rowWidth / 2,
+				sy + sh / 2 + 0.5
+			);
+		}
+
+		// heading cell separators
+		if (scale > 0.2) {
+			for (let x = colStart; x <= colEnd + 1; x++) {
+				const sx = (offsets.getColumnX(x) - viewport.left) * scale;
+				if (sx < rowWidth) continue;
+				g.moveTo(sx, 0).lineTo(sx, HEADING_SIZE);
+			}
+			for (let y = rowStart; y <= rowEnd + 1; y++) {
+				const sy = (offsets.getRowY(y) - viewport.top) * scale;
+				if (sy < HEADING_SIZE) continue;
+				g.moveTo(0, sy).lineTo(rowWidth, sy);
+			}
+			g.stroke({ color: colors.mediumGray, alpha: 0.5, pixelLine: true });
+		}
+
+		// corner box + outer borders
+		g.rect(0, 0, rowWidth, HEADING_SIZE).fill(colors.headerBackground);
+		g.moveTo(0, HEADING_SIZE + 0.5)
+			.lineTo(width, HEADING_SIZE + 0.5)
+			.moveTo(rowWidth + 0.5, 0)
+			.lineTo(rowWidth + 0.5, height)
+			.stroke({ color: colors.mediumGray, pixelLine: true });
+
+		// hide unused pooled labels
+		for (let i = this.labelsUsed; i < this.labelPool.length; i++) this.labelPool[i].visible = false;
+	}
+}
+````

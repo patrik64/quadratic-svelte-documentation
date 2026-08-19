@@ -1,0 +1,11 @@
+{
+  "title": "src",
+  "pages": [
+    "lib",
+    "routes",
+    "app.css",
+    "app.d.ts",
+    "app.html"
+  ],
+  "defaultOpen": true
+}

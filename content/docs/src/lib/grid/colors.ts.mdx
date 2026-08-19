@@ -1,0 +1,79 @@
+---
+title: "colors.ts"
+description: "Quadratic's palette, updated to the modern client's theme (quadratic-client/src/app/theme/colors.ts @ v0.24), with a dark variant. `colors` is mutated in pla…"
+source: "src/lib/grid/colors.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts colors.ts -n
+// Quadratic's palette, updated to the modern client's theme
+// (quadratic-client/src/app/theme/colors.ts @ v0.24), with a dark variant.
+// `colors` is mutated in place by setPixiTheme so every consumer (PixiGrid,
+// GridHeadings) sees the switch without import churn.
+
+const LIGHT = {
+	gridLines: '#233143', // modern slate; drawn with zoom-faded alpha
+	cellFontColor: '#000000',
+	cellColorUserText: '#8ecb89',
+	cellColorUserPython: '#3776ab',
+	cellColorUserFormula: '#8c1a6a',
+	cellColorUserJavascript: '#ca8a04',
+	cellColorError: '#f25f5c',
+	cursorCell: '#2463eb', // modern accent blue (was #6cd4ff)
+	independence: '#5d576b',
+	headerBackground: '#ffffff',
+	headerSelectedBackground: 'rgba(36, 99, 235, 0.18)',
+	lightGray: '#f6f8fa',
+	mediumGray: '#cfd7de',
+	darkGray: '#55606b',
+	quadraticPrimary: '#6cd4ff',
+	quadraticSecondary: '#8ecb89',
+	error: '#f25f5c'
+};
+
+const DARK: typeof LIGHT = {
+	...LIGHT,
+	gridLines: '#2e3a4a',
+	cellFontColor: '#e8ebee',
+	cellColorUserPython: '#6fa8dc',
+	cellColorUserFormula: '#d16bb0',
+	cellColorUserJavascript: '#e0b341',
+	cursorCell: '#6ea0ff',
+	headerBackground: '#1b1f24',
+	headerSelectedBackground: 'rgba(110, 160, 255, 0.22)',
+	lightGray: '#20262d',
+	mediumGray: '#343c46',
+	darkGray: '#9aa4ad'
+};
+
+export const colors = { ...LIGHT };
+
+export type ThemeName = 'light' | 'dark';
+
+export function setPixiTheme(theme: ThemeName): void {
+	Object.assign(colors, theme === 'dark' ? DARK : LIGHT);
+}
+
+export function themeBackground(theme: ThemeName): string {
+	return theme === 'dark' ? '#14171b' : '#ffffff';
+}
+
+export type CodeEditorMode = 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
+
+export function editorModeColor(mode: CodeEditorMode): string {
+	if (mode === 'FORMULA') return colors.cellColorUserFormula;
+	if (mode === 'JAVASCRIPT') return colors.cellColorUserJavascript;
+	return colors.cellColorUserPython;
+}
+
+/** Modern gridline fade: lines dim as you zoom out and vanish below 10%. */
+export function gridLineAlpha(scale: number): number {
+	if (scale < 0.1) return 0;
+	if (scale < 0.6) return scale * 2 - 0.2;
+	return 1;
+}
+````

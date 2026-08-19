@@ -1,0 +1,145 @@
+---
+title: "BottomBar.svelte"
+description: "The BottomBar Svelte component."
+source: "src/lib/components/BottomBar.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte BottomBar.svelte -n
+<script lang="ts">
+	import { pythonStatus } from '../python/pythonRunner';
+	import { app, sheetController } from '../state.svelte';
+
+	const selection = $derived(app.multiCursor);
+
+	// Sum / Avg / Count over the selection, like the modern SheetBar summary
+	const summary = $derived.by(() => {
+		void app.redraw;
+		if (!app.multiCursor) return undefined;
+		const o = app.multiCursor.originPosition;
+		const t = app.multiCursor.terminalPosition;
+		const cells = sheetController.sheet.getCellsInRect({
+			left: Math.min(o.x, t.x),
+			top: Math.min(o.y, t.y),
+			right: Math.max(o.x, t.x),
+			bottom: Math.max(o.y, t.y)
+		});
+		const nonEmpty = cells.filter((c) => c.value !== '');
+		if (nonEmpty.length < 2) return undefined;
+		const numbers = nonEmpty.map((c) => Number(c.value)).filter((n) => !Number.isNaN(n));
+		const fmt = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+		const sum = numbers.reduce((a, b) => a + b, 0);
+		return {
+			sum: numbers.length > 0 ? fmt(sum) : undefined,
+			avg: numbers.length > 0 ? fmt(sum / numbers.length) : undefined,
+			count: nonEmpty.length
+		};
+	});
+	const cursorCell = $derived.by(() => {
+		void app.redraw;
+		return sheetController.sheet.getCell(app.cursorPosition.x, app.cursorPosition.y);
+	});
+
+	function timeAgo(iso: string): string {
+		const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+		if (seconds < 60) return 'less than a minute ago';
+		const minutes = Math.floor(seconds / 60);
+		if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+		const hours = Math.floor(minutes / 60);
+		if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+		const days = Math.floor(hours / 24);
+		return `${days} day${days === 1 ? '' : 's'} ago`;
+	}
+</script>
+
+<div class="bottombar" oncontextmenu={(e) => e.preventDefault()}>
+	<div class="left">
+		<button class="stat link" onclick={() => (app.showGoToMenu = true)}>
+			Cursor: ({app.cursorPosition.x}, {app.cursorPosition.y})
+		</button>
+		{#if selection}
+			<button class="stat link" onclick={() => (app.showGoToMenu = true)}>
+				Selection: ({selection.originPosition.x}, {selection.originPosition.y}), ({selection
+					.terminalPosition.x}, {selection.terminalPosition.y})
+			</button>
+		{/if}
+		{#if cursorCell?.last_modified}
+			<span class="stat">You, {timeAgo(cursorCell.last_modified)}</span>
+		{/if}
+	</div>
+	<div class="right">
+		{#if summary}
+			<span class="stat summary">
+				{#if summary.sum !== undefined}Sum: {summary.sum} · Avg: {summary.avg} · {/if}Count: {summary.count}
+			</span>
+		{/if}
+		{#if app.saveError}
+			<span class="stat error" title={app.saveError}>
+				⚠ Autosave failed — use File → Download to keep your work
+			</span>
+		{/if}
+		{#if $pythonStatus.state === 'ready'}
+			<span class="stat">✓ Python {$pythonStatus.version}</span>
+		{:else if $pythonStatus.state === 'loading'}
+			<span class="stat">⏳ Loading Python…</span>
+		{:else if $pythonStatus.state === 'error'}
+			<span class="stat error">✗ Python failed to load</span>
+		{/if}
+		<span class="stat">quadratic is svelte</span>
+	</div>
+</div>
+
+<style>
+	.bottombar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		background: var(--panel);
+		border-top: 1px solid var(--border);
+		color: var(--muted);
+		height: 1.5rem;
+		font-size: 0.7rem;
+		padding: 0 1rem;
+		user-select: none;
+		backdrop-filter: blur(1px);
+	}
+	.left,
+	.right {
+		display: flex;
+		align-items: center;
+		gap: 1rem;
+	}
+	.stat {
+		white-space: nowrap;
+	}
+	.stat.error {
+		color: var(--error);
+	}
+	.stat.summary {
+		color: var(--accent);
+		font-variant-numeric: tabular-nums;
+	}
+	button.link {
+		background: none;
+		border: none;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		padding: 0;
+	}
+	button.link:hover {
+		text-decoration: underline;
+	}
+	.beta {
+		background: #8ecb89;
+		color: white;
+		padding: 2px 5px;
+		border-radius: 2px;
+		font-size: 0.65rem;
+	}
+</style>
+````

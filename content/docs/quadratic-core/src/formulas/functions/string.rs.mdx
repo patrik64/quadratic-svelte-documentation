@@ -1,0 +1,250 @@
+---
+title: "string.rs"
+description: "Rust module string.rs of the quadratic-core formula engine."
+source: "quadratic-core/src/formulas/functions/string.rs"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````rust string.rs -n
+use super::*;
+
+pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
+    include_in_docs: true,
+    include_in_completions: true,
+    name: "String functions",
+    docs: "",
+    get_functions,
+};
+
+/// Character index (1-based, from an f64 argument) clamped to usize.
+fn to_count(n: f64) -> usize {
+    n.max(0.0).round() as usize
+}
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "CONCAT",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["CONCAT(\"Hello, \", C0, \"!\")"],
+            doc: "[Concatenates](https://en.wikipedia.org/wiki/Concatenation) all values as strings.",
+            eval: util::pure_fn(|args| {
+                Ok(Value::String(util::flat_iter_strings(&args.inner).join("")))
+            }),
+        },
+        FormulaFunction {
+            name: "CONCATENATE",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["CONCATENATE(A0, \" \", B0)"],
+            doc: "Same as `CONCAT`. Concatenates all values as strings.",
+            eval: util::pure_fn(|args| {
+                Ok(Value::String(util::flat_iter_strings(&args.inner).join("")))
+            }),
+        },
+        FormulaFunction {
+            name: "LEFT",
+            arg_completion: "${1:string}",
+            usages: &["string", "string, count"],
+            examples: &["LEFT(\"spreadsheet\", 6)"],
+            doc: "Returns the first `count` characters of a string (default 1).",
+            eval: util::pure_fn(|args| {
+                let (s, count) = string_and_optional_count(args)?;
+                Ok(Value::String(s.chars().take(count).collect()))
+            }),
+        },
+        FormulaFunction {
+            name: "RIGHT",
+            arg_completion: "${1:string}",
+            usages: &["string", "string, count"],
+            examples: &["RIGHT(\"spreadsheet\", 5)"],
+            doc: "Returns the last `count` characters of a string (default 1).",
+            eval: util::pure_fn(|args| {
+                let (s, count) = string_and_optional_count(args)?;
+                let chars: Vec<char> = s.chars().collect();
+                let skip = chars.len().saturating_sub(count);
+                Ok(Value::String(chars[skip..].iter().collect()))
+            }),
+        },
+        FormulaFunction {
+            name: "MID",
+            arg_completion: "${1:string}, ${2:start}, ${3:count}",
+            usages: &["string, start, count"],
+            examples: &["MID(\"spreadsheet\", 7, 5)"],
+            doc: "Returns `count` characters starting at 1-based position `start`.",
+            eval: util::array_mapped(|[string, start, count]| {
+                let s = string.to_string();
+                let start = to_count(start.to_number()?).max(1) - 1;
+                let count = to_count(count.to_number()?);
+                Ok(Value::String(s.chars().skip(start).take(count).collect()))
+            }),
+        },
+        FormulaFunction {
+            name: "LEN",
+            arg_completion: "${1:string}",
+            usages: &["string"],
+            examples: &["LEN(\"hello\")"],
+            doc: "Returns the number of characters in a string.",
+            eval: util::array_mapped(|[string]| {
+                Ok(Value::Number(string.to_string().chars().count() as f64))
+            }),
+        },
+        FormulaFunction {
+            name: "LOWER",
+            arg_completion: "${1:string}",
+            usages: &["string"],
+            examples: &["LOWER(\"WORLD\")"],
+            doc: "Converts a string to lowercase.",
+            eval: util::array_mapped(|[string]| {
+                Ok(Value::String(string.to_string().to_lowercase()))
+            }),
+        },
+        FormulaFunction {
+            name: "UPPER",
+            arg_completion: "${1:string}",
+            usages: &["string"],
+            examples: &["UPPER(\"hello\")"],
+            doc: "Converts a string to uppercase.",
+            eval: util::array_mapped(|[string]| {
+                Ok(Value::String(string.to_string().to_uppercase()))
+            }),
+        },
+        FormulaFunction {
+            name: "TRIM",
+            arg_completion: "${1:string}",
+            usages: &["string"],
+            examples: &["TRIM(\"  hi  \")"],
+            doc: "Removes leading and trailing spaces and collapses runs of \
+                  spaces into one.",
+            eval: util::array_mapped(|[string]| {
+                let s = string.to_string();
+                let mut out = String::with_capacity(s.len());
+                let mut last_space = true; // strips leading spaces
+                for c in s.chars() {
+                    if c == ' ' {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        last_space = true;
+                    } else {
+                        out.push(c);
+                        last_space = false;
+                    }
+                }
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                Ok(Value::String(out))
+            }),
+        },
+        FormulaFunction {
+            name: "SUBSTITUTE",
+            arg_completion: "${1:string}, ${2:search}, ${3:replace}",
+            usages: &["string, search, replace"],
+            examples: &["SUBSTITUTE(\"a-b-c\", \"-\", \"+\")"],
+            doc: "Replaces every occurrence of `search` with `replace`.",
+            eval: util::array_mapped(|[string, search, replace]| {
+                let s = string.to_string();
+                let search = search.to_string();
+                if search.is_empty() {
+                    return Ok(Value::String(s));
+                }
+                Ok(Value::String(s.replace(&search, &replace.to_string())))
+            }),
+        },
+        FormulaFunction {
+            name: "FIND",
+            arg_completion: "${1:search}, ${2:string}",
+            usages: &["search, string"],
+            examples: &["FIND(\"sheet\", \"spreadsheet\")"],
+            doc: "Returns the 1-based position of `search` within `string`, or an error \
+                  if it is not found. Case-sensitive.",
+            eval: util::array_mapped(|[search, string]| {
+                let haystack = string.to_string();
+                let needle = search.to_string();
+                match haystack.find(&needle) {
+                    Some(byte_idx) => {
+                        let char_idx = haystack[..byte_idx].chars().count();
+                        Ok(Value::Number((char_idx + 1) as f64))
+                    }
+                    None => Err(FormulaErrorMsg::Expected {
+                        expected: format!("substring {needle:?}").into(),
+                        got: None,
+                    }
+                    .with_span(search.span)),
+                }
+            }),
+        },
+        FormulaFunction {
+            name: "REPT",
+            arg_completion: "${1:string}, ${2:count}",
+            usages: &["string, count"],
+            examples: &["REPT(\"ab\", 3)"],
+            doc: "Repeats a string `count` times.",
+            eval: util::array_mapped(|[string, count]| {
+                let n = to_count(count.to_number()?).min(10_000);
+                Ok(Value::String(string.to_string().repeat(n)))
+            }),
+        },
+        FormulaFunction {
+            name: "TEXTJOIN",
+            arg_completion: "${1:delimiter}, ${2:ignore_empty}, ${3:a, b, ...}",
+            usages: &["delimiter, ignore_empty, a, b, ..."],
+            examples: &["TEXTJOIN(\", \", TRUE, A0:A5)"],
+            doc: "Joins all values as strings with `delimiter` between them. \
+                  If `ignore_empty` is TRUE, empty values are skipped.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(delimiter), Some(ignore_empty)) = (a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let delimiter = delimiter.to_string();
+                let ignore_empty = ignore_empty.to_bool()?;
+                let parts: Vec<String> = a
+                    .flat_map(|v| v.to_strings())
+                    .filter(|s| !(ignore_empty && s.is_empty()))
+                    .collect();
+                Ok(Value::String(parts.join(&delimiter)))
+            }),
+        },
+    ]
+}
+
+/// Helper for LEFT/RIGHT: `(string)` or `(string, count)`, count defaults to 1.
+fn string_and_optional_count(
+    args: Spanned<Vec<Spanned<Value>>>,
+) -> FormulaResult<(String, usize)> {
+    let span = args.span;
+    let mut a = args.inner.into_iter();
+    let (Some(string), count) = (a.next(), a.next()) else {
+        return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+    };
+    if a.next().is_some() {
+        return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+    }
+    let count = match count {
+        Some(c) => to_count(c.to_number()?),
+        None => 1,
+    };
+    Ok((string.to_string(), count))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::formulas::tests::*;
+
+    #[test]
+    fn test_formula_concat() {
+        assert_eq!(
+            "Hello, 14000605 worlds!".to_string(),
+            eval_to_string(&mut NoGrid, "'Hello, ' & 14000605 & ' worlds!'"),
+        );
+    }
+}
+````

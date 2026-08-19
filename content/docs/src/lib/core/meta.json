@@ -1,0 +1,19 @@
+{
+  "title": "core",
+  "pages": [
+    "a1.test.ts",
+    "a1.ts",
+    "cellTextFormatter.test.ts",
+    "cellTextFormatter.ts",
+    "GridOffsets.test.ts",
+    "GridOffsets.ts",
+    "series.test.ts",
+    "series.ts",
+    "Sheet.ts",
+    "SheetController.test.ts",
+    "SheetController.ts",
+    "types.ts",
+    "updateCellAndDCells.spill.test.ts",
+    "updateCellAndDCells.ts"
+  ]
+}

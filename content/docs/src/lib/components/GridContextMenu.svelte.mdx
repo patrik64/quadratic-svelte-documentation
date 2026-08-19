@@ -1,0 +1,170 @@
+---
+title: "GridContextMenu.svelte"
+description: "Right-click grid menu, ported from the modern client's GridContextMenuCell."
+source: "src/lib/components/GridContextMenu.svelte"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````svelte GridContextMenu.svelte -n
+<script lang="ts">
+	// Right-click grid menu, ported from the modern client's GridContextMenuCell.
+	import { isCodeCellType } from '../core/types';
+	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
+	import {
+		app,
+		copySelection,
+		copySelectionAsPng,
+		deleteColumns,
+		deleteRows,
+		downloadSelectionAsCsv,
+		getSelectionRect,
+		insertColumn,
+		insertRow,
+		pasteFromClipboard,
+		rerunCurrentCell,
+		sheetController
+	} from '../state.svelte';
+
+	const C = KeyboardSymbols.Cmd;
+	const S = KeyboardSymbols.Shift;
+
+	let { x, y, onclose }: { x: number; y: number; onclose: () => void } = $props();
+	let menuEl: HTMLDivElement | undefined = $state();
+
+	const sel = $derived.by(() => {
+		void app.redraw;
+		return getSelectionRect();
+	});
+	const cols = $derived(sel.x1 - sel.x0 + 1);
+	const rows = $derived(sel.y1 - sel.y0 + 1);
+	const isCodeCell = $derived.by(() => {
+		void app.redraw;
+		const cell = sheetController.sheet.getCell(app.cursorPosition.x, app.cursorPosition.y);
+		return cell !== undefined && isCodeCellType(cell.type);
+	});
+
+	// keep the menu on-screen
+	const left = $derived(Math.min(x, (typeof window !== 'undefined' ? window.innerWidth : 1200) - 250));
+	const top = $derived(Math.min(y, (typeof window !== 'undefined' ? window.innerHeight : 800) - 420));
+
+	function run(action: () => unknown): void {
+		onclose();
+		void action();
+	}
+
+	$effect(() => {
+		// containment check rather than stopPropagation: Svelte delegates
+		// mousedown, so stopping it inside the menu is unreliable
+		const close = (e: MouseEvent) => {
+			if (!menuEl?.contains(e.target as Node)) onclose();
+		};
+		const key = (e: KeyboardEvent) => {
+			if (e.key === 'Escape') {
+				e.stopPropagation();
+				onclose();
+			}
+		};
+		window.addEventListener('mousedown', close);
+		window.addEventListener('keydown', key, true);
+		return () => {
+			window.removeEventListener('mousedown', close);
+			window.removeEventListener('keydown', key, true);
+		};
+	});
+</script>
+
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+	class="ctx"
+	bind:this={menuEl}
+	style:left="{left}px"
+	style:top="{top}px"
+	oncontextmenu={(e) => e.preventDefault()}
+>
+	{#if isCodeCell}
+		<button class="item" onclick={() => run(rerunCurrentCell)}>
+			<span>Run code</span><span class="key">{C}↵</span>
+		</button>
+		<div class="sep"></div>
+	{/if}
+	<button class="item" onclick={() => run(() => copySelection(true))}>
+		<span>Cut</span><span class="key">{C}X</span>
+	</button>
+	<button class="item" onclick={() => run(() => copySelection(false))}>
+		<span>Copy</span><span class="key">{C}C</span>
+	</button>
+	<button class="item" onclick={() => run(pasteFromClipboard)}>
+		<span>Paste</span><span class="key">{C}V</span>
+	</button>
+	<div class="sep"></div>
+	<button class="item" onclick={() => run(copySelectionAsPng)}>
+		<span>Copy as PNG</span><span class="key">{C}{S}C</span>
+	</button>
+	<button class="item" onclick={() => run(downloadSelectionAsCsv)}>
+		<span>Download as CSV</span><span class="key">{C}{S}E</span>
+	</button>
+	<div class="sep"></div>
+	<button class="item" onclick={() => run(() => insertColumn(sel.x0))}>
+		<span>Insert column left</span>
+	</button>
+	<button class="item" onclick={() => run(() => insertColumn(sel.x1 + 1))}>
+		<span>Insert column right</span>
+	</button>
+	<button class="item" onclick={() => run(() => deleteColumns(sel.x0, sel.x1))}>
+		<span>Delete {cols > 1 ? `${cols} columns` : 'column'}</span>
+	</button>
+	<div class="sep"></div>
+	<button class="item" onclick={() => run(() => insertRow(sel.y0))}>
+		<span>Insert row above</span>
+	</button>
+	<button class="item" onclick={() => run(() => insertRow(sel.y1 + 1))}>
+		<span>Insert row below</span>
+	</button>
+	<button class="item" onclick={() => run(() => deleteRows(sel.y0, sel.y1))}>
+		<span>Delete {rows > 1 ? `${rows} rows` : 'row'}</span>
+	</button>
+</div>
+
+<style>
+	.ctx {
+		position: fixed;
+		z-index: 250;
+		background: var(--panel);
+		border: 1px solid var(--border);
+		border-radius: 4px;
+		box-shadow: 0 6px 24px var(--shadow);
+		min-width: 220px;
+		padding: 4px 0;
+		font-size: 0.82rem;
+	}
+	.item {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 2rem;
+		width: 100%;
+		background: none;
+		border: none;
+		font: inherit;
+		text-align: left;
+		padding: 0.35rem 1rem;
+		cursor: pointer;
+		color: var(--text);
+	}
+	.item:hover {
+		background: var(--accent-soft);
+	}
+	.key {
+		color: var(--faint-2);
+		font-size: 0.72rem;
+	}
+	.sep {
+		border-top: 1px solid var(--border-light);
+		margin: 4px 0;
+	}
+</style>
+````

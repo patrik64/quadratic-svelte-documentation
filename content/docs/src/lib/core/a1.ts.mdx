@@ -1,0 +1,130 @@
+---
+title: a1.ts
+description: A1-notation helpers — column letters, row labels, and parsing cell references like nB7
+source: src/lib/core/a1.ts
+full: true
+---
+
+Spreadsheets name cells like `B7`: letters for the column, digits for the row.
+quadratic-svelte follows Quadratic's convention on an **infinite grid centered
+on the origin**: column `A` is 0, row labels are the raw y values (row 0
+exists), and negative coordinates are prefixed with a literal lowercase `n` —
+`nA` is column −1, `n5` is row −5. This 50-line module converts both ways.
+
+<Scrollycoding>
+
+## !!steps Column letters, base 26 with a twist
+
+Column numbers become letters in *bijective* base 26: there is no zero digit,
+so after `Z` (25) comes `AA` (26), not `BA`. The trick is the `- 1` when
+moving to the next block: it shifts each higher digit down by one, which is
+exactly what makes `A` play both the role of 0 (in the last position) and 1
+(in higher positions).
+
+The loop peels digits off the low end, so letters are *unshifted* onto the
+front of the array.
+
+```ts ! a1.ts
+function numberToLetters(column: number): string {
+	const letters: string[] = [];
+	let block = column;
+	while (block >= 0) {
+		letters.unshift(String.fromCharCode((block % 26) + 65));
+		// !mark
+		block = Math.floor(block / 26) - 1;
+	}
+	return letters.join('');
+}
+```
+
+## !!steps …and back again
+
+The inverse is a plain positional accumulate — but in 1-based digits: `A`
+contributes 1, `Z` contributes 26. Subtracting 1 at the end brings the result
+back to the 0-based column index, so `lettersToNumber('A') === 0` and
+`lettersToNumber('AA') === 26`.
+
+```ts ! a1.ts
+function lettersToNumber(letters: string): number {
+	let n = 0;
+	// !mark
+	for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+	return n - 1;
+}
+```
+
+## !!steps Negative axes get an n prefix
+
+The grid extends infinitely in all four directions, so columns and rows can be
+negative. Negative columns mirror the positive side: column −1 is `nA`,
+column −2 is `nB` — hence `-column - 1` to map −1 → 0 → `A`. Negative rows
+are simpler because rows are just numbers: row −5 is `n5`.
+
+Together they format any cell: x → column letters, y → row label,
+concatenated.
+
+```ts ! a1.ts
+export function getColumnA1Notation(column: number): string {
+	// !mark
+	if (column < 0) return `n${numberToLetters(-column - 1)}`;
+	return numberToLetters(column);
+}
+
+export function getRowA1Notation(row: number): string {
+	if (row < 0) return `n${-row}`;
+	return row.toString();
+}
+
+export function getCellA1Notation(x: number, y: number): string {
+	return `${getColumnA1Notation(x)}${getRowA1Notation(y)}`;
+}
+```
+
+## !!steps The reference regex
+
+Parsing is where the `n` convention bites. The marker is a *literal lowercase*
+`n`, so the reference must keep its case while matching — uppercasing first
+would fold the marker into the column letters (`nA7` would read as column
+"NA"). The column letters are matched **lazily** (`[A-Za-z]+?`) so that in a
+reference like `An1`, the trailing `n` is free to match as the row's negative
+marker instead of being swallowed by the column.
+
+```ts ! a1.ts
+/** Regex for one cell reference, e.g. B7, nB7, An1, nBn2.
+ * The negative marker is a literal lowercase `n`, so the ref must keep its
+ * case here — uppercasing first would fold the marker into the column
+ * letters (`nA7` → column "NA"). Lazy letters let the row's `n` match. */
+// !mark
+export const CELL_REF_RE = /^(n?)([A-Za-z]+?)(n?)(\d+)$/;
+```
+
+## !!steps Putting it together
+
+`parseCellRef` destructures the four capture groups — optional column marker,
+column letters, optional row marker, row digits — and undoes each encoding:
+letters back to a number (uppercased only *after* the match), then the mirror
+mapping for negative columns and plain negation for negative rows.
+
+`getCellA1Notation` and `parseCellRef` are exact inverses, which the test
+suite ([a1.test.ts](/docs/src/lib/core/a1.test.ts)) round-trips.
+
+```ts ! a1.ts
+export function parseCellRef(ref: string): { x: number; y: number } | undefined {
+	const m = CELL_REF_RE.exec(ref);
+	if (!m) return undefined;
+	const [, colNeg, letters, rowNeg, digits] = m;
+	const col = lettersToNumber(letters.toUpperCase());
+	// !mark(1:2)
+	const x = colNeg ? -col - 1 : col;
+	const row = parseInt(digits, 10);
+	const y = rowNeg ? -row : row;
+	return { x, y };
+}
+```
+
+</Scrollycoding>
+
+Used throughout the app: the [GoTo](/docs/src/lib/components/GoTo.svelte)
+dialog parses what you type, the formula engine displays cell references, and
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) exposes
+A1-addressed cell access to user code.

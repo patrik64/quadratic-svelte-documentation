@@ -1,0 +1,90 @@
+---
+title: "mod.rs"
+description: "Root of the formulas module: declares the lexer, parser, AST, eval and LSP submodules and re-exports the engine's public API."
+source: "quadratic-core/src/formulas/mod.rs"
+full: true
+---
+
+`quadratic-core` keeps the entire formula language in one module tree rooted
+here: lexing, parsing, evaluation, error reporting, the built-in function
+library, and the Monaco language-server support. This `mod.rs` contains no
+logic of its own — it declares the submodules, decides what escapes the module
+boundary, and defines the crate-wide result alias.
+
+<Scrollycoding>
+
+## !!steps The module tree
+
+Ten submodules, most of them private. Order matters for exactly one line:
+`errors` is declared first with `#[macro_use]`, so the `internal_error!` and
+`internal_error_value!` macros it defines are visible in every sibling module
+declared after it. `functions` and `lsp` are `pub` because they are consumed
+from outside the module: [lib.rs](/docs/quadratic-core/src/lib.rs) walks
+`functions::CATEGORIES` to build the in-app docs, and `lsp` exports
+wasm-bindgen entry points directly to JavaScript.
+
+```rust ! mod.rs
+use crate::Pos;
+use ast::AstNode;
+
+// !mark(1:2)
+#[macro_use]
+mod errors;
+mod ast;
+mod cell_ref;
+mod ctx;
+pub mod functions;
+mod grid_proxy;
+mod lexer;
+pub mod lsp;
+mod parser;
+mod span;
+mod value;
+```
+
+## !!steps A flat public API
+
+The interesting types are re-exported at the `formulas::` level, so the rest
+of the crate never names a submodule: `lib.rs` calls
+`formulas::parse_formula` and `formulas::find_cell_references`, and uses
+`formulas::Span`, `formulas::Value` and the error types in its wasm-facing
+result structs. `cell_ref` is glob-exported, which brings `RangeRef`,
+`CellRef` and `CellRefCoord` along.
+
+```rust ! mod.rs
+pub use ast::Formula;
+pub use cell_ref::*;
+pub use ctx::Ctx;
+pub use errors::{FormulaError, FormulaErrorMsg};
+pub use grid_proxy::GridProxy;
+pub use parser::{find_cell_references, parse_formula};
+pub use span::{Span, Spanned};
+pub use value::Value;
+```
+
+## !!steps One Result type for everything
+
+`FormulaResult` has a default type parameter, so the bare spelling means
+`Result` of `Value` — the signature of every evaluation step — while helpers
+can still write `FormulaResult<T>` for other payloads. The `tests` module is
+compiled only under `#[cfg(test)]`.
+
+```rust ! mod.rs
+/// Result of a `FormulaError`.
+// !mark
+pub type FormulaResult<T = Value> = Result<T, FormulaError>;
+
+#[cfg(test)]
+mod tests;
+```
+
+</Scrollycoding>
+
+The real code lives one level down:
+[lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs) tokenizes,
+[parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs) builds the
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) tree, and
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) drives evaluation. The
+public surface assembled here is consumed by
+[lib.rs](/docs/quadratic-core/src/lib.rs), whose wasm exports are what
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) calls from the app.

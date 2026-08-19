@@ -1,0 +1,83 @@
+---
+title: "a1.test.ts"
+description: "Unit tests for a1.ts."
+source: "src/lib/core/a1.test.ts"
+generated: true
+---
+
+_Auto-generated page showing the full file contents. To replace it with a
+hand-written walkthrough, remove `generated: true` from the frontmatter so
+`pnpm gen` keeps your edits._
+
+````ts a1.test.ts -n
+import { describe, expect, it } from 'vitest';
+import { getCellA1Notation, getColumnA1Notation, getRowA1Notation, parseCellRef } from './a1';
+
+describe('getColumnA1Notation', () => {
+	it('maps column 0 to A', () => {
+		expect(getColumnA1Notation(0)).toBe('A');
+	});
+
+	it('rolls over from Z to AA', () => {
+		expect(getColumnA1Notation(25)).toBe('Z');
+		expect(getColumnA1Notation(26)).toBe('AA');
+		expect(getColumnA1Notation(27)).toBe('AB');
+		expect(getColumnA1Notation(701)).toBe('ZZ');
+		expect(getColumnA1Notation(702)).toBe('AAA');
+	});
+
+	it('prefixes negative columns with n', () => {
+		expect(getColumnA1Notation(-1)).toBe('nA');
+		expect(getColumnA1Notation(-27)).toBe('nAA');
+	});
+});
+
+describe('getRowA1Notation', () => {
+	it('uses the raw y value (row 0 exists)', () => {
+		expect(getRowA1Notation(0)).toBe('0');
+		expect(getRowA1Notation(42)).toBe('42');
+	});
+
+	it('prefixes negative rows with n', () => {
+		expect(getRowA1Notation(-5)).toBe('n5');
+	});
+});
+
+describe('parseCellRef', () => {
+	it('parses simple refs', () => {
+		expect(parseCellRef('A0')).toEqual({ x: 0, y: 0 });
+		expect(parseCellRef('B7')).toEqual({ x: 1, y: 7 });
+		expect(parseCellRef('AA10')).toEqual({ x: 26, y: 10 });
+	});
+
+	it('parses negative columns and rows', () => {
+		expect(parseCellRef('nA7')).toEqual({ x: -1, y: 7 });
+		expect(parseCellRef('An5')).toEqual({ x: 0, y: -5 });
+		expect(parseCellRef('nBn2')).toEqual({ x: -2, y: -2 });
+	});
+
+	it('accepts lowercase', () => {
+		expect(parseCellRef('aa10')).toEqual({ x: 26, y: 10 });
+	});
+
+	it('rejects malformed refs', () => {
+		expect(parseCellRef('A')).toBeUndefined();
+		expect(parseCellRef('7')).toBeUndefined();
+		expect(parseCellRef('')).toBeUndefined();
+		expect(parseCellRef('A-1')).toBeUndefined();
+		expect(parseCellRef('1A')).toBeUndefined();
+	});
+
+	it('roundtrips with getCellA1Notation', () => {
+		for (const coord of [
+			{ x: 0, y: 0 },
+			{ x: 26, y: 3 },
+			{ x: -1, y: 7 },
+			{ x: 5, y: -2 },
+			{ x: -28, y: -9 }
+		]) {
+			expect(parseCellRef(getCellA1Notation(coord.x, coord.y))).toEqual(coord);
+		}
+	});
+});
+````
