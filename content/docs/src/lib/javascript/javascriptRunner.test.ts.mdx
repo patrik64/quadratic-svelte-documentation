@@ -1,31 +1,67 @@
 ---
 title: "javascriptRunner.test.ts"
-description: "Unit tests for javascriptRunner.ts."
+description: "Vitest coverage for the import rewriter — every ESM clause form, plus the invariants error mapping depends on"
 source: "src/lib/javascript/javascriptRunner.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Almost all of this file tests one function. That is proportionate:
+`transformImports` in
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) is a
+regex-based source transformer, the kind of code where a missed clause form
+breaks user cells in ways that are hard to diagnose from a stack trace.
 
-````ts javascriptRunner.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { runJavascript, transformImports } from './javascriptRunner';
+The tests are written as exact string comparisons rather than pattern matches,
+so they pin the generated code precisely — including its punctuation.
 
+<Scrollycoding>
+
+## !!steps The default and named forms
+
+The two clause shapes users write most often. The first pins the whole
+translation for a default import, down to the semicolon: the default export is
+reached as the `default` property of the module namespace, so
+`import Chart from '...'` has to become a destructuring of that property rather
+than a plain assignment.
+
+The second covers named imports and, in the same case, the `as` rename — the
+detail most likely to be wrong, since ESM spells renaming with `as` while
+destructuring spells it with a colon. Note the input omits its trailing
+semicolon and the output has one, fixing the expectation that the rewriter
+normalizes that.
+
+```ts ! javascriptRunner.test.ts
 describe('transformImports', () => {
 	it('rewrites default imports', () => {
 		expect(transformImports("import Chart from 'https://esm.run/chart.js/auto';")).toBe(
+			// !mark
 			"const { default: Chart } = await import('https://esm.run/chart.js/auto');"
 		);
 	});
 
 	it('rewrites named imports, including renames', () => {
 		expect(transformImports("import { min, max as maximum } from 'https://x/d.js'")).toBe(
+			// !mark
 			"const { min, max: maximum } = await import('https://x/d.js');"
 		);
 	});
+```
 
+## !!steps Namespaces and the combined forms
+
+A namespace import is the case that cannot be destructured — the whole module
+object needs a name — so it must produce a plain `const` assignment, which this
+test locks in. It also uses double quotes, incidentally confirming the rewriter
+does not care which quote style the specifier uses.
+
+The two combined forms are where the clause parser earns its keep. A default
+next to named imports folds into a single destructuring pattern, while a
+default next to a namespace cannot: the test expects two declarators in one
+statement, with the default pulled off the namespace afterwards. Getting that
+second one wrong would still be valid JavaScript, just bound to the wrong
+value.
+
+```ts ! javascriptRunner.test.ts
 	it('rewrites namespace imports', () => {
 		expect(transformImports('import * as d3 from "https://esm.run/d3";')).toBe(
 			'const d3 = await import("https://esm.run/d3");'
@@ -34,31 +70,68 @@ describe('transformImports', () => {
 
 	it('rewrites combined default + named imports', () => {
 		expect(transformImports("import Chart, { registerables } from 'https://x/c.js';")).toBe(
+			// !mark
 			"const { default: Chart, registerables } = await import('https://x/c.js');"
 		);
 	});
 
 	it('rewrites combined default + namespace imports', () => {
 		expect(transformImports("import D, * as ns from 'https://x/c.js';")).toBe(
+			// !mark
 			"const ns = await import('https://x/c.js'), D = ns.default;"
 		);
 	});
+```
 
-	it('rewrites bare imports', () => {
-		expect(transformImports("import 'https://x/side-effect.js';")).toBe(
-			"await import('https://x/side-effect.js');"
-		);
-	});
+## !!steps The invariants everything else depends on
 
+The last case tests three properties at once, and each protects something
+outside this function.
+
+Line count is checked explicitly because error reporting subtracts a fixed
+offset from the stack's line number to map it back to the user's source; a
+rewrite that added or removed a line would silently misreport every subsequent
+error. Indentation is preserved so a rewritten import inside an indented block
+still reads naturally.
+
+The third assertion is the sharpest: the input's final line *mentions* an
+import inside a trailing comment, and the test requires it to come through
+untouched. That is the guard against a rewriter matching the word `import`
+anywhere on a line instead of only at the start — which is exactly why the
+regexes are anchored.
+
+```ts ! javascriptRunner.test.ts
 	it('preserves indentation, line count, and non-import lines', () => {
 		const code = "let a = 1;\n  import X from 'm';\nreturn a; // import X from 'm'";
 		const out = transformImports(code);
+		// !mark
 		expect(out.split('\n').length).toBe(3);
 		expect(out).toContain("  const { default: X } = await import('m');");
+		// !mark
 		expect(out).toContain("return a; // import X from 'm'");
 	});
 });
+```
 
+## !!steps Testing the runner around its environment
+
+The two end-to-end cases run real code through `runJavascript`. The first is
+shaped by a limitation the comment is careful to record: Vitest's Node
+environment has no dynamic-import callback, so the rewritten `await import()`
+cannot actually resolve, even for a `data:` URL that works in a browser.
+
+Rather than skip the case or mock the loader, the assertion is narrowed to what
+*can* be verified here — that the failure is not a `SyntaxError`. If the static
+import had reached `AsyncFunction` unrewritten, the message would mention an
+unexpected import statement; its absence proves the rewrite happened and the
+code compiled. The test asserts a *negative* precisely because the positive is
+unavailable in this environment.
+
+The second case is the sanity check that none of the import machinery disturbed
+the ordinary path: plain code still returns its value as a string, and
+`image_output` stays absent when nothing drew a canvas.
+
+```ts ! javascriptRunner.test.ts
 describe('runJavascript', () => {
 	const noCells = () => undefined;
 
@@ -71,14 +144,26 @@ describe('runJavascript', () => {
 			{ x: 0, y: 0 },
 			noCells
 		);
+		// !mark
 		expect(result.std_err ?? '').not.toMatch(/import statement|Unexpected/);
 	});
 
 	it('still returns plain values', async () => {
 		const result = await runJavascript('return 1 + 1;', { x: 0, y: 0 }, noCells);
 		expect(result.success).toBe(true);
+		// !mark(1:2)
 		expect(result.output_value).toBe('2');
 		expect(result.image_output).toBeUndefined();
 	});
 });
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`, which invokes Vitest across the project. What is *not*
+covered here is the output-shaping half of the runner —
+`convertOutput`'s object-header, 2-D padding and spill rules, and the canvas
+capture path — nor the `q.cells` shape logic, all of which are exercised only
+through the app. The spill behavior does have coverage elsewhere, from the
+model side, in
+[updateCellAndDCells.spill.test.ts](/docs/src/lib/core/updateCellAndDCells.spill.test.ts).

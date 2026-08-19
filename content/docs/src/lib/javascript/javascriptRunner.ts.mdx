@@ -1,42 +1,68 @@
 ---
 title: "javascriptRunner.ts"
-description: "JavaScript cells, mirroring the modern Quadratic client's semantics: the return value of the user's (async) code becomes the cell output, arrays spill (1-D d…"
+description: "Runs JavaScript cells — rewrites static imports, exposes a cell API, captures console output, and shapes the return value"
 source: "src/lib/javascript/javascriptRunner.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A JavaScript cell is a body of code whose **return value becomes the cell's
+output**. This module is what makes that true: it compiles the user's source
+into an async function, hands it an API for reading the sheet, captures
+anything logged, and then translates whatever comes back — a number, an array,
+a canvas — into something the grid can store.
 
-````ts javascriptRunner.ts -n
-// JavaScript cells, mirroring the modern Quadratic client's semantics:
-// the return value of the user's (async) code becomes the cell output,
-// arrays spill (1-D down a column, 2-D as rows, arrays of plain objects get
-// a header row), console output is captured, q.cells()/q.pos() API.
-// Static `import` declarations are rewritten to dynamic imports so CDN ESM
-// modules work, and a returned canvas becomes a PNG image on the sheet.
+Everything here runs on the main thread in the page's own realm. There is no
+sandbox: a cell can reach `window` and `fetch`, which is what allows loading
+chart libraries from a CDN.
 
-import { getCellA1Notation, parseCellRef } from '../core/a1';
-import type { ArrayOutput } from '../core/types';
+<Scrollycoding>
 
+## !!steps What a run produces
+
+The result type is the contract with the rest of the app. `output_value` is the
+single cell value, `array_output` the spilled block when the code returned a
+collection, and `cells_accessed` the dependency list that
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts) uses to
+decide what recomputes when an input changes.
+
+The three optional fields carry everything else a cell can produce: captured
+logs, an error message, and a data URL when the code returned a canvas. Note
+`success` is independent of `std_err` being present — a run can succeed while
+having logged warnings.
+
+```ts ! javascriptRunner.ts
 export interface JavascriptRunResult {
 	success: boolean;
 	output_value: string | null;
 	array_output?: ArrayOutput | null;
+	// !mark
 	cells_accessed: [number, number][];
 	std_out?: string;
 	std_err?: string;
 	image_output?: string;
 }
+```
 
-/** Rewrites top-level static `import` declarations to `await import()` so
- * user code can load ESM dependencies from CDNs — the cell body is compiled
- * with `new AsyncFunction(...)`, where static imports are a syntax error.
- * Line-based: an import statement spread over several lines is not
- * recognized. Replacements keep the line count so error positions map back. */
+## !!steps Why static imports have to be rewritten
+
+The cell body is compiled with `new AsyncFunction(...)`, and a static `import`
+declaration inside a function body is a **syntax error** — imports are only
+legal at the top level of a module. So user code that starts with
+`import Chart from '...'` would fail to compile at all.
+
+The fix is to rewrite each import into an equivalent `await import()`, which is
+an expression and therefore legal anywhere. Two constraints shape the
+implementation, both spelled out in the doc comment: it is deliberately
+**line-based**, so an import spread across several lines is not recognized; and
+every replacement occupies exactly one line, preserving the file's line count
+so that error positions still map back to what the user wrote.
+
+The simplest case is a bare side-effect import, handled first.
+
+```ts ! javascriptRunner.ts
 export function transformImports(code: string): string {
 	const rewrite = (line: string): string => {
+		// !mark(1:2)
 		const bare = /^(\s*)import\s+(['"][^'"]+['"])\s*;?\s*$/.exec(line);
 		if (bare) return `${bare[1]}await import(${bare[2]});`;
 		const m = /^(\s*)import\s+([^'"]+?)\s+from\s+(['"][^'"]+['"])\s*;?\s*$/.exec(line);
@@ -51,7 +77,27 @@ export function transformImports(code: string): string {
 			rest = rest.slice(dm[0].length).trim();
 			if (rest !== '' && !dm[2]) return line;
 		}
+```
+
+## !!steps Every import clause has its own destructuring
+
+With the default binding peeled off, what remains is one of three shapes, and
+each maps to a different destructuring of the module namespace object.
+
+Named imports become object destructuring, with `as` renames converted to the
+colon syntax destructuring already uses — `{ max as maximum }` becomes
+`{ max: maximum }`. A default alongside them is folded in as `default: Name`,
+since the default export is just a property called `default` on the namespace.
+
+Namespace imports are the exception: `import * as d3` needs the whole object
+bound to a name rather than destructured, so it emits a plain assignment, and a
+default alongside it is pulled off in a second declarator. Anything the parser
+does not recognize is returned unchanged, so a line that merely mentions the
+word `import` is left alone.
+
+```ts ! javascriptRunner.ts
 		if (rest.startsWith('{') && rest.endsWith('}')) {
+			// !mark(1:3)
 			const inner = rest.slice(1, -1).replace(/\s+as\s+/g, ': ').trim();
 			const parts = def ? `default: ${def}, ${inner}` : inner;
 			return `${indent}const { ${parts} } = await import(${spec});`;
@@ -68,31 +114,33 @@ export function transformImports(code: string): string {
 	};
 	return code.split('\n').map(rewrite).join('\n');
 }
+```
 
-function isCanvas(v: unknown): v is OffscreenCanvas | HTMLCanvasElement {
-	return (
-		(typeof OffscreenCanvas !== 'undefined' && v instanceof OffscreenCanvas) ||
-		(typeof HTMLCanvasElement !== 'undefined' && v instanceof HTMLCanvasElement)
-	);
-}
+## !!steps Waiting for a chart to stop moving
 
-/** Converts a returned canvas to a PNG data URL. Chart libraries draw over
- * several animation frames, so capture waits until the pixels stop changing
- * (bounded by a cap) rather than grabbing a half-animated first frame. */
-async function captureCanvas(canvas: OffscreenCanvas | HTMLCanvasElement): Promise<string> {
-	const ctx = canvas.getContext('2d') as
-		| OffscreenCanvasRenderingContext2D
-		| CanvasRenderingContext2D
-		| null;
+Returning a canvas produces an image on the sheet, but grabbing its pixels
+immediately would capture a half-drawn chart: libraries like Chart.js animate
+their first render across several frames.
+
+Rather than guessing a delay, this polls for stability. `sample` hashes the
+pixel buffer — striding by 1021, a prime, so the samples spread across the
+image instead of landing on one channel of every Nth pixel — and the loop waits
+until two consecutive samples match, meaning nothing changed in the last
+120ms. A 1600ms ceiling bounds the wait for a canvas that never settles, such
+as a continuous animation.
+
+```ts ! javascriptRunner.ts
 	if (ctx && canvas.width > 0 && canvas.height > 0) {
 		const sample = (): number => {
 			const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
 			let h = 0;
+			// !mark
 			for (let i = 0; i < data.length; i += 1021) h = (h * 31 + data[i]) | 0;
 			return h;
 		};
 		const started = performance.now();
 		let prev = sample();
+		// !mark(1:6)
 		while (performance.now() - started < 1600) {
 			await new Promise((r) => setTimeout(r, 120));
 			const cur = sample();
@@ -100,20 +148,24 @@ async function captureCanvas(canvas: OffscreenCanvas | HTMLCanvasElement): Promi
 			prev = cur;
 		}
 	}
-	if (typeof OffscreenCanvas !== 'undefined' && canvas instanceof OffscreenCanvas) {
-		const blob = await canvas.convertToBlob({ type: 'image/png' });
-		return await new Promise<string>((resolve, reject) => {
-			const reader = new FileReader();
-			reader.onload = () => resolve(reader.result as string);
-			reader.onerror = () => reject(reader.error ?? new Error('could not read canvas blob'));
-			reader.readAsDataURL(blob);
-		});
-	}
-	return (canvas as HTMLCanvasElement).toDataURL('image/png');
-}
+```
 
-type Scalar = string | number | boolean;
+## !!steps Reading the sheet, with types restored
 
+Cell values are stored as strings, so handing them to JavaScript untouched
+would make `q.cells('A1') * 2` produce `NaN` for a perfectly good number.
+`coerce` restores the natural type: numeric strings become numbers, the three
+spellings of each boolean become booleans, and everything else stays a string.
+Empty cells become `undefined` rather than an empty string, so a missing value
+is falsy in the obvious way.
+
+Every read goes through `readCell`, which **records the coordinate** before
+returning. That side effect is the dependency tracking — the cell doesn't
+declare its inputs, they are discovered by watching what it actually reads.
+`readRect` normalizes its corners with `Math.min`/`Math.max` so a range works
+in any direction.
+
+```ts ! javascriptRunner.ts
 function coerce(raw: string | undefined): Scalar | undefined {
 	if (raw === undefined || raw === '') return undefined;
 	const n = Number(raw);
@@ -122,30 +174,33 @@ function coerce(raw: string | undefined): Scalar | undefined {
 	if (raw === 'FALSE' || raw === 'false' || raw === 'False') return false;
 	return raw;
 }
-
-export async function runJavascript(
-	code: string,
-	pos: { x: number; y: number },
-	getCellValue: (x: number, y: number) => string | undefined
-): Promise<JavascriptRunResult> {
-	const accessed: [number, number][] = [];
-	const logs: string[] = [];
-
+// ...
 	const readCell = (x: number, y: number): Scalar | undefined => {
+		// !mark
 		accessed.push([x, y]);
 		return coerce(getCellValue(x, y));
 	};
+```
 
-	const readRect = (x0: number, y0: number, x1: number, y1: number) => {
-		const rows: (Scalar | undefined)[][] = [];
-		for (let y = Math.min(y0, y1); y <= Math.max(y0, y1); y++) {
-			const row: (Scalar | undefined)[] = [];
-			for (let x = Math.min(x0, x1); x <= Math.max(x0, x1); x++) row.push(readCell(x, y));
-			rows.push(row);
-		}
-		return rows;
-	};
+## !!steps One accessor, three shapes
 
+`q.cells` accepts either a single reference or a range, parsing both through
+[a1.ts](/docs/src/lib/core/a1.ts), and its return shape depends on the
+geometry rather than on a flag.
+
+A lone reference yields a scalar. A range collapses when it is one cell thick:
+a single row returns a flat array, and so does a single column — via
+`rows.map((r) => r[0])` — which means `q.cells('A1:A5')` gives you five values
+you can `reduce` over directly, not five one-element arrays. Only a genuine
+rectangle stays two-dimensional. A one-by-one range degenerates all the way
+back to a scalar.
+
+Alongside `q` the runner exposes `cell` and `cells` as coordinate-based
+aliases, deliberately matching the API of
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts) so the two languages
+read alike.
+
+```ts ! javascriptRunner.ts
 	/** q.cells('A0') -> scalar; single row/col -> 1-D array; else 2-D. */
 	const qCells = (a1: string) => {
 		const parts = String(a1).split(':');
@@ -155,43 +210,35 @@ export async function runJavascript(
 		const second = parseCellRef(parts[1]?.trim() ?? '');
 		if (!second) throw new Error(`Invalid cell reference: '${a1}'`);
 		const rows = readRect(first.x, first.y, second.x, second.y);
+		// !mark(1:3)
 		if (rows.length === 1) return rows[0].length === 1 ? rows[0][0] : rows[0];
 		if (rows[0].length === 1) return rows.map((r) => r[0]);
 		return rows;
 	};
+```
 
-	const q = {
-		cells: qCells,
-		pos: () => ({ x: pos.x, y: pos.y }),
-		toA1: (x: number, y: number) => getCellA1Notation(x, y)
-	};
-	// convenience aliases matching this port's Python cells
-	const cell = (x: number, y: number) => readCell(x, y);
-	const cells = (p0: [number, number], p1: [number, number]) =>
-		readRect(p0[0], p0[1], p1[0], p1[1]);
+## !!steps Compiling the cell and translating its errors
 
-	const stringify = (v: unknown): string => {
-		if (v instanceof Date) return v.toISOString();
-		if (typeof v === 'object') {
-			try {
-				return JSON.stringify(v);
-			} catch {
-				return String(v);
-			}
-		}
-		return String(v);
-	};
-	const capturedConsole = {
-		log: (...args: unknown[]) => logs.push(args.map(stringify).join(' ')),
-		warn: (...args: unknown[]) => logs.push('WARNING: ' + args.map(stringify).join(' ')),
-		error: (...args: unknown[]) => logs.push('ERROR: ' + args.map(stringify).join(' '))
-	};
+`AsyncFunction` is not a global, so it is reached through the prototype of an
+async function expression. Constructing one with the API names as parameters is
+what puts `q`, `cell`, `cells`, `pos` and `console` in scope for the user's
+code — and because `console` is a *parameter*, the substituted
+`capturedConsole` shadows the real one without any global patching, so logs are
+collected rather than lost to devtools.
 
-	let result: unknown;
+The failure path exists to fix line numbers. A thrown error's stack refers to
+positions inside the generated function, which the `<anonymous>` pattern
+extracts — and those are offset by the wrapper the constructor adds, so `- 2`
+maps them back to the line the user actually wrote. This is the payoff for
+`transformImports` preserving the line count: had rewriting changed it, every
+reported position would be wrong.
+
+```ts ! javascriptRunner.ts
 	try {
 		const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
 			...args: string[]
 		) => (...fnArgs: unknown[]) => Promise<unknown>;
+		// !mark(1:2)
 		const fn = new AsyncFunction('q', 'cell', 'cells', 'pos', 'console', transformImports(code));
 		result = await fn(q, cell, cells, q.pos, capturedConsole);
 	} catch (e) {
@@ -199,6 +246,7 @@ export async function runJavascript(
 		let message = err?.message ?? String(e);
 		// map the stack's <anonymous> position back to a user line number
 		const m = /<anonymous>:(\d+):(\d+)/.exec(err?.stack ?? '');
+		// !mark
 		if (m) message += ` at line ${Math.max(1, parseInt(m[1], 10) - 2)}:${m[2]}`;
 		return {
 			success: false,
@@ -208,7 +256,21 @@ export async function runJavascript(
 			std_err: message
 		};
 	}
+```
 
+## !!steps A canvas becomes an image, or degrades gracefully
+
+Before the return value is treated as data, it is checked for being a canvas.
+If it is, the captured data URL goes into `image_output` and `output_value`
+stays `null` — the cell holds a picture instead of a value, which is what
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) turns into a sprite.
+
+The `catch` is the considerate part: a canvas that cannot be read — a tainted
+one, for instance — does not fail the cell. The problem is appended to the logs
+as a warning and `result` is reset to `undefined`, so execution continues into
+the normal conversion path and the cell simply ends up empty.
+
+```ts ! javascriptRunner.ts
 	// a returned canvas becomes an image on the sheet instead of a cell value
 	if (isCanvas(result)) {
 		try {
@@ -216,42 +278,38 @@ export async function runJavascript(
 			return {
 				success: true,
 				output_value: null,
+				// !mark
 				image_output: image,
 				cells_accessed: accessed,
 				std_out: logs.length ? logs.join('\n') : undefined
 			};
 		} catch (e) {
+			// !mark(1:2)
 			logs.push(`WARNING: could not capture canvas: ${(e as Error)?.message ?? e}`);
 			result = undefined;
 		}
 	}
+```
 
-	const { output_value, array_output, warning } = convertOutput(result);
-	if (warning) logs.push(`WARNING: ${warning}`);
-	return {
-		success: true,
-		output_value,
-		array_output,
-		cells_accessed: accessed,
-		std_out: logs.length ? logs.join('\n') : undefined
-	};
-}
+## !!steps Giving the return value a shape
 
-function sanitizeScalar(v: unknown): Scalar | null {
-	if (v === null || v === undefined) return null;
-	if (typeof v === 'number') return Number.isFinite(v) ? v : null;
-	if (typeof v === 'boolean' || typeof v === 'string') return v;
-	if (v instanceof Date) return v.toISOString();
-	return null;
-}
+`convertOutput` is where "arrays spill" becomes concrete, and the branch order
+matters because the checks overlap.
 
-function convertOutput(result: unknown): {
-	output_value: string | null;
-	array_output?: ArrayOutput;
-	warning?: string;
-} {
-	if (result === undefined || result === null) return { output_value: null };
+An array of plain objects is recognized first, because it is also an array: the
+keys of the first element become a header row and each object contributes a row
+in that key order, which turns a list of records into a table without the user
+formatting anything. An array of arrays is treated as rows, with short rows
+padded to the widest so the block stays rectangular. A flat array spills down a
+single column.
 
+Every value passes through `sanitizeScalar`, which converts `Date` objects to
+ISO strings and turns anything unrepresentable — including `NaN` and `Infinity`
+— into `null`. That last case is caught for scalars and reported as a
+targeted warning, as is the easy mistake of returning a `Promise` without
+awaiting it.
+
+```ts ! javascriptRunner.ts
 	if (Array.isArray(result)) {
 		if (result.length === 0) return { output_value: null };
 		// array of plain objects: keys become a header row (modern behavior)
@@ -261,6 +319,7 @@ function convertOutput(result: unknown): {
 			!Array.isArray(result[0]) &&
 			!(result[0] instanceof Date)
 		) {
+			// !mark(1:5)
 			const keys = Object.keys(result[0] as object);
 			const rows: (Scalar | null)[][] = [keys];
 			for (const item of result as Record<string, unknown>[]) {
@@ -278,26 +337,14 @@ function convertOutput(result: unknown): {
 			});
 			return { output_value: String(rows[0]?.[0] ?? ''), array_output: rows as ArrayOutput };
 		}
-		// 1-D spills down a single column
-		const column = (result as unknown[]).map(sanitizeScalar);
-		return { output_value: String(column[0] ?? ''), array_output: column as ArrayOutput };
-	}
+```
 
-	const scalar = sanitizeScalar(result);
-	if (scalar === null) {
-		if (typeof result === 'number') {
-			return { output_value: null, warning: 'NaN or Infinity is not supported as cell output' };
-		}
-		if (typeof result === 'object' && String(result) === '[object Promise]') {
-			return { output_value: null, warning: 'Unawaited Promise returned — did you forget await?' };
-		}
-		return {
-			output_value: null,
-			warning: `Unsupported output type: ${typeof result}`
-		};
-	}
-	return {
-		output_value: typeof scalar === 'boolean' ? (scalar ? 'TRUE' : 'FALSE') : String(scalar)
-	};
-}
-````
+</Scrollycoding>
+
+The runner is invoked from
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts), which
+passes the cell's position and a `getCellValue` closure over the sheet, then
+writes the spilled block and records `cells_accessed` as dependency edges in
+[Sheet.ts](/docs/src/lib/core/Sheet.ts). The import rewriting and the plain
+value path are covered by
+[javascriptRunner.test.ts](/docs/src/lib/javascript/javascriptRunner.test.ts).
