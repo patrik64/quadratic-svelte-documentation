@@ -1,15 +1,37 @@
 ---
 title: "TopBar.svelte"
-description: "Menubar layout following the modern client's TopBar: [logo] File · Edit · View · Insert · Format · Help | filename | controls"
+description: "The menubar: six dropdown menus plus a zoom control, an inline-rename filename, and toolbar clusters over state.svelte.ts"
 source: "src/lib/components/TopBar.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The application's menubar — the strip across the top of the window holding the
+logo, six menus, the filename and the zoom controls. It is the widest surface in
+the app measured by features exposed, and one of the thinnest measured by logic:
+nearly every entry is a one-line call into
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).
 
-````svelte TopBar.svelte -n
+What it does own is small and local — renaming the file in place, a hidden file
+input for CSV import, and one remembered setting, the colour the Format menu
+paints borders with. [+page.svelte](/docs/src/routes/+page.svelte) renders the
+bar only while `app.presentationMode` is false, so the View menu's presentation
+toggle removes the very bar it was clicked from.
+
+<Scrollycoding>
+
+## !!steps Delegating almost everything
+
+The import list is the shape of the file: three dozen functions pulled from the
+state module, roughly one per menu entry, plus `app` itself for the flags the
+View menu toggles. Nothing a menu does is implemented here.
+
+Two aliases follow. `C` and `S` come from
+[keyboardSymbols.ts](/docs/src/lib/helpers/keyboardSymbols.ts), where `Cmd`
+resolves to `⌘` on a Mac and to the literal `Ctrl+` everywhere else — which is
+why every hint below is written as `{C}O` rather than a hard-coded glyph. `S` is
+always `⇧`; only the Cmd half adapts.
+
+```svelte ! TopBar.svelte
 <script lang="ts">
 	// Menubar layout following the modern client's TopBar:
 	// [logo] File · Edit · View · Insert · Format · Help | filename | controls
@@ -19,53 +41,68 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		app,
 		changeDecimals,
 		clearFormatting,
-		copySelection,
-		copySelectionAsPng,
-		downloadSelectionAsCsv,
-		fillDown,
-		fillRight,
-		importCSVAt,
-		insertTodayDate,
-		newFile,
-		openCodeEditorAt,
-		pasteFromClipboard,
-		redo,
-		rerunAllCode,
-		saveFile,
-		copyFormat,
-		pasteFormat,
-		setAlignment,
-		setBorders,
-		setFormat,
-		setWrapping,
-		setTextFormat,
-		setZoom,
-		toggleBold,
-		toggleItalic,
-		undo,
-		zoomIn,
-		zoomOut,
-		zoomTo100,
-		zoomToFit,
+		// ...
 		zoomToSelection
 	} from '../state.svelte';
 	import DropdownMenu from './DropdownMenu.svelte';
 
+	// !mark(1:2)
 	const C = KeyboardSymbols.Cmd;
 	const S = KeyboardSymbols.Shift;
+</script>
+```
 
+## !!steps Local state and two palettes
+
+Five pieces of state and two colour arrays. `editingName` and `nameDraft` drive
+the rename; `nameInput` and `csvInput` are element references filled by
+`bind:this`, the second pointing at a hidden file input at the very bottom of
+the markup that two different menu entries click.
+
+`borderColor` is the only thing the bar remembers between interactions. The
+Format menu's border section is a colour picker followed by eight apply buttons,
+so the picked colour has to survive until one of those buttons is pressed.
+
+Both palettes mix literal hex with `var(--…)` theme tokens from
+[app.css](/docs/src/app.css). `TEXT_COLORS` is used twice — once for text colour,
+again for the border picker — and `FILL_COLORS` once. Note that `#000000` opens
+one array and `#ffffff` closes the other; both act as "no colour" sentinels
+further down.
+
+```svelte ! TopBar.svelte
+<script lang="ts">
 	let editingName = $state(false);
 	let nameDraft = $state('');
 	let nameInput: HTMLInputElement | undefined = $state();
 	let csvInput: HTMLInputElement | undefined = $state();
+	// !mark
 	let borderColor = $state('#000000');
 
 	const TEXT_COLORS = ['#000000', 'var(--error)', '#ffc800', '#8ecb89', 'var(--python)', 'var(--formula)', '#5d576b', '#ffffff'];
 	const FILL_COLORS = ['#fde8e8', 'var(--warn-bg)', '#e2f0d9', 'var(--accent-soft)', '#ece3f0', 'var(--panel-2)', '#ffffff'];
+</script>
+```
 
+## !!steps Renaming in place
+
+Clicking the filename swaps it for an input. `startRename` seeds the draft from
+`app.filename`, flips the flag, and then defers the focus — at the moment the
+flag is set the input does not exist yet, so `nameInput` is still `undefined`.
+`queueMicrotask` waits for Svelte to render it, and `select()` puts the whole
+name in the selection so typing replaces rather than appends.
+
+`commitRename` runs on Enter and on blur, and refuses an empty or
+whitespace-only draft by leaving `app.filename` untouched. Escape sets
+`editingName = false` directly, without going through `commitRename` — and the
+`editingName &&` guard is what makes a subsequent blur a no-op instead of a late
+commit.
+
+```svelte ! TopBar.svelte
+<script lang="ts">
 	function startRename(): void {
 		nameDraft = app.filename;
 		editingName = true;
+		// !mark
 		queueMicrotask(() => {
 			nameInput?.focus();
 			nameInput?.select();
@@ -73,21 +110,64 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	}
 
 	function commitRename(): void {
+		// !mark
 		if (editingName && nameDraft.trim() !== '') app.filename = nameDraft.trim();
 		editingName = false;
 	}
+</script>
+```
 
+## !!steps One CSV path and a live zoom readout
+
+`onCsvChosen` is the hidden input's change handler: read the file as text, hand
+it to `importCSVAt` at the current cursor, then clear `value`. That last line is
+load-bearing — without it, choosing the same file a second time would not fire
+`change` at all and the import would silently do nothing.
+
+Below it, the zoom label. `zoomPercent` is derived from the live viewport scale,
+so the readout on the right of the bar follows pinch- and scroll-zoom performed
+on the canvas, not just the buttons. `atZoom` compares with a tolerance rather
+than `===` because that scale is a float arriving from the Pixi viewport; an
+exact match against `0.5` or `2` would almost never hold, and the checkmarks in
+the zoom menu would never appear.
+
+```svelte ! TopBar.svelte
+<script lang="ts">
 	async function onCsvChosen(e: Event): Promise<void> {
 		const file = (e.target as HTMLInputElement).files?.[0];
 		if (!file) return;
 		await importCSVAt(await file.text(), app.cursorPosition);
+		// !mark
 		(e.target as HTMLInputElement).value = '';
 	}
 
 	const zoomPercent = $derived(`${Math.round(app.viewport.scale * 100)}%`);
+	// !mark
 	const atZoom = (scale: number) => Math.abs(app.viewport.scale - scale) < 0.005;
 </script>
+```
 
+## !!steps The bar and the first menu
+
+Three flex groups — left, centre, right — with `oncontextmenu` cancelled across
+the whole strip, so a right-click on the menubar does nothing rather than
+opening the browser's own menu. The logo is inline SVG, four squares, marked
+`aria-hidden` because it carries nothing the menus do not.
+
+The File menu shows the pattern all six follow.
+[DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte) takes the
+trigger text as a prop and the contents as children, and the classes used here —
+`menu-item`, `menu-divider`, `shortcut` — are not styled in this file at all.
+They are the vocabulary that component publishes through its
+`.panel :global(...)` rules, so a plain `button` with `class="menu-item"`
+arrives fully laid out, hover state included. Note too that no entry closes the
+menu itself: the panel dismisses on any click that bubbles out of it.
+
+Two entries here, `Open…` and `Examples…`, do the same thing — open
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) — which is also
+what the Help menu's `Example files` does, and what `⌘O` does.
+
+```svelte ! TopBar.svelte
 <div class="topbar" oncontextmenu={(e) => e.preventDefault()}>
 	<div class="group left">
 		<span class="logo" aria-hidden="true">
@@ -115,60 +195,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				<span>Download as CSV</span><span class="shortcut">{C}{S}E</span>
 			</button>
 		</DropdownMenu>
+```
 
-		<DropdownMenu label="Edit">
-			<button class="menu-item" onclick={undo}>
-				<span>Undo</span><span class="shortcut">{C}Z</span>
-			</button>
-			<button class="menu-item" onclick={redo}>
-				<span>Redo</span><span class="shortcut">{C}{S}Z</span>
-			</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={() => void copySelection(true)}>
-				<span>Cut</span><span class="shortcut">{C}X</span>
-			</button>
-			<button class="menu-item" onclick={() => void copySelection(false)}>
-				<span>Copy</span><span class="shortcut">{C}C</span>
-			</button>
-			<button class="menu-item" onclick={() => void pasteFromClipboard()}>
-				<span>Paste</span><span class="shortcut">{C}V</span>
-			</button>
-			<button class="menu-item" onclick={() => void copySelectionAsPng()}>
-				<span>Copy selection as PNG</span><span class="shortcut">{C}{S}C</span>
-			</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={() => void rerunAllCode()}>
-				<span>Rerun all code</span><span class="shortcut">{C}{S}↵</span>
-			</button>
-			<div class="menu-divider"></div>
-			<button
-				class="menu-item"
-				onclick={() => {
-					app.searchAllSheets = false;
-					app.showSearch = true;
-				}}
-			>
-				<span>Find…</span><span class="shortcut">{C}F</span>
-			</button>
-			<button class="menu-item" onclick={() => (app.showGoToMenu = true)}>
-				<span>Go to cell</span><span class="shortcut">{C}G</span>
-			</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={() => void fillDown()}>
-				<span>Fill down</span><span class="shortcut">{C}D</span>
-			</button>
-			<button class="menu-item" onclick={() => void fillRight()}>
-				<span>Fill right</span><span class="shortcut">{C}R</span>
-			</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={copyFormat}>
-				<span>Copy format</span><span class="shortcut">{C}⌥C</span>
-			</button>
-			<button class="menu-item" onclick={pasteFormat}>
-				<span>Paste format</span><span class="shortcut">{C}⌥V</span>
-			</button>
-		</DropdownMenu>
+## !!steps Toggles drawn as text
 
+The View menu's first six entries each read and write one flag on `app` and
+render their own state as a leading `✓` or a space. There is no checkbox element
+and no icon; the check is literally part of the label string.
+
+Because the flags are reactive store state the labels do re-render — but the
+panel closes on the same click that flipped the flag, so the new mark is seen
+the next time the menu is opened. Five of the six are rendering flags read by
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) and pushed into
+the Pixi layer; the sixth swaps `app.theme`.
+
+The menu continues past this slice with a `Zoom` header, seven zoom entries, and
+presentation mode on `⌘.` — all of which are repeated elsewhere in the bar.
+
+```svelte ! TopBar.svelte
 		<DropdownMenu label="View">
 			<button class="menu-item" onclick={() => (app.showHeadings = !app.showHeadings)}>
 				<span>{app.showHeadings ? '✓' : ' '} Show row and column headings</span>
@@ -188,56 +232,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			<button class="menu-item" onclick={() => (app.theme = app.theme === 'dark' ? 'light' : 'dark')}>
 				<span>{app.theme === 'dark' ? '✓' : ' '} Dark theme</span>
 			</button>
-			<div class="menu-divider"></div>
-			<div class="menu-header">Zoom</div>
-			<button class="menu-item" onclick={zoomIn}>
-				<span>Zoom in</span><span class="shortcut">{C}+</span>
-			</button>
-			<button class="menu-item" onclick={zoomOut}>
-				<span>Zoom out</span><span class="shortcut">{C}−</span>
-			</button>
-			<button class="menu-item" onclick={zoomToSelection}>
-				<span>Zoom to selection</span><span class="shortcut">{C}8</span>
-			</button>
-			<button class="menu-item" onclick={zoomToFit}>
-				<span>Zoom to fit</span><span class="shortcut">{C}9</span>
-			</button>
-			<button class="menu-item" onclick={() => setZoom(0.5)}>Zoom to 50%</button>
-			<button class="menu-item" onclick={zoomTo100}>
-				<span>Zoom to 100%</span><span class="shortcut">{C}0</span>
-			</button>
-			<button class="menu-item" onclick={() => setZoom(2)}>Zoom to 200%</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={() => (app.presentationMode = !app.presentationMode)}>
-				<span>Presentation mode</span><span class="shortcut">{C}.</span>
-			</button>
-		</DropdownMenu>
+```
 
-		<DropdownMenu label="Insert">
-			<div class="menu-header">Code</div>
-			<button class="menu-item" onclick={() => openCodeEditorAt('PYTHON')}>
-				<span><i class="lang python"></i> Python</span>
-			</button>
-			<button class="menu-item" onclick={() => openCodeEditorAt('JAVASCRIPT')}>
-				<span><i class="lang javascript"></i> JavaScript</span>
-			</button>
-			<button class="menu-item" onclick={() => openCodeEditorAt('FORMULA')}>
-				<span><i class="lang formula"></i> Formula</span><span class="shortcut">=</span>
-			</button>
-			<div class="menu-divider"></div>
-			<div class="menu-header">Data</div>
-			<button class="menu-item" onclick={() => csvInput?.click()}>From file (CSV)…</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={addSheet}>Sheet</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={() => void insertTodayDate(false)}>
-				<span>Today's date</span><span class="shortcut">{C};</span>
-			</button>
-			<button class="menu-item" onclick={() => void insertTodayDate(true)}>
-				<span>Date and time</span><span class="shortcut">{C}{S};</span>
-			</button>
-		</DropdownMenu>
+## !!steps A shortcut column that is not showing shortcuts
 
+The Format menu's number section reuses the `shortcut` class for something that
+is not a key binding: a sample of what the format produces. `Abc`, `9,999.99`,
+`$9,999.99`, `99.99%`, `6.02E+23`. They inherit the muted, right-aligned
+treatment DropdownMenu gives real shortcut hints, and read as previews.
+
+The calls pass the whole format descriptor inline, and `setTextFormat(undefined)`
+is how `Automatic` clears it. Increase and decrease decimals go through a
+different function, `changeDecimals`, because they are relative to whatever
+format the cell already carries.
+
+The Insert menu borrows the same slot to label Formula with `=` — that one *is*
+a real binding, handled in [keyboard.ts](/docs/src/lib/grid/keyboard.ts), where
+typing `=` on an empty cell opens the formula editor directly.
+
+```svelte ! TopBar.svelte
 		<DropdownMenu label="Format">
 			<div class="menu-header">Number</div>
 			<button class="menu-item" onclick={() => setTextFormat(undefined)}>
@@ -260,47 +273,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			</button>
 			<button class="menu-item" onclick={() => changeDecimals(1)}>Increase decimals</button>
 			<button class="menu-item" onclick={() => changeDecimals(-1)}>Decrease decimals</button>
-			<div class="menu-divider"></div>
-			<div class="menu-header">Text</div>
-			<button class="menu-item" onclick={toggleBold}>
-				<span>Bold</span><span class="shortcut">{C}B</span>
-			</button>
-			<button class="menu-item" onclick={toggleItalic}>
-				<span>Italic</span><span class="shortcut">{C}I</span>
-			</button>
-			<div class="menu-header">Text color</div>
-			<div class="swatches">
-				{#each TEXT_COLORS as color (color)}
-					<button
-						class="swatch"
-						style:background={color}
-						aria-label="text color {color}"
-						onclick={() => setFormat({ textColor: color === '#000000' ? undefined : color })}
-					></button>
-				{/each}
-			</div>
-			<div class="menu-header">Fill color</div>
-			<div class="swatches">
-				{#each FILL_COLORS as color (color)}
-					<button
-						class="swatch"
-						style:background={color}
-						aria-label="fill color {color}"
-						onclick={() => setFormat({ fillColor: color === '#ffffff' ? undefined : color })}
-					></button>
-				{/each}
-			</div>
-			<div class="menu-divider"></div>
-			<div class="menu-header">Alignment</div>
-			<button class="menu-item" onclick={() => setAlignment('left')}>Align left</button>
-			<button class="menu-item" onclick={() => setAlignment('center')}>Align center</button>
-			<button class="menu-item" onclick={() => setAlignment('right')}>Align right</button>
-			<div class="menu-divider"></div>
-			<div class="menu-header">Wrapping</div>
-			<button class="menu-item" onclick={() => setWrapping(undefined)}>Overflow</button>
-			<button class="menu-item" onclick={() => setWrapping('wrap')}>Wrap</button>
-			<button class="menu-item" onclick={() => setWrapping('clip')}>Clip</button>
-			<div class="menu-divider"></div>
+```
+
+## !!steps The click that must not close the menu
+
+The border section is the one place in the bar where a menu has to survive being
+clicked. Picking a colour is not the action — it only arms `borderColor`, and
+the user then presses one of the eight apply buttons underneath.
+
+Since DropdownMenu closes the panel on any click that reaches it, the swatch has
+to stop the event from bubbling, and the inline comment says exactly that.
+`class:active` then shows which colour is armed. This is the only swatch grid in
+the file with a selected state: the text and fill swatches apply immediately, so
+they are happy to let the click close the menu.
+
+Eight `setBorders` buttons sit under the picker, three of them visible here.
+They differ only in their mode argument — `all`, `outer`, `inner`, `top`,
+`bottom`, `left`, `right`, and `clear`, which is the one that takes no colour.
+
+```svelte ! TopBar.svelte
 			<div class="menu-header">Borders</div>
 			<div class="swatches">
 				{#each TEXT_COLORS as color (color)}
@@ -319,39 +310,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			<button class="menu-item" onclick={() => setBorders('all', borderColor)}>All borders</button>
 			<button class="menu-item" onclick={() => setBorders('outer', borderColor)}>Outer borders</button>
 			<button class="menu-item" onclick={() => setBorders('inner', borderColor)}>Inner borders</button>
-			<button class="menu-item" onclick={() => setBorders('top', borderColor)}>Top border</button>
-			<button class="menu-item" onclick={() => setBorders('bottom', borderColor)}>Bottom border</button>
-			<button class="menu-item" onclick={() => setBorders('left', borderColor)}>Left border</button>
-			<button class="menu-item" onclick={() => setBorders('right', borderColor)}>Right border</button>
-			<button class="menu-item" onclick={() => setBorders('clear')}>Clear borders</button>
-			<div class="menu-divider"></div>
-			<button class="menu-item" onclick={clearFormatting}>
-				<span>Clear formatting</span><span class="shortcut">{C}\</span>
-			</button>
-		</DropdownMenu>
+```
 
-		<DropdownMenu label="Help">
-			<button class="menu-item" onclick={() => (app.showFileMenu = true)}>
-				Example files
-			</button>
-			<button class="menu-item" onclick={() => (app.showFormulaDocs = true)}>
-				Formula reference
-			</button>
-			<button
-				class="menu-item"
-				onclick={() => window.open('https://docs.quadratichq.com', '_blank')}
-			>
-				Read the docs ↗
-			</button>
-			<button
-				class="menu-item"
-				onclick={() => window.open('https://github.com/patrik64/quadratic-svelte', '_blank')}
-			>
-				Quadratic on GitHub ↗
-			</button>
-		</DropdownMenu>
-	</div>
+## !!steps The filename, editable in place
 
+The centre group is a single conditional: an input while renaming, a button
+otherwise. `title="Rename file"` is the only affordance — nothing else marks the
+name as editable.
+
+The input's `onkeydown` does three jobs. Enter commits, Escape abandons, and
+`stopPropagation` on every key keeps typing away from the window-level shortcut
+handlers registered in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which also
+guard themselves by checking whether the event came from a field.
+
+The `Local /` prefix is not a link or a menu — a static span, dimmed to
+`--border`, labelling where the file lives. The button itself is capped at
+`25vw` with an ellipsis so a long name cannot push the toolbar clusters off the
+right edge.
+
+```svelte ! TopBar.svelte
 	<div class="group center">
 		{#if editingName}
 			<input
@@ -370,34 +348,28 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			<button class="filename" title="Rename file" onclick={startRename}>{app.filename}</button>
 		{/if}
 	</div>
+```
 
-	<div class="group right">
-		<div class="cluster">
-			<button
-				class="tool"
-				class:on={app.showCellTypeOutlines}
-				aria-pressed={app.showCellTypeOutlines}
-				title="Code cell outlines{app.showCellTypeOutlines ? ' (on)' : ' (off)'}"
-				aria-label="Toggle code cell outlines"
-				onclick={() => (app.showCellTypeOutlines = !app.showCellTypeOutlines)}
-			>
-				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-					<path d="M8 6 3 12l5 6" />
-					<path d="m16 6 5 6-5 6" />
-				</svg>
-			</button>
-			<button
-				class="tool"
-				title="Command palette ({C}P)"
-				aria-label="Open command palette"
-				onclick={() => (app.showCommandPalette = true)}
-			>
-				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-					<path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3z" />
-				</svg>
-			</button>
-		</div>
+## !!steps The right side, and DropdownMenu's other arm
 
+The zoom cluster is a bordered pill holding three controls: minus, the current
+percentage as a dropdown trigger, and plus. The buttons call the same `zoomOut`
+and `zoomIn` the View menu does, and their `title` text interpolates `C`, so the
+tooltips are platform-correct too.
+
+This dropdown is the only caller that uses either of DropdownMenu's unusual
+props. `align="right"` releases the panel's `left` so it hugs the window edge
+instead of overflowing it, and the label is passed as a snippet rather than a
+string — the `Snippet | string` union exists for exactly this case, a live value
+that has to re-render, wrapped in a span with tabular numerals so the trigger
+does not change width between `50%` and `100%`.
+
+The menu repeats four entries from View and then lists the three fixed levels
+with the same checkmark convention, with one refinement: the unchecked branch
+here is `\u2007`, a figure space, which is exactly one digit wide, so checked and
+unchecked rows align. The View menu uses a plain space for the same job.
+
+```svelte ! TopBar.svelte
 		<div class="cluster zoom">
 			<button class="tool" title="Zoom out ({C}−)" aria-label="Zoom out" onclick={zoomOut}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
@@ -430,66 +402,27 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 					<span>{atZoom(2) ? '✓' : '\u2007'} 200%</span>
 				</button>
 			</DropdownMenu>
-			<button class="tool" title="Zoom in ({C}+)" aria-label="Zoom in" onclick={zoomIn}>
-				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-					<path d="M12 5v14M5 12h14" />
-				</svg>
-			</button>
-		</div>
-	</div>
+```
 
-	<input
-		bind:this={csvInput}
-		type="file"
-		accept=".csv"
-		style="display: none"
-		onchange={onCsvChosen}
-	/>
-</div>
+## !!steps Reaching back into the menu component
 
+The right-hand controls get their look from `.cluster` and `.tool`: a bordered
+pill with one pixel of padding and buttons that sit inside it. The outlines
+toggle pairs `.tool.on` with `aria-pressed`, so the pressed state is announced
+as well as drawn.
+
+The last two rules are the mirror image of what DropdownMenu does for its
+children. That component styles markup it did not write, using
+`.panel :global(...)`; here the parent styles a child's internals, using
+`.zoom :global(.trigger)` to override the trigger's padding and hover so the
+percentage reads as part of the pill rather than as a menubar item.
+
+One detail worth noticing: `#e9eef3` and `#e4edff` are literal hex where the
+rest of the file uses custom properties, so those two backgrounds stay the same
+under the dark theme.
+
+```svelte ! TopBar.svelte
 <style>
-	.topbar {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		background: var(--panel);
-		border-bottom: 1px solid var(--border);
-		color: var(--muted);
-		padding: 0.15rem 1rem 0.15rem 0.75rem;
-		font-size: 0.85rem;
-		user-select: none;
-		gap: 1rem;
-	}
-	.group {
-		display: flex;
-		align-items: center;
-	}
-	.group.left {
-		gap: 0.1rem;
-	}
-	.logo {
-		display: inline-flex;
-		align-items: center;
-		padding: 0 0.4rem 0 0.1rem;
-	}
-	.group.center {
-		flex: 1;
-		justify-content: center;
-		min-width: 0;
-	}
-	.group.right {
-		gap: 0.5rem;
-	}
-	/* toolbar clusters: grouped controls sharing one bordered pill */
-	.cluster {
-		display: inline-flex;
-		align-items: center;
-		border: 1px solid var(--border-light);
-		border-radius: 6px;
-		background: var(--panel-2);
-		padding: 1px;
-		gap: 1px;
-	}
 	.tool {
 		display: inline-flex;
 		align-items: center;
@@ -523,73 +456,30 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	.zoom :global(.trigger.active) {
 		background: #e9eef3;
 	}
-	.local {
-		color: var(--border);
-	}
-	.filename {
-		background: none;
-		border: none;
-		font: inherit;
-		color: var(--muted);
-		cursor: pointer;
-		max-width: 25vw;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		padding: 0.2rem 0.3rem;
-		border-radius: 3px;
-	}
-	.filename:hover {
-		background: var(--panel-2);
-	}
-	.name-input {
-		font: inherit;
-		text-align: center;
-		border: 1px solid var(--accent);
-		border-radius: 3px;
-		outline: none;
-		padding: 0.15rem 0.4rem;
-		width: 16rem;
-	}
-	.zoom-label {
-		display: inline-block;
-		min-width: 2.9rem;
-		text-align: center;
-		font-variant-numeric: tabular-nums;
-		font-size: 0.8rem;
-	}
-	.lang {
-		display: inline-block;
-		width: 9px;
-		height: 9px;
-		border-radius: 2px;
-		margin-right: 0.35rem;
-	}
-	.lang.python {
-		background: var(--python);
-	}
-	.lang.javascript {
-		background: var(--javascript);
-	}
-	.lang.formula {
-		background: var(--formula);
-	}
-	.swatches {
-		display: flex;
-		gap: 4px;
-		padding: 2px 1rem 8px;
-	}
-	.swatch {
-		width: 20px;
-		height: 20px;
-		border: 1px solid var(--border);
-		border-radius: 3px;
-		cursor: pointer;
-		padding: 0;
-	}
-	.swatch.active {
-		outline: 2px solid var(--accent);
-		outline-offset: 1px;
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Everything the entries call lives in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts); the panel behaviour, and the
+`menu-item` / `menu-divider` / `menu-header` / `shortcut` vocabulary the menus
+are written in, lives in
+[DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte).
+
+This bar is one of four ways the same actions are reachable.
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) lists
+them as searchable text,
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte) offers
+the selection-relevant subset at the pointer, and
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts) implements the key bindings. None
+of them is derived from the others: the hints rendered here are hand-written
+strings, so a binding changed in `keyboard.ts` would leave this bar advertising
+the old one. `⌘S` is a visible seam — `keyboard.ts` swallows it to suppress the
+browser's save dialog but does not save, while `Download local copy (.grid)` is
+offered with no shortcut at all.
+
+One last note on the palettes: both mix literal hex with `var(--…)` references,
+and a swatch hands whichever string it holds straight to `setFormat`, so a cell
+coloured from a token entry stores the custom-property reference itself rather
+than a resolved colour.

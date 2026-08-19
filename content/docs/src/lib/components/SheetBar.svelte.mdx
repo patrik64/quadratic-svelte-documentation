@@ -1,15 +1,39 @@
 ---
 title: "SheetBar.svelte"
-description: "Multi-sheet tab bar, styled after the modern client's SheetBar: per-sheet color as a 3px bottom bar, double-click renames, right-click (or the chevron) opens…"
+description: "The sheet tab bar — tabs derived from the controller, double-click rename, and a right-click menu for color, order and deletion"
 source: "src/lib/components/SheetBar.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The strip along the bottom of the grid: one tab per sheet, a `＋` to add
+another, and a small menu for renaming, coloring, reordering and deleting. It is
+the only place in the app that shows the whole sheet list at once, so it is also
+the only place where the shape of the multi-sheet model is visible.
 
-````svelte SheetBar.svelte -n
+Everything it does is a thin wrapper over methods on
+[SheetController.ts](/docs/src/lib/core/SheetController.ts). The component owns
+no sheet data — only which tab has its menu open and which one is being renamed.
+
+<Scrollycoding>
+
+## !!steps Tabs derived from a model that is not reactive
+
+The sheet list lives on `sheetController`, a plain class instance rather than
+`$state`, so mutating it does not by itself invalidate anything. The derived
+reads `app.redraw` first to subscribe to the counter that
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) bumps from
+`sheetController.onChange` — the same manual subscription
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) and
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte) use.
+
+The map flattens each `Sheet` into exactly what the markup needs — name, color,
+whether it is current, and its position — so the template never reaches into the
+model. `SHEET_COLORS` mixes theme variables with two literal hex values, and the
+variables are redefined under `:root[data-theme='dark']` in `app.css`, so a tab
+colored with `var(--accent)` follows the theme while one colored `#8ecb89` does
+not.
+
+```svelte ! SheetBar.svelte
 <script lang="ts">
 	// Multi-sheet tab bar, styled after the modern client's SheetBar:
 	// per-sheet color as a 3px bottom bar, double-click renames, right-click
@@ -19,15 +43,40 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	const SHEET_COLORS = ['var(--accent)', '#8ecb89', 'var(--javascript)', '#cb8999', 'var(--formula)', 'var(--python)', 'var(--error)'];
 
 	const sheets = $derived.by(() => {
+		// !mark
 		void app.redraw;
 		return sheetController.sheets.map((s, i) => ({
 			name: s.name,
 			color: s.color,
+			// !mark
 			active: i === sheetController.currentSheetIndex,
 			index: i
 		}));
 	});
+</script>
+```
 
+## !!steps State for the menu and the rename box
+
+`menuFor` carries two facts at once: whether the tab menu exists, and which tab
+it belongs to. `renaming` does the same for the rename input. Both being
+`number | undefined` means opening a menu on one tab implicitly closes the one on
+another, the same representation trick
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) uses for its armed
+delete button.
+
+Only the horizontal position comes from the pointer: `menuX` is `e.clientX`
+capped by a hard-coded `window.innerWidth - 200`, against a menu whose
+`min-width` is `11rem`. Vertical placement is fixed in CSS, so the menu always
+sits just above the bar. Renaming seeds the draft from the current name, closes
+the menu, and defers focus with `queueMicrotask` because the input does not
+exist yet at the moment `renaming` is assigned — it appears only after Svelte
+flushes the update. `commitRename` guards on `renaming !== undefined`, which
+matters because Enter and blur both call it and Escape clears `renaming` first:
+a blur arriving after an Escape cannot re-apply the draft.
+
+```svelte ! SheetBar.svelte
+<script lang="ts">
 	let menuFor = $state<number | undefined>(undefined);
 	let menuEl: HTMLDivElement | undefined = $state();
 	let menuX = $state(0);
@@ -38,6 +87,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	function openMenu(e: MouseEvent, index: number): void {
 		e.preventDefault();
 		menuFor = index;
+		// !mark
 		menuX = Math.min(e.clientX, window.innerWidth - 200);
 	}
 
@@ -49,6 +99,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		renaming = index;
 		renameDraft = sheetController.sheets[index].name;
 		closeMenu();
+		// !mark(1:4)
 		queueMicrotask(() => {
 			renameEl?.focus();
 			renameEl?.select();
@@ -59,17 +110,53 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		if (renaming !== undefined) sheetController.renameSheet(renaming, renameDraft);
 		renaming = undefined;
 	}
+</script>
+```
 
+## !!steps Dismissing the menu by containment
+
+The early return means the effect re-runs whenever `menuFor` changes and only
+attaches a listener while a menu is open; the returned teardown removes it when
+the menu closes or the component is destroyed.
+
+The dismissal test asks whether the mousedown landed inside `menuEl` rather than
+stopping the event inside the menu — the reason is spelled out in
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte): Svelte
+delegates `mousedown` from the root, so `stopPropagation` inside the menu cannot
+reliably beat a window-level listener. Unlike that component, this one registers
+no Escape handler, so the tab menu closes on an outside mousedown or by picking
+an item, and nothing else.
+
+```svelte ! SheetBar.svelte
+<script lang="ts">
 	$effect(() => {
 		if (menuFor === undefined) return;
 		const close = (e: MouseEvent) => {
+			// !mark
 			if (!menuEl?.contains(e.target as Node)) closeMenu();
 		};
 		window.addEventListener('mousedown', close);
 		return () => window.removeEventListener('mousedown', close);
 	});
 </script>
+```
 
+## !!steps The plus button
+
+The add button calls `sheetController.addSheet()` and then clears
+`app.multiCursor` inline. That pair is exactly the exported `addSheet` helper in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) that
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) imports
+for its `Sheet: New sheet` entry — this button repeats the two statements rather
+than importing the helper, so the two paths are equivalent but separately
+maintained.
+
+`addSheet` on the controller picks the first unused `Sheet<n>` name and makes the
+new sheet current, which is why the bar needs no follow-up call to switch to it.
+The container's `oncontextmenu` handler suppresses the browser menu over the
+whole bar, including the empty space to the right of the last tab.
+
+```svelte ! SheetBar.svelte
 <div class="sheetbar" oncontextmenu={(e) => e.preventDefault()}>
 	<button
 		class="add"
@@ -80,6 +167,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		}}>＋</button
 	>
 	<div class="tabs">
+```
+
+## !!steps A tab, or an input in its place
+
+The `{#each}` is keyed by `tab.index`, which is a position rather than a sheet
+identity — after a move the same key refers to a different sheet, so Svelte
+updates the existing nodes in place instead of relocating them. Each entry
+renders one of two things: the rename input for the tab being renamed, or the tab
+button.
+
+The input's `maxlength="31"` mirrors the `slice(0, 31)` inside `renameSheet`, and
+`e.stopPropagation()` on keydown keeps typing away from the grid's window-level
+key handling in [keyboard.ts](/docs/src/lib/grid/keyboard.ts). The tab button
+carries three gestures: click switches, double-click renames, right-click opens
+the menu — and since a double-click also produces clicks, renaming a tab switches
+to it first. `style:--sheet-color` sets a custom property per tab, defaulting to
+`transparent`. The chevron calls `stopPropagation` so clicking it opens the menu
+without also running `switchSheet`, which would clear the selection.
+
+```svelte ! SheetBar.svelte
 		{#each sheets as tab (tab.index)}
 			{#if renaming === tab.index}
 				<input
@@ -116,9 +223,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				</button>
 			{/if}
 		{/each}
-	</div>
-</div>
+```
 
+## !!steps Delete, duplicate, rename
+
+The menu is rendered outside the bar, at the top level of the component, so its
+fixed positioning is not affected by the bar's overflow.
+The `{@const index = menuFor}` line narrows `number | undefined` to `number`
+once, which both satisfies the type checker and gives every handler below a
+plain number to close over.
+
+Delete is only rendered when there is more than one sheet, matching
+`deleteSheet` in [SheetController.ts](/docs/src/lib/core/SheetController.ts),
+which returns early on the last sheet; that method also clears the undo and redo
+stacks, because recorded operations are tagged with the sheet index they ran on.
+Duplicate copies the source through an export/import round trip, names the copy
+`<name> copy`, inserts it after the original and makes it current. Both call the
+controller directly, so unlike the palette's `deleteCurrentSheet` and
+`duplicateCurrentSheet` they leave `app.multiCursor` untouched.
+
+```svelte ! SheetBar.svelte
 {#if menuFor !== undefined}
 	{@const index = menuFor}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -140,6 +264,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			}}>Duplicate</button
 		>
 		<button class="menu-item" onclick={() => startRename(index)}>Rename</button>
+```
+
+## !!steps Colors as swatches, and moving a sheet
+
+The swatch row is `SHEET_COLORS` painted onto buttons with `style:background`,
+followed by a clear button that passes `undefined` to the same `setSheetColor`
+call. Because the value is stored verbatim on the sheet, and
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) writes and reads a `color` field,
+a chosen tab color survives a save and reload.
+
+Move left and right are `disabled` at the two ends rather than hidden, so the
+menu keeps a stable height and the entries stay in the same place. `moveSheet`
+splices the sheet to its new position and adjusts `currentSheetIndex` for both
+sides of the swap, so the active sheet stays active whether it was the one moved
+or the one displaced. Every entry closes the menu, which matters most for the
+move items: the menu is positioned from the click that opened it, and after a
+swap `index` no longer names the sheet it did.
+
+```svelte ! SheetBar.svelte
 		<div class="menu-label">Color</div>
 		<div class="swatches">
 			{#each SHEET_COLORS as color (color)}
@@ -179,51 +322,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				closeMenu();
 			}}>Move right</button
 		>
-	</div>
-{/if}
+```
 
-<style>
-	.sheetbar {
-		display: flex;
-		align-items: stretch;
-		height: 2rem;
-		background: var(--panel-2);
-		border-top: 1px solid var(--border);
-		font-size: 0.75rem;
-		color: var(--muted);
-		user-select: none;
-	}
-	.add {
-		border: none;
-		border-right: 1px solid var(--border-light);
-		background: none;
-		font-size: 0.9rem;
-		color: var(--muted);
-		width: 2.2rem;
-		cursor: pointer;
-	}
-	.add:hover {
-		background: var(--hover);
-	}
-	.tabs {
-		display: flex;
-		overflow-x: auto;
-		scrollbar-width: thin;
-	}
-	.tab {
-		position: relative;
-		display: inline-flex;
-		align-items: center;
-		gap: 0.3rem;
-		border: none;
-		border-right: 1px solid var(--border-light);
-		background: none;
-		font: inherit;
-		color: inherit;
-		padding: 0 0.9rem 3px;
-		cursor: pointer;
-		white-space: nowrap;
-	}
+## !!steps The color bar and the chevron
+
+The per-sheet color is drawn by a pseudo-element rather than a background, so it
+reads as a 3px strip along the bottom edge of the tab. It is absolutely
+positioned against the tab, which the rule above it makes `position: relative`,
+and its color comes straight from the `--sheet-color` custom property the markup
+sets inline — so seven possible colors need no classes at all, and an unset color
+resolves to `transparent`.
+
+The chevron uses `visibility` rather than `display`, so it always occupies its
+space and revealing it on hover does not reflow the tab text. It is shown by two
+selectors: hovering the tab, or the `visible` class that the active tab carries
+permanently. The rename input inherits the bar's font and is given a fixed
+`8rem` width, so swapping a tab for the input does not change the bar's height.
+
+```svelte ! SheetBar.svelte
 	.tab::before {
 		content: '';
 		position: absolute;
@@ -258,64 +374,23 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		padding: 0 0.5rem;
 		width: 8rem;
 	}
-	.tabmenu {
-		position: fixed;
-		bottom: 3.6rem;
-		background: var(--panel);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		box-shadow: 0 -4px 16px var(--shadow);
-		min-width: 11rem;
-		padding: 4px 0;
-		z-index: 150;
-		font-size: 0.8rem;
-	}
-	.menu-item {
-		display: block;
-		width: 100%;
-		background: none;
-		border: none;
-		font: inherit;
-		text-align: left;
-		padding: 0.35rem 1rem;
-		cursor: pointer;
-		color: var(--text);
-	}
-	.menu-item:hover:not(:disabled) {
-		background: var(--accent-soft);
-	}
-	.menu-item:disabled {
-		color: var(--faint-2);
-		cursor: default;
-	}
-	.menu-label {
-		padding: 0.35rem 1rem 0.1rem;
-		font-size: 0.65rem;
-		text-transform: uppercase;
-		letter-spacing: 0.05em;
-		color: var(--faint);
-	}
-	.menu-divider {
-		border-top: 1px solid var(--border-light);
-		margin: 4px 0;
-	}
-	.swatches {
-		display: flex;
-		gap: 4px;
-		padding: 4px 1rem 8px;
-	}
-	.swatch {
-		width: 18px;
-		height: 18px;
-		border: 1px solid var(--border);
-		border-radius: 3px;
-		cursor: pointer;
-		padding: 0;
-		font-size: 0.6rem;
-		color: var(--muted);
-	}
-	.swatch.clear {
-		background: var(--panel);
-	}
-</style>
-````
+```
+
+</Scrollycoding>
+
+Mounted from [+page.svelte](/docs/src/routes/+page.svelte) below the grid and
+omitted entirely in presentation mode. Every mutation it triggers lands on
+[SheetController.ts](/docs/src/lib/core/SheetController.ts), whose sheet
+management section is marked as deliberately not undoable — adding, deleting,
+renaming, coloring and reordering are outside the transaction system that covers
+cell edits, and deleting a sheet discards the undo history rather than trying to
+keep it valid.
+
+Switching sheets also has two other entrances:
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts) maps Alt with Right or Up to the
+next sheet and Alt with Left or Down to the previous one, wrapping around at both
+ends, and [CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte)
+exposes a `Sheet` group with new, duplicate, delete and next/previous. All of
+them go through the helpers in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), which clear `app.multiCursor`
+so a selection made on one sheet does not linger on another.

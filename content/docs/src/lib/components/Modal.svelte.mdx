@@ -1,32 +1,92 @@
 ---
 title: "Modal.svelte"
-description: "The Modal Svelte component."
+description: "The dialog shell — a backdrop that closes on click, a panel that stops it, and two size variants"
 source: "src/lib/components/Modal.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Forty-four lines shared by every dialog in the app. It supplies the backdrop,
+the centred panel and the click-to-dismiss behavior, and nothing else — no
+header, no close button, no keyboard handling. Each dialog brings its own
+content and its own Escape key.
 
-````svelte Modal.svelte -n
+That minimalism is why it fits four quite different consumers: the cell type
+menu, the command palette, the go-to dialog and the formula reference.
+
+<Scrollycoding>
+
+## !!steps Three props, one of them a size
+
+`onclose` is a callback rather than a bindable flag, so the modal never touches
+application state — each consumer decides what closing means, which is usually
+clearing its own flag on
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).
+
+`children` is the Svelte 5 snippet carrying the dialog's contents, replacing
+the slot a Svelte 4 component would have used.
+
+`wide` is the only styling knob, defaulting to false. Rather than exposing
+width and height props, the component offers two curated sizes — which keeps
+the dialogs visually consistent, since no caller can invent a third.
+
+```svelte ! Modal.svelte
 <script lang="ts">
 	import type { Snippet } from 'svelte';
 
 	let {
 		onclose,
 		children,
+		// !mark
 		wide = false
 	}: { onclose: () => void; children: Snippet; wide?: boolean } = $props();
 </script>
+```
 
+## !!steps Click outside to close, click inside to stay
+
+The dismissal mechanism is two handlers that work as a pair. The backdrop
+covers the viewport and closes on click; the panel sits inside it and stops the
+event before it can reach the backdrop.
+
+So clicking anywhere on the dimmed area dismisses the dialog, while clicking
+the content does nothing — the standard behavior, expressed in one line each.
+Note this is the inverse approach to
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte),
+which cannot rely on `stopPropagation` because it listens on `window` where
+Svelte's event delegation gets in the way. Here both handlers are inside the
+same component tree, so propagation behaves as written.
+
+`role="dialog"` marks the panel for assistive technology. The `svelte-ignore`
+comment acknowledges the accessibility lint this pattern trips: a `div` with a
+click handler and no keyboard equivalent. Escape is handled by each consumer
+rather than here, which is what makes that acceptable in practice.
+
+```svelte ! Modal.svelte
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 <div class="backdrop" onclick={onclose}>
 	<div class="modal" class:wide onclick={(e) => e.stopPropagation()} role="dialog">
 		{@render children()}
 	</div>
 </div>
+```
 
+## !!steps Anchored near the top, not centred
+
+The backdrop is a full-viewport flex container, and the alignment is the
+considered part: `align-items: flex-start` with `padding-top: 10vh` places
+dialogs a fixed distance below the top edge rather than centring them
+vertically.
+
+That matters for the two dialogs whose height changes as you type. A vertically
+centred command palette would drift up and down as the filtered list grows and
+shrinks, moving the rows under the pointer; anchoring near the top keeps the
+search box and the first result stationary while only the bottom edge moves.
+
+Notably the backdrop has no background colour, so it dims nothing — it is
+invisible, and exists purely to capture outside clicks. The dialog is separated
+from the grid by its shadow instead.
+
+```svelte ! Modal.svelte
 <style>
 	.backdrop {
 		position: fixed;
@@ -37,6 +97,28 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		justify-content: center;
 		padding-top: 10vh;
 	}
+</style>
+```
+
+## !!steps Two sizes, both bounded by the viewport
+
+Every dimension is a `min()` against a viewport unit, so the panel takes its
+preferred size on a large screen and shrinks to fit a small one — no media
+queries needed.
+
+`max-height` paired with `overflow: hidden` and a column flex layout is what
+lets consumers put a fixed search box above a scrolling list: the panel never
+exceeds its share of the screen, and the child marked `overflow-y: auto`
+absorbs the remainder. That contract is why
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) and
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte) can scroll
+their lists without either managing its own height.
+
+The `wide` variant raises both bounds together, for content like formula
+signatures that needs the extra room in both directions.
+
+```svelte ! Modal.svelte
+<style>
 	.modal {
 		background: var(--panel);
 		border-radius: 6px;
@@ -54,4 +136,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		max-height: 80vh;
 	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Used by [CellTypeMenu.svelte](/docs/src/lib/components/CellTypeMenu.svelte),
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte),
+[GoTo.svelte](/docs/src/lib/components/GoTo.svelte) and
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte) — the last of
+which passes `wide`.
+
+Two dialogs deliberately do not use it.
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) covers the whole
+window rather than floating over it, and
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte)
+appears at the pointer. Both bring their own container, which is the same
+reason [DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte) is a
+separate primitive.
+
+One thing to note when reading the shadow: its colours are hard-coded `rgba`
+values rather than the `--shadow` custom property the rest of the app uses, so
+this is one of the few places that does not follow the theme.

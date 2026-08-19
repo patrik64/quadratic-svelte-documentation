@@ -1,35 +1,43 @@
 ---
 title: "SearchBar.svelte"
-description: "Find in sheet(s): a floating bar over the grid (⌘F / ⌘⇧F all sheets)."
+description: "Find in sheet or all sheets — a floating bar that recomputes matches reactively but only ever jumps from an event handler"
 source: "src/lib/components/SearchBar.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The find bar that floats over the top-right of the grid. It searches the
+current sheet or every sheet, reports a position within the results, and steps
+through them with Enter.
 
-````svelte SearchBar.svelte -n
+The design decision worth the page is in a comment near the middle: matches are
+derived reactively, but **navigation never happens inside an effect**. That
+separation is what keeps the component from putting the Svelte runtime into a
+loop.
+
+<Scrollycoding>
+
+## !!steps Matches, in reading order
+
+The derived value collects every cell whose text contains the query, across
+either the current sheet or all of them depending on `app.searchAllSheets`.
+
+`void app.redraw` is the manual subscription to the non-reactive sheet model —
+the same pattern as
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) — so editing a
+cell updates the result count live.
+
+The sort is what makes stepping feel right: primarily by `y`, then by `x`, so
+Enter walks the sheet left-to-right and top-to-bottom rather than in whatever
+order the sparse cell map happens to yield. Sheets are searched in index order,
+so results group by sheet.
+
+An empty query returns an empty array rather than every cell, which is both
+faster and what the count display expects.
+
+```svelte ! SearchBar.svelte
 <script lang="ts">
-	// Find in sheet(s): a floating bar over the grid (⌘F / ⌘⇧F all sheets).
-	import { app, gotoCell, sheetController, switchSheet } from '../state.svelte';
-
-	let query = $state('');
-	let currentMatch = $state(0);
-	let inputEl: HTMLInputElement | undefined = $state();
-
-	$effect(() => {
-		inputEl?.focus();
-		inputEl?.select();
-	});
-
-	interface Match {
-		sheetIndex: number;
-		x: number;
-		y: number;
-	}
-
 	const matches = $derived.by((): Match[] => {
+		// !mark
 		void app.redraw;
 		const q = query.trim().toLowerCase();
 		if (!q) return [];
@@ -41,13 +49,35 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			const found = sheetController.sheets[sheetIndex]
 				.getAllCells()
 				.filter((c) => c.value.toLowerCase().includes(q))
+				// !mark
 				.sort((a, b) => a.y - b.y || a.x - b.x)
 				.map((c) => ({ sheetIndex, x: c.x, y: c.y }));
 			out.push(...found);
 		}
 		return out;
 	});
+</script>
+```
 
+## !!steps Why jumping is not an effect
+
+The comment explains a trap that would be easy to fall into. The natural
+implementation is an effect that watches `matches` and jumps to the first one —
+but jumping calls `gotoCell`, which writes cursor state, and `matches` reads
+`app.redraw`, which those writes can bump. The effect re-runs, jumps again, and
+the runtime is in a cycle.
+
+So navigation is only ever called from event handlers: typing, clicking an
+arrow, pressing Enter. The reactive graph computes *what* the matches are; user
+actions decide *when* to move.
+
+The index arithmetic wraps in both directions with the `((i % n) + n) % n` form,
+so stepping back from the first match lands on the last. Switching sheets first
+when a match lives elsewhere is what makes searching all sheets work as one
+continuous list.
+
+```svelte ! SearchBar.svelte
+<script lang="ts">
 	// jumping happens from event handlers only — doing it in an effect that
 	// also reads reactive state (matches → app.redraw) loops the runtime
 	function jumpTo(index: number): void {
@@ -55,35 +85,64 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			currentMatch = 0;
 			return;
 		}
+		// !mark
 		currentMatch = ((index % matches.length) + matches.length) % matches.length;
 		const m = matches[currentMatch];
+		// !mark
 		if (m.sheetIndex !== sheetController.currentSheetIndex) switchSheet(m.sheetIndex);
 		gotoCell(m.x, m.y);
 	}
+</script>
+```
 
-	function step(delta: number): void {
-		jumpTo(currentMatch + delta);
-	}
+## !!steps Enter steps, shift reverses, and ⌘F retargets
 
-	function close(): void {
-		app.showSearch = false;
-	}
+Stopping propagation keeps typing away from the grid's global handler in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts), so a search query does not also
+move the cursor.
 
+Enter advances and Shift+Enter goes back — the same convention as a browser's
+own find bar, which is what most users will expect without being told.
+
+The last branch handles pressing the find shortcut again while the bar is
+already open. Rather than reopening or closing it, this **switches scope**:
+`⌘F` sets single-sheet search and `⌘⇧F` sets all-sheets, both by assigning
+`e.shiftKey` directly. Notably it does not re-jump, so the current position is
+kept while the result set changes underneath.
+
+```svelte ! SearchBar.svelte
+<script lang="ts">
 	function onKeyDown(e: KeyboardEvent): void {
 		e.stopPropagation();
 		if (e.key === 'Escape') close();
 		else if (e.key === 'Enter') {
 			e.preventDefault();
+			// !mark
 			step(e.shiftKey ? -1 : 1);
 		} else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
 			e.preventDefault();
+			// !mark
 			app.searchAllSheets = e.shiftKey;
 		}
 	}
 </script>
+```
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="searchbar" onkeydown={onKeyDown}>
+## !!steps Typing jumps to the first result
+
+The input uses `value` with an explicit `oninput` rather than `bind:value`,
+because it needs to do two things per keystroke: update the query and jump to
+the first match.
+
+That live jump is what makes the bar feel like a browser's find — the grid
+scrolls to the first hit as you type, rather than waiting for Enter. It is also
+the reason `jumpTo(0)` appears here rather than in an effect watching `query`,
+per the loop hazard above.
+
+The placeholder changes with the scope, so the bar always states which mode it
+is in without a separate label.
+
+```svelte ! SearchBar.svelte
 	<input
 		bind:this={inputEl}
 		value={query}
@@ -94,6 +153,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		placeholder="Find in {app.searchAllSheets ? 'all sheets' : 'sheet'}…"
 		spellcheck="false"
 	/>
+```
+
+## !!steps A counter with three states
+
+The count has to distinguish three situations, and the nested conditional
+handles each: an empty query renders a non-breaking space, holding the
+element's width so the controls beside it do not shift the moment you start
+typing; a query with no hits shows a bare `0`; anything else shows the familiar
+one-based position.
+
+The `none` class turns the counter red only in the middle case — the class
+expression checks both that a query exists and that nothing matched, so an
+empty field is never styled as an error.
+
+The scope toggle is a real toggle button, carrying `aria-pressed` so assistive
+technology reports its state, and re-jumping after the switch because the match
+set has just changed.
+
+```svelte ! SearchBar.svelte
 	<span class="count" class:none={query !== '' && matches.length === 0}>
 		{#if query === ''}&nbsp;{:else if matches.length === 0}0{:else}{currentMatch + 1} of {matches.length}{/if}
 	</span>
@@ -109,11 +187,27 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			jumpTo(0);
 		}}
 	>
-		All sheets
-	</button>
-	<button class="nav close" title="Close (Esc)" aria-label="Close search" onclick={close}>✕</button>
-</div>
+```
 
+## !!steps Floating over the grid, not in it
+
+`position: absolute` places the bar against
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which is its
+positioning context — the same container that hosts the cell input and the
+hover card. Pinning it to the top-right keeps it clear of the cursor, which is
+usually working on the left.
+
+The counter uses `tabular-nums` for the same reason
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) does: with
+proportional digits, `9 of 12` and `10 of 12` occupy different widths and the
+buttons beside them would twitch on every step. The `min-width` reserves space
+for the longest expected value on top of that.
+
+The scope toggle's active state changes three properties at once — text,
+border and background all move to the accent — so it reads as engaged at a
+glance rather than needing to be compared against its inactive twin.
+
+```svelte ! SearchBar.svelte
 <style>
 	.searchbar {
 		position: absolute;
@@ -131,13 +225,6 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		font-size: 0.8rem;
 		color: var(--muted);
 	}
-	input {
-		border: none;
-		outline: none;
-		font: inherit;
-		width: 13rem;
-		padding: 0.15rem 0.3rem;
-	}
 	.count {
 		min-width: 3.6rem;
 		text-align: right;
@@ -148,36 +235,20 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	.count.none {
 		color: var(--error);
 	}
-	.nav {
-		background: none;
-		border: none;
-		font: inherit;
-		color: var(--muted);
-		cursor: pointer;
-		padding: 0.15rem 0.35rem;
-		border-radius: 4px;
-	}
-	.nav:hover {
-		background: var(--hover);
-	}
-	.all {
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: 9px;
-		font: inherit;
-		font-size: 0.68rem;
-		color: var(--faint);
-		cursor: pointer;
-		padding: 0.1rem 0.5rem;
-		white-space: nowrap;
-	}
-	.all.on {
-		color: var(--accent);
-		border-color: var(--accent);
-		background: var(--accent-soft);
-	}
-	.close {
-		color: var(--faint);
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Rendered by [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte)
+when `app.showSearch` is set, which happens from `⌘F` and `⌘⇧F` in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts) and from two entries in
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) — both
+of which set `app.searchAllSheets` before opening, so the bar starts in the
+requested scope.
+
+Because the whole search runs over
+[Sheet.ts](/docs/src/lib/core/Sheet.ts)'s in-memory cells with no index, it
+scans every cell on every keystroke. That is fine at spreadsheet scale and
+keeps results exactly current, with the sparse storage meaning empty cells cost
+nothing.
