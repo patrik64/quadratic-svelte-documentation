@@ -1,69 +1,119 @@
 ---
 title: "CommandPalette.svelte"
-description: "The CommandPalette Svelte component."
+description: "The searchable command list — 71 actions declared as data, filtered by label, with keyboard navigation over a scrolling list"
 source: "src/lib/components/CommandPalette.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The palette that opens on `⌘P`, listing every action the app can perform. Most
+of the file is the list itself — 71 commands declared as data — and the
+surrounding UI is deliberately thin: a search box, a filtered list, and arrow
+keys.
 
-````svelte CommandPalette.svelte -n
+Its real role is as an index of the application. Nearly every entry delegates
+to a function already exported by
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), so the palette adds no
+behavior of its own; it makes existing behavior findable.
+
+<Scrollycoding>
+
+## !!steps Commands as data
+
+The `Command` shape is four fields, and one of them is worth noting: `group` is
+set on every single entry and then **never read** — the markup renders only
+`label` and `shortcut`, and filtering matches on `label` alone. It is
+groundwork for grouped rendering that has not been built.
+
+That is less of an omission than it looks, because of the labelling
+convention below. `C` aliases the platform-aware Cmd glyph from
+[keyboardSymbols.ts](/docs/src/lib/helpers/keyboardSymbols.ts) once, so the 30-odd
+shortcut strings that interpolate it read tolerably.
+
+```svelte ! CommandPalette.svelte
 <script lang="ts">
-	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
-	import {
-		addSheet,
-		app,
-		changeDecimals,
-		deleteCurrentSheet,
-		duplicateCurrentSheet,
-		insertTodayDate,
-		openCodeEditorAt,
-		switchSheetRelative,
-		copySelectionAsPng,
-		downloadSelectionAsCsv,
-		deleteColumns,
-		deleteRows,
-		insertColumn,
-		insertRow,
-		getSelectionRect,
-		rerunAllCode,
-		fillDown,
-		fillRight,
-		clearFormatting,
-		copySelection,
-		importCSVAt,
-		newFile,
-		pasteFromClipboard,
-		redo,
-		saveFile,
-		copyFormat,
-		pasteFormat,
-		setAlignment,
-		setBorders,
-		setTextFormat,
-		setWrapping,
-		toggleBold,
-		toggleItalic,
-		undo,
-		zoomIn,
-		zoomOut,
-		zoomTo100,
-		zoomToFit,
-		zoomToSelection
-	} from '../state.svelte';
-	import Modal from './Modal.svelte';
-
 	const C = KeyboardSymbols.Cmd;
 
 	interface Command {
+		// !mark
 		group: string;
 		label: string;
 		shortcut?: string;
 		action: () => void;
 	}
+</script>
+```
 
+## !!steps Labels that carry their own category
+
+Every label repeats its group as a prefix — `File: New`, `Edit: Undo`,
+`View: Zoom in`. That redundancy is what lets the filter stay a single
+case-insensitive substring match while still behaving like a categorized menu:
+typing `file` narrows to the File commands, `zoom` finds them across groups.
+
+The actions show three shapes. Some are bare references to store functions,
+which is the ideal case. Some wrap a call that needs arguments or `void` to
+discard a promise. And a few toggle a flag inline — the view options are all of
+that form, reading and writing the same property in one expression.
+
+```svelte ! CommandPalette.svelte
+<script lang="ts">
+	const commands: Command[] = [
+		// !mark
+		{ group: 'File', label: 'File: New', action: newFile },
+		{ group: 'File', label: 'File: Open…', shortcut: `${C}O`, action: () => (app.showFileMenu = true) },
+		{ group: 'Edit', label: 'Edit: Undo', shortcut: `${C}Z`, action: undo },
+		{ group: 'Edit', label: 'Edit: Cut', shortcut: `${C}X`, action: () => void copySelection(true) },
+		{ group: 'Edit', label: 'Edit: Find in sheet', shortcut: `${C}F`, action: () => { app.searchAllSheets = false; app.showSearch = true; } },
+		{ group: 'Edit', label: 'Edit: Find in all sheets', shortcut: `${C}⇧F`, action: () => { app.searchAllSheets = true; app.showSearch = true; } },
+		// !mark
+		{ group: 'View', label: 'View: Show grid lines', action: () => (app.showGridLines = !app.showGridLines) },
+	];
+</script>
+```
+
+## !!steps Commands that compute their own arguments
+
+The structural commands are the ones that could not be plain function
+references, because what they operate on depends on the selection at the moment
+they run.
+
+Reading `getSelectionRect()` **inside** the action rather than when the array is
+built is what makes that work — the array is constructed once when the
+component mounts, so a captured rectangle would be stale by the time anything
+was clicked. Insert-column-left and insert-column-right differ only by whether
+they pass the left edge or one past the right.
+
+The two delete commands need a local binding because they use both edges, which
+is why they are written as blocks rather than expressions.
+
+```svelte ! CommandPalette.svelte
+<script lang="ts">
+		// !mark(1:2)
+		{ group: 'Insert', label: 'Insert: Column left', action: () => void insertColumn(getSelectionRect().x0) },
+		{ group: 'Insert', label: 'Insert: Column right', action: () => void insertColumn(getSelectionRect().x1 + 1) },
+		{ group: 'Insert', label: 'Insert: Row above', action: () => void insertRow(getSelectionRect().y0) },
+		{ group: 'Insert', label: 'Insert: Row below', action: () => void insertRow(getSelectionRect().y1 + 1) },
+		{ group: 'Edit', label: 'Edit: Delete column(s)', action: () => { const s = getSelectionRect(); void deleteColumns(s.x0, s.x1); } },
+		{ group: 'Edit', label: 'Edit: Delete row(s)', action: () => { const s = getSelectionRect(); void deleteRows(s.y0, s.y1); } },
+</script>
+```
+
+## !!steps The one command with its own implementation
+
+`Import: CSV` is the exception that needed real code, because a file picker
+cannot be opened programmatically without an `input` element to click.
+
+So one is created, configured and clicked, never entering the document — the
+browser shows the dialog regardless. The `accept` attribute filters the picker
+to `.csv`, and the handler reads the file as text before handing it to
+`importCSVAt` at the current cursor, where the parser in
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) takes over.
+
+Nothing removes the element afterwards; it is garbage collected once the
+closure is done, since it was never attached to the DOM.
+
+```svelte ! CommandPalette.svelte
+<script lang="ts">
 	function importCsvViaPicker(): void {
 		const input = document.createElement('input');
 		input.type = 'file';
@@ -72,119 +122,61 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			const file = input.files?.[0];
 			if (file) await importCSVAt(await file.text(), app.cursorPosition);
 		};
+		// !mark
 		input.click();
 	}
+</script>
+```
 
-	const commands: Command[] = [
-		{ group: 'File', label: 'File: New', action: newFile },
-		{ group: 'File', label: 'File: Open…', shortcut: `${C}O`, action: () => (app.showFileMenu = true) },
-		{ group: 'File', label: 'File: Examples…', action: () => (app.showFileMenu = true) },
-		{ group: 'File', label: 'File: Download local copy', action: saveFile },
-		{ group: 'Edit', label: 'Edit: Undo', shortcut: `${C}Z`, action: undo },
-		{ group: 'Edit', label: 'Edit: Redo', shortcut: `${C}⇧Z`, action: redo },
-		{ group: 'Edit', label: 'Edit: Cut', shortcut: `${C}X`, action: () => void copySelection(true) },
-		{ group: 'Edit', label: 'Edit: Copy', shortcut: `${C}C`, action: () => void copySelection(false) },
-		{ group: 'Edit', label: 'Edit: Paste', shortcut: `${C}V`, action: () => void pasteFromClipboard() },
-		{ group: 'Edit', label: 'Edit: Find in sheet', shortcut: `${C}F`, action: () => { app.searchAllSheets = false; app.showSearch = true; } },
-		{ group: 'Edit', label: 'Edit: Find in all sheets', shortcut: `${C}⇧F`, action: () => { app.searchAllSheets = true; app.showSearch = true; } },
-		{ group: 'Edit', label: 'Edit: Fill down', shortcut: `${C}D`, action: () => void fillDown() },
-		{ group: 'Edit', label: 'Edit: Fill right', shortcut: `${C}R`, action: () => void fillRight() },
-		{ group: 'Edit', label: 'Edit: Copy format', shortcut: `${C}⌥C`, action: copyFormat },
-		{ group: 'Edit', label: 'Edit: Paste format', shortcut: `${C}⌥V`, action: pasteFormat },
-		{ group: 'Edit', label: 'Edit: Go to cell', shortcut: `${C}G`, action: () => (app.showGoToMenu = true) },
-		{ group: 'Edit', label: 'Edit: Copy selection as PNG', shortcut: `${C}⇧C`, action: () => void copySelectionAsPng() },
-		{ group: 'File', label: 'File: Download as CSV', shortcut: `${C}⇧E`, action: downloadSelectionAsCsv },
-		{ group: 'View', label: 'View: Show row and column headings', action: () => (app.showHeadings = !app.showHeadings) },
-		{ group: 'View', label: 'View: Show grid axis', action: () => (app.showGridAxes = !app.showGridAxes) },
-		{ group: 'View', label: 'View: Show grid lines', action: () => (app.showGridLines = !app.showGridLines) },
-		{ group: 'View', label: 'View: Show code cell outlines', action: () => (app.showCellTypeOutlines = !app.showCellTypeOutlines) },
-		{ group: 'View', label: 'View: Show A1 notation on headings', action: () => (app.showA1Notation = !app.showA1Notation) },
-		{ group: 'View', label: 'View: Presentation mode', shortcut: `${C}.`, action: () => (app.presentationMode = !app.presentationMode) },
-		{ group: 'View', label: 'View: Zoom in', shortcut: `${C}+`, action: zoomIn },
-		{ group: 'View', label: 'View: Zoom out', shortcut: `${C}−`, action: zoomOut },
-		{ group: 'View', label: 'View: Zoom to selection', shortcut: `${C}8`, action: zoomToSelection },
-		{ group: 'View', label: 'View: Zoom to fit', shortcut: `${C}9`, action: zoomToFit },
-		{ group: 'View', label: 'View: Zoom to 100%', shortcut: `${C}0`, action: zoomTo100 },
-		{ group: 'Import', label: 'Import: CSV', action: importCsvViaPicker },
-		{ group: 'Insert', label: 'Insert: Python code', action: () => openCodeEditorAt('PYTHON') },
-		{ group: 'Insert', label: 'Insert: JavaScript code', action: () => openCodeEditorAt('JAVASCRIPT') },
-		{ group: 'Insert', label: 'Insert: Formula', shortcut: '=', action: () => openCodeEditorAt('FORMULA') },
-		{ group: 'Insert', label: "Insert: Today's date", shortcut: `${C};`, action: () => void insertTodayDate(false) },
-		{ group: 'Insert', label: 'Insert: Date and time', shortcut: `${C}⇧;`, action: () => void insertTodayDate(true) },
-		{ group: 'Insert', label: 'Insert: Column left', action: () => void insertColumn(getSelectionRect().x0) },
-		{ group: 'Insert', label: 'Insert: Column right', action: () => void insertColumn(getSelectionRect().x1 + 1) },
-		{ group: 'Insert', label: 'Insert: Row above', action: () => void insertRow(getSelectionRect().y0) },
-		{ group: 'Insert', label: 'Insert: Row below', action: () => void insertRow(getSelectionRect().y1 + 1) },
-		{ group: 'Edit', label: 'Edit: Delete column(s)', action: () => { const s = getSelectionRect(); void deleteColumns(s.x0, s.x1); } },
-		{ group: 'Edit', label: 'Edit: Delete row(s)', action: () => { const s = getSelectionRect(); void deleteRows(s.y0, s.y1); } },
-		{ group: 'Sheet', label: 'Sheet: New sheet', action: addSheet },
-		{ group: 'Sheet', label: 'Sheet: Duplicate sheet', action: duplicateCurrentSheet },
-		{ group: 'Sheet', label: 'Sheet: Delete sheet', action: deleteCurrentSheet },
-		{ group: 'Sheet', label: 'Sheet: Next sheet', shortcut: '⌥→', action: () => switchSheetRelative(1) },
-		{ group: 'Sheet', label: 'Sheet: Previous sheet', shortcut: '⌥←', action: () => switchSheetRelative(-1) },
-		{ group: 'Text', label: 'Text: Bold', shortcut: `${C}B`, action: toggleBold },
-		{ group: 'Text', label: 'Text: Italic', shortcut: `${C}I`, action: toggleItalic },
-		{ group: 'Text', label: 'Text: Align left', action: () => setAlignment('left') },
-		{ group: 'Text', label: 'Text: Align center', action: () => setAlignment('center') },
-		{ group: 'Text', label: 'Text: Align right', action: () => setAlignment('right') },
-		{
-			group: 'View',
-			label: 'View: Toggle dark theme',
-			action: () => (app.theme = app.theme === 'dark' ? 'light' : 'dark')
-		},
-		{ group: 'Text', label: 'Text: Overflow (no wrap)', action: () => setWrapping(undefined) },
-		{ group: 'Text', label: 'Text: Wrap', action: () => setWrapping('wrap') },
-		{ group: 'Text', label: 'Text: Clip', action: () => setWrapping('clip') },
-		{ group: 'Format', label: 'Format: Plain text', action: () => setTextFormat(undefined) },
-		{ group: 'Format', label: 'Format: Number', action: () => setTextFormat({ type: 'NUMBER', decimalPlaces: 2 }) },
-		{ group: 'Format', label: 'Format: Currency', action: () => setTextFormat({ type: 'CURRENCY', display: 'CURRENCY', symbol: '$', decimalPlaces: 2 }) },
-		{ group: 'Format', label: 'Format: Percent', action: () => setTextFormat({ type: 'PERCENTAGE', decimalPlaces: 2 }) },
-		{ group: 'Format', label: 'Format: Scientific', action: () => setTextFormat({ type: 'EXPONENTIAL', decimalPlaces: 2 }) },
-		{ group: 'Format', label: 'Format: Increase decimals', action: () => changeDecimals(1) },
-		{ group: 'Format', label: 'Format: Decrease decimals', action: () => changeDecimals(-1) },
-		{ group: 'Format', label: 'Format: All borders', action: () => setBorders('all') },
-		{ group: 'Format', label: 'Format: Outer borders', action: () => setBorders('outer') },
-		{ group: 'Format', label: 'Format: Inner borders', action: () => setBorders('inner') },
-		{ group: 'Format', label: 'Format: Clear borders', action: () => setBorders('clear') },
-		{ group: 'Format', label: 'Format: Clear formatting', shortcut: `${C}\\`, action: clearFormatting },
-		{ group: 'Edit', label: 'Edit: Rerun all code', shortcut: `${C}⇧↵`, action: () => void rerunAllCode() },
-		{ group: 'Help', label: 'Help: Example files', action: () => (app.showFileMenu = true) },
-		{ group: 'Help', label: 'Help: Formula reference', action: () => (app.showFormulaDocs = true) },
-		{ group: 'Help', label: 'Help: Read the docs', action: () => window.open('https://docs.quadratichq.com', '_blank') }
-	];
+## !!steps Closing before acting
 
-	let search = $state('');
-	let selectedIndex = $state(0);
-	let searchEl: HTMLInputElement | undefined = $state();
-	let listEl: HTMLDivElement | undefined = $state();
+`runCommand` closes the palette **first**, then invokes the action, and the
+order is deliberate rather than incidental.
 
-	const filtered = $derived(
-		commands.filter((c) => c.label.toLowerCase().includes(search.toLowerCase()))
-	);
+Several commands open another dialog — three of them set `showFileMenu`, and
+others open go-to, search or the formula reference. Running the action first
+and closing afterwards would work for simple commands but risks the close
+sequence interfering with the state the action just set. Closing first leaves
+the action as the last writer, so whatever it opens stays open.
 
-	$effect(() => {
-		searchEl?.focus();
-	});
-	$effect(() => {
-		void search;
-		selectedIndex = 0;
-	});
+It also means the palette disappears immediately on Enter, before any slow
+action runs, which is what makes the interaction feel responsive.
 
-	function close(): void {
-		app.showCommandPalette = false;
-	}
-
+```svelte ! CommandPalette.svelte
+<script lang="ts">
 	function runCommand(cmd: Command): void {
+		// !mark(1:2)
 		close();
 		cmd.action();
 	}
+</script>
+```
 
+## !!steps Navigating a list that scrolls
+
+The filter and the two effects match
+[CellTypeMenu.svelte](/docs/src/lib/components/CellTypeMenu.svelte) exactly —
+focus the search box, reset the selection whenever the query changes.
+
+Navigation differs in two ways, both because this list is long. `Math.max(1,
+filtered.length)` guards the modulo against a division by zero when nothing
+matches, where the shorter menu could simply return early. And because the list
+has a `max-height` and scrolls, moving the selection has to bring the new row
+into view — done by finding it through the `data-index` attribute and calling
+`scrollIntoView` with `block: 'nearest'`, which scrolls only when the row is
+actually outside the viewport rather than centring it on every keystroke.
+
+There is no disabled state to skip here, so the arithmetic is a plain wrap.
+
+```svelte ! CommandPalette.svelte
+<script lang="ts">
 	function onKeyDown(e: KeyboardEvent): void {
 		e.stopPropagation();
 		if (e.key === 'Escape') close();
 		else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
 			e.preventDefault();
 			const delta = e.key === 'ArrowDown' ? 1 : -1;
+			// !mark
 			selectedIndex = (selectedIndex + delta + filtered.length) % Math.max(1, filtered.length);
 			listEl
 				?.querySelector(`[data-index="${selectedIndex}"]`)
@@ -196,18 +188,23 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		}
 	}
 </script>
+```
 
-<Modal onclose={close}>
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div onkeydown={onKeyDown}>
-		<input
-			bind:this={searchEl}
-			bind:value={search}
-			class="search"
-			placeholder="Search menus and commands…"
-			spellcheck="false"
-		/>
-		<div class="list" bind:this={listEl}>
+## !!steps Rows keyed by label
+
+The list is keyed on `cmd.label`, which doubles as an assertion that labels are
+unique — a duplicate would collapse two rows into one keyed entry.
+
+`data-index` exists purely so the keyboard handler can find the selected row in
+the DOM without keeping element references. As in the cell type menu, hovering
+writes the same `selectedIndex` the arrows write, so mouse and keyboard cannot
+disagree about what Enter would run.
+
+The shortcut hint is rendered only when present and pushed to the right by the
+row's `space-between`, giving the palette its familiar two-column look without
+a grid.
+
+```svelte ! CommandPalette.svelte
 			{#each filtered as cmd, i (cmd.label)}
 				<button
 					class="row"
@@ -222,49 +219,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			{:else}
 				<div class="empty">No matches</div>
 			{/each}
-		</div>
-	</div>
-</Modal>
+```
 
-<style>
-	.search {
-		width: 100%;
-		border: none;
-		outline: none;
-		padding: 0.9rem 1rem;
-		font-size: 0.95rem;
-		border-bottom: 1px solid var(--border-light);
-		box-sizing: border-box;
-	}
-	.list {
-		overflow-y: auto;
-		max-height: 330px;
-		padding: 0.25rem 0;
-	}
-	.row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		width: 100%;
-		background: none;
-		border: none;
-		font: inherit;
-		font-size: 0.85rem;
-		padding: 0.45rem 1rem;
-		cursor: pointer;
-		text-align: left;
-	}
-	.row.selected {
-		background: var(--accent-soft);
-	}
-	.shortcut {
-		color: var(--faint-2);
-		font-size: 0.75rem;
-	}
-	.empty {
-		padding: 0.75rem 1rem;
-		color: var(--muted);
-		font-size: 0.85rem;
-	}
-</style>
-````
+</Scrollycoding>
+
+Rendered by [+page.svelte](/docs/src/routes/+page.svelte) when
+`app.showCommandPalette` is set, inside the shared
+[Modal.svelte](/docs/src/lib/components/Modal.svelte).
+
+Two things worth knowing when reading the list. The shortcut strings are only
+partly platform-aware — the Cmd glyph adapts, but `⇧`, `⌥` and the arrow glyphs
+are written literally, so a Windows user sees `Ctrl+⇧Z`. And three separate
+commands (`File: Open…`, `File: Examples…`, `Help: Example files`) all just open
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) — three doors into
+the same dialog, findable under the words someone might actually search for.
+
+The palette is not the source of truth for any shortcut it displays; those are
+implemented independently in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts), so a binding changed there would
+need updating here too.
