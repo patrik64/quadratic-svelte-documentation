@@ -1,98 +1,128 @@
 ---
 title: "Sheet.ts"
-description: "Sparse spreadsheet model: cells, formats, and dependency edges."
+description: "The sparse spreadsheet model — cells, formats and a reverse dependency index, all stored as exceptions to an empty grid"
 source: "src/lib/core/Sheet.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+One sheet's worth of data: what is in each cell, how each cell is formatted, and
+which cells read which. It holds no UI state and no reactivity — deliberately,
+since making thousands of cells individually reactive would be ruinous, which is
+why components subscribe through the redraw counter in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) instead.
 
-````ts Sheet.ts -n
-import { GridOffsets } from './GridOffsets';
-import {
-	coordKey,
-	parseCoordKey,
-	type Cell,
-	type CellFormat,
-	type Coordinate,
-	type GridFileData,
-	type Rect
-} from './types';
+The organizing idea is that the grid is infinite and almost entirely empty, so
+nothing is ever stored for a cell that has no content. Every structure here is
+a map of exceptions.
 
+<Scrollycoding>
+
+## !!steps Three maps and a coordinate system
+
+The state is three `Map`s plus the geometry in
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts), which applies the same
+sparse discipline to column widths and row heights.
+
+All three are keyed by a string built by `coordKey`, which is simply
+`` `${x},${y}` ``. Using a string rather than nesting maps by axis keeps every
+lookup a single hash, and it is what allows negative coordinates without any
+special handling — `-3,-7` is as ordinary a key as `3,7`.
+
+The separation of cells from formats matters: formatting a cell that has no
+value creates a format entry with no cell, and that is a legitimate state rather
+than an inconsistency.
+
+```ts ! Sheet.ts
 /** Sparse spreadsheet model: cells, formats, and dependency edges. */
 export class Sheet {
 	name = 'Sheet1';
 	color: string | undefined; // SheetBar tab color (modern client feature)
 	gridOffsets = new GridOffsets();
 
+	// !mark(1:4)
 	private cells = new Map<string, Cell>();
 	private formats = new Map<string, CellFormat>();
 	/** dependency: key cell -> set of cells whose computation reads it */
 	private dependents = new Map<string, Set<string>>();
+```
 
-	// ---------- cells ----------
+## !!steps Rectangle queries scan everything
 
-	getCell(x: number, y: number): Cell | undefined {
-		return this.cells.get(coordKey(x, y));
-	}
+Single-cell access is a hash lookup, but a rectangle query iterates **every
+cell in the sheet** and filters by bounds. There is no spatial index.
 
-	setCell(cell: Cell): void {
-		this.cells.set(coordKey(cell.x, cell.y), cell);
-	}
+That is a considered trade rather than an oversight. Sparse storage means the
+map holds only cells that exist, so a sheet with a thousand populated cells
+costs a thousand comparisons regardless of how far apart they sit — whereas
+walking the rectangle's coordinates would cost its area, which on an infinite
+grid can be astronomically larger than its content.
 
-	deleteCell(x: number, y: number): void {
-		this.cells.delete(coordKey(x, y));
-	}
+It does mean the cost scales with the *document*, not the viewport, and this
+runs in the render loop: [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts)
+calls it every time cells are redrawn. At spreadsheet scale that is fine; it
+would not be for a sheet with millions of cells.
 
-	getAllCells(): Cell[] {
-		return [...this.cells.values()];
-	}
-
+```ts ! Sheet.ts
 	getCellsInRect(rect: Rect): Cell[] {
 		const out: Cell[] = [];
+		// !mark
 		for (const cell of this.cells.values()) {
 			if (cell.x >= rect.left && cell.x <= rect.right && cell.y >= rect.top && cell.y <= rect.bottom)
 				out.push(cell);
 		}
 		return out;
 	}
+```
 
-	get cellCount(): number {
-		return this.cells.size;
-	}
+## !!steps A format that empties itself out of existence
 
-	// ---------- formats ----------
+`setFormat` merges rather than replaces, so setting `bold` leaves an existing
+fill colour intact — which is what lets the Format menu apply one attribute at
+a time.
 
-	getFormat(x: number, y: number): CellFormat | undefined {
-		return this.formats.get(coordKey(x, y));
-	}
+The two lines after the merge are the interesting part. Keys whose value came
+back `undefined` are deleted outright, so clearing an attribute genuinely
+removes it instead of storing a tombstone. Then the entry is counted: if only
+two keys remain, those must be `x` and `y`, meaning every actual attribute has
+been cleared — and the whole record is dropped from the map.
 
+Without that check, toggling bold on and off would leave behind a format object
+forever, and both the bounds calculation below and the file on disk would grow
+with entries that mean nothing.
+
+```ts ! Sheet.ts
 	setFormat(x: number, y: number, update: Partial<CellFormat>): CellFormat {
 		const key = coordKey(x, y);
 		const existing = this.formats.get(key) ?? { x, y };
 		const merged: CellFormat = { ...existing, ...update, x, y };
 		// drop undefined entries so empty formats can be pruned
 		for (const k of Object.keys(merged) as (keyof CellFormat)[]) {
+			// !mark
 			if (merged[k] === undefined) delete merged[k];
 		}
+		// !mark
 		if (Object.keys(merged).length <= 2) this.formats.delete(key);
 		else this.formats.set(key, merged);
 		return merged;
 	}
+```
 
-	clearFormat(x: number, y: number): void {
-		this.formats.delete(coordKey(x, y));
-	}
+## !!steps Bounds cover formats as well as values
 
-	getAllFormats(): CellFormat[] {
-		return [...this.formats.values()];
-	}
+`getBounds` walks both maps, so a cell that has been coloured but never typed
+into still counts as content.
 
-	// ---------- bounds ----------
+That is the right definition for what it feeds: selecting an entire column in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) spans the
+sheet's bounds, and zoom-to-fit frames them. A formatted-but-empty region is
+visible, so leaving it outside the bounds would let it fall off screen or out of
+a selection.
 
-	/** Bounding rect of all content (cells + formats), or undefined when empty. */
+Returning `undefined` for a genuinely empty sheet — rather than a zero-sized
+rectangle at the origin — forces callers to handle emptiness explicitly, which
+is why they fall back to `0` rather than silently selecting a phantom cell.
+
+```ts ! Sheet.ts
 	getBounds(): Rect | undefined {
 		let bounds: Rect | undefined;
 		const extend = (x: number, y: number) => {
@@ -105,16 +135,36 @@ export class Sheet {
 			}
 		};
 		for (const c of this.cells.values()) extend(c.x, c.y);
+		// !mark
 		for (const f of this.formats.values()) extend(f.x, f.y);
 		return bounds;
 	}
+```
 
-	// ---------- dependency graph ----------
+## !!steps The graph points the useful way
 
-	/** Record that `dependent` reads from each of `reads`. */
+The dependency map is stored **reversed**: the key is a cell that gets read, and
+the value is the set of cells whose computations read it.
+
+That direction is chosen for the question actually asked. When a cell changes,
+the recompute pipeline in
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts) needs to
+know what depends on it — which is a single lookup here. Storing it the natural
+way round, each formula listing its inputs, would make that a full scan.
+
+The cost lands on writes instead. Because a dependent can appear in any number
+of sets, removing its old edges means visiting **every** set in the map. That
+is linear in the graph, accepted because writes happen once per recomputation
+while reads happen once per dependent.
+
+The final loop prunes sets that have emptied, keeping the map sparse like
+everything else here.
+
+```ts ! Sheet.ts
 	setDependencies(dependent: Coordinate, reads: Coordinate[]): void {
 		const depKey = coordKey(dependent.x, dependent.y);
 		// remove old edges pointing at this dependent
+		// !mark
 		for (const set of this.dependents.values()) set.delete(depKey);
 		for (const r of reads) {
 			const key = coordKey(r.x, r.y);
@@ -123,44 +173,65 @@ export class Sheet {
 			set.add(depKey);
 		}
 		// prune empty sets
+		// !mark
 		for (const [key, set] of this.dependents) if (set.size === 0) this.dependents.delete(key);
 	}
+```
 
-	/** Cells whose computations read (x, y). */
-	getDependents(x: number, y: number): Coordinate[] {
-		const set = this.dependents.get(coordKey(x, y));
-		return set ? [...set].map(parseCoordKey) : [];
-	}
+## !!steps The graph is a cache, not a source of truth
 
-	/** Re-derive the dependency graph from stored evaluation results (after undo/redo/import). */
+`rebuildDependencies` reconstructs the entire map from scratch, reading each
+cell's `cells_accessed` — the list every runtime records as it evaluates, in
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts),
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) and
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts).
+
+That makes the graph **derived data**. The authoritative record of what a cell
+read lives on the cell itself, alongside its result, so the index can always be
+thrown away and rebuilt.
+
+This is what makes undo and redo tractable: restoring cells restores their
+evaluation results, and one rebuild puts the graph back in agreement — far
+simpler than trying to invert individual edge changes as part of each
+transaction.
+
+```ts ! Sheet.ts
 	rebuildDependencies(): void {
+		// !mark
 		this.dependents.clear();
 		for (const cell of this.cells.values()) {
 			const accessed = cell.evaluation_result?.cells_accessed;
 			if (accessed && accessed.length > 0) {
 				this.setDependencies(
 					{ x: cell.x, y: cell.y },
+					// !mark
 					accessed.map(([x, y]) => ({ x, y }))
 				);
 			}
 		}
 	}
+```
 
-	// ---------- serialization ----------
+## !!steps Serializing, and tolerating a corrupt cache
 
-	export(): GridFileData {
-		return {
-			cells: this.getAllCells(),
-			formats: this.getAllFormats(),
-			columns: this.gridOffsets.exportColumns(),
-			rows: this.gridOffsets.exportRows(),
-			cell_dependency: JSON.stringify(
-				[...this.dependents.entries()].map(([k, v]) => [k, [...v]])
-			)
-		};
-	}
+Export hands back the four collections plus the dependency graph as a JSON
+*string*. The nested string is not this file's choice — it matches the
+`.grid` v1.3 schema documented on
+[gridFile.ts](/docs/src/lib/files/gridFile.ts), where `cell_dependency` is a
+string field.
 
+Import clears everything first, then repopulates, so loading a file into a
+reused instance cannot leave stragglers from the previous document.
+
+The `try`/`catch` at the end is the payoff of the previous step. A malformed
+dependency string is swallowed rather than failing the import, because — as the
+comment says — the graph is re-derivable. The caller loses nothing: `importGridFile`
+calls `rebuildDependencies` afterwards regardless. Corrupt *cells* would be a
+real problem; a corrupt index is not.
+
+```ts ! Sheet.ts
 	import(data: GridFileData): void {
+		// !mark(1:3)
 		this.cells.clear();
 		this.formats.clear();
 		this.dependents.clear();
@@ -171,8 +242,22 @@ export class Sheet {
 			const parsed = JSON.parse(data.cell_dependency || '[]') as [string, string[]][];
 			for (const [k, v] of parsed) this.dependents.set(k, new Set(v));
 		} catch {
+			// !mark
 			// dependency cache is re-derivable; ignore corrupt data
 		}
 	}
-}
-````
+```
+
+</Scrollycoding>
+
+A sheet never acts alone. Multiple instances are held by
+[SheetController.ts](/docs/src/lib/core/SheetController.ts), which wraps every
+mutation in an undoable transaction — so almost nothing calls `setCell` or
+`setFormat` here directly. Reads, by contrast, come from everywhere: the
+renderer, the status bar's selection summary, the search bar, and the formula
+engine's grid accessor.
+
+Cross-sheet references are the one dependency this graph does not capture, since
+[sheetRefs.ts](/docs/src/lib/formulas/sheetRefs.ts) inlines those values before
+evaluation and the engine therefore never reports them as accessed. They are
+tracked separately by `rebuildCrossSheetDeps` on the controller.
