@@ -1,0 +1,53 @@
+# Disabled — not running for now.
+#
+# To re-enable: rename this file back to `ci.yml` and uncomment the block below
+# (strip the leading "# " from each line). It checks out this repo and
+# quadratic-svelte as siblings so `pnpm check` can verify every quoted excerpt
+# against the file it came from, then builds.
+#
+# The filename ends in `.disabled` rather than `.yml` because GitHub reports a
+# comment-only workflow as an invalid workflow file.
+
+# name: CI
+#
+# on:
+#   push:
+#     branches: [main]
+#   pull_request:
+#
+# jobs:
+#   check:
+#     runs-on: ubuntu-latest
+#     steps:
+#       # both repos are checked out as siblings so `pnpm check` can compare
+#       # every quoted excerpt against the file it came from
+#       - uses: actions/checkout@v4
+#         with:
+#           path: quadratic-svelte-documentation
+#
+#       - uses: actions/checkout@v4
+#         with:
+#           repository: patrik64/quadratic-svelte
+#           path: quadratic-svelte
+#
+#       - uses: pnpm/action-setup@v4
+#         with:
+#           version: 11
+#
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: 24
+#           cache: pnpm
+#           cache-dependency-path: quadratic-svelte-documentation/pnpm-lock.yaml
+#
+#       - name: Install
+#         working-directory: quadratic-svelte-documentation
+#         run: pnpm install --frozen-lockfile
+#
+#       - name: Check docs against source
+#         working-directory: quadratic-svelte-documentation
+#         run: pnpm check
+#
+#       - name: Build
+#         working-directory: quadratic-svelte-documentation
+#         run: pnpm build
