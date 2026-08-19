@@ -1,32 +1,41 @@
 ---
 title: "FileMenu.svelte"
-description: "The FileMenu Svelte component."
+description: "The full-screen file browser — stored files from IndexedDB, two-click delete, local file opening, and the bundled examples"
 source: "src/lib/components/FileMenu.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Unlike the other dialogs, this one is not a modal: it covers the entire window.
+That fits what it does — it is the place you go when you are not working on the
+current sheet but choosing a different one, so the grid behind it is irrelevant.
 
-````svelte FileMenu.svelte -n
+Three sources of files sit side by side: a blank grid, whatever is stored in
+this browser, and the bundled examples. Reached from the `⌘O` command, from
+three separate entries in
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte), and
+from the File menu.
+
+<Scrollycoding>
+
+## !!steps Examples described as data
+
+The eight examples are declared with a display name, the file to fetch, a
+one-line description and tags naming the features each demonstrates. The tag
+union is closed, so a typo is a compile error rather than an unstyled chip —
+each value has a matching CSS class.
+
+Worth knowing when cross-referencing: only two of these files
+(`formula_tour.grid` and `javascript.grid`) are produced by
+[generate-examples.mjs](/docs/scripts/generate-examples.mjs); the rest are
+committed artifacts in `static/examples/`.
+
+```svelte ! FileMenu.svelte
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { listStoredFiles, type StoredFileMeta } from '../files/gridFile';
-	import {
-		app,
-		deleteStoredFileById,
-		duplicateStoredFileById,
-		newFile,
-		openFileFromJSON,
-		openStoredFile,
-		saveFile
-	} from '../state.svelte';
-
 	interface Example {
 		name: string;
 		file: string;
 		description: string;
+		// !mark
 		tags: ('Formulas' | 'Python' | 'JavaScript' | 'Data')[];
 	}
 
@@ -43,61 +52,55 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			description: 'q.cells(), spilling a table, and a formula reading JS output.',
 			tags: ['JavaScript', 'Formulas']
 		},
-		{
-			name: 'Default (example)',
-			file: 'default.grid',
-			description: 'Quick overview of basic usage of the app.',
-			tags: ['Formulas', 'Python']
-		},
-		{
-			name: 'Python (example)',
-			file: 'python.grid',
-			description: 'Advanced examples of how to use Python in the app.',
-			tags: ['Python']
-		},
-		{
-			name: 'Airports distance (example)',
-			file: 'airports_distance.grid',
-			description: 'Filtering data and calculating values over a large table.',
-			tags: ['Python', 'Data']
-		},
-		{
-			name: 'Expenses (example)',
-			file: 'expenses.grid',
-			description: 'Spreadsheet-style budgeting with formatted currency.',
-			tags: ['Formulas']
-		},
-		{
-			name: 'Monte Carlo simulation (example)',
-			file: 'monte_carlo_simulation.grid',
-			description: 'Working with large sets of generated data.',
-			tags: ['Python', 'Data']
-		},
-		{
-			name: 'Startup portfolio (example)',
-			file: 'startup_portfolio.grid',
-			description: 'Calculations from formulas and Python side by side.',
-			tags: ['Formulas', 'Python', 'Data']
-		}
 	];
+</script>
+```
 
-	let fileInput: HTMLInputElement | undefined = $state();
-	let error = $state('');
+## !!steps Listing what is stored, forgivingly
 
-	// ---- your files (local IndexedDB store) ----
-	let stored = $state<StoredFileMeta[]>([]);
-	let confirmDeleteId = $state('');
+The stored files come from `listStoredFiles` in
+[gridFile.ts](/docs/src/lib/files/gridFile.ts), which returns metadata only —
+names, sheet counts, timestamps — so opening this screen does not pull megabytes
+of cell data out of IndexedDB.
 
+The `catch` deliberately swallows the error and empties the list. If the store
+is unavailable — a private browsing mode, a corrupted database — the right
+outcome is a file screen showing the examples and a New grid button, not a
+broken dialog. The user can still work; they simply have no saved files to
+choose from.
+
+Refreshing is a plain function rather than an effect, because it needs
+re-running at specific moments: on mount, and after a duplicate or delete
+changes the store.
+
+```svelte ! FileMenu.svelte
+<script lang="ts">
 	async function refreshStored(): Promise<void> {
 		try {
 			stored = await listStoredFiles();
 		} catch {
+			// !mark
 			stored = [];
 		}
 	}
 	onMount(() => void refreshStored());
+</script>
+```
 
+## !!steps Opening the file you already have open
+
+`openStored` checks first whether the requested file is the current one, and if
+so just closes the screen.
+
+Without that guard, clicking the file you are already editing would run the
+whole load path — replacing the sheets with their saved state, and silently
+discarding anything typed since the last save. The short-circuit makes the
+obvious gesture harmless.
+
+```svelte ! FileMenu.svelte
+<script lang="ts">
 	async function openStored(id: string): Promise<void> {
+		// !mark(1:4)
 		if (id === app.fileId) {
 			close();
 			return;
@@ -105,13 +108,28 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		await openStoredFile(id);
 		close();
 	}
+</script>
+```
 
-	async function duplicateStored(id: string): Promise<void> {
-		await duplicateStoredFileById(id);
-		await refreshStored();
-	}
+## !!steps Delete that asks once, without a dialog
 
+Deleting a file is irreversible, so it needs confirmation — but interrupting a
+full-screen file browser with a modal would be heavy-handed.
+
+Instead the button arms itself. The first click stores the id in
+`confirmDeleteId` and returns; the markup then swaps that button's label to
+`Delete?` and adds an `armed` class. Only a second click on the *same* button
+proceeds.
+
+Because the state is a single id rather than a boolean, arming one file
+automatically disarms any other — clicking delete on file A and then on file B
+leaves only B armed, which is the behavior you would want and comes for free
+from the representation.
+
+```svelte ! FileMenu.svelte
+<script lang="ts">
 	async function deleteStored(id: string): Promise<void> {
+		// !mark(1:4)
 		if (confirmDeleteId !== id) {
 			confirmDeleteId = id; // first click arms, second click deletes
 			return;
@@ -120,106 +138,84 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		await deleteStoredFileById(id);
 		await refreshStored();
 	}
+</script>
+```
 
+## !!steps Timestamps at the resolution that matters
+
+A file touched an hour ago is best identified by its time; one touched last
+month by its date. Showing both always would be noise, so the threshold is a
+day.
+
+`toLocaleTimeString` and `toLocaleDateString` with no explicit locale use the
+browser's, so the format matches what the user expects from the rest of their
+system. The falsy check on `ms` covers a record with no timestamp, returning an
+empty string rather than rendering the epoch.
+
+```svelte ! FileMenu.svelte
+<script lang="ts">
 	function modifiedLabel(ms: number): string {
 		if (!ms) return '';
 		const days = (Date.now() - ms) / 86_400_000;
+		// !mark(1:2)
 		if (days < 1) return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 		return new Date(ms).toLocaleDateString();
 	}
+</script>
+```
 
-	function close(): void {
-		app.showFileMenu = false;
-	}
+## !!steps Fetching an example, one at a time
 
-	async function openLocal(e: Event): Promise<void> {
-		const file = (e.target as HTMLInputElement).files?.[0];
-		if (!file) return;
-		try {
-			openFileFromJSON(await file.text(), file.name);
-			close();
-		} catch (err) {
-			error = `Could not open file: ${String(err)}`;
-		}
-	}
+Examples are static assets, so opening one is a `fetch` against
+`/examples/`, with the response text handed to `openFileFromJSON`.
 
-	let loading = $state('');
+`loading` holds the *filename* rather than a boolean, which lets it serve two
+purposes: the markup shows an `Opening…` chip on the specific card being
+fetched, while `disabled={loading !== ''}` greys out **all** the example
+buttons. That prevents a second click starting a concurrent load that could
+finish out of order and open the wrong file.
 
+The explicit `res.ok` check matters because `fetch` does not reject on a 404 —
+without it, a missing example would parse an HTML error page as JSON and produce
+a confusing message instead of a clear one. `finally` clears the flag on both
+paths, so a failure re-enables the buttons.
+
+```svelte ! FileMenu.svelte
+<script lang="ts">
 	async function openExample(file: string, name: string): Promise<void> {
 		loading = file;
 		try {
 			const res = await fetch(`/examples/${file}`);
+			// !mark
 			if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
 			openFileFromJSON(await res.text(), name);
 			close();
 		} catch (err) {
 			error = `Could not load ${name}: ${String(err)}`;
 		} finally {
+			// !mark
 			loading = '';
 		}
 	}
-
-	function onKeyDown(e: KeyboardEvent): void {
-		e.stopPropagation();
-		if (e.key === 'Escape') close();
-	}
 </script>
+```
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="filemenu" onkeydown={onKeyDown} tabindex="-1">
-	<div class="header">
-		<svg width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">
-			<rect x="2" y="2" width="9" height="9" fill="#6cd4ff" />
-			<rect x="13" y="2" width="9" height="9" fill="#8ecb89" />
-			<rect x="2" y="13" width="9" height="9" fill="#cb8999" />
-			<rect x="13" y="13" width="9" height="9" fill="#5d576b" />
-		</svg>
-		<span class="title">Files</span>
-		<button class="close" onclick={close} title="Close (Esc)">✕</button>
-	</div>
+## !!steps The stored file rows
 
-	{#if error}<div class="error">{error}</div>{/if}
+Each row pairs a large open button with a small actions group. The open button
+carries the name, an `open` badge when it is the current file, and a metadata
+line pluralizing `sheet` correctly.
 
-	<div class="content">
-		<div class="section">
-			<div class="section-title">Start</div>
-			<button
-				class="entry"
-				onclick={() => {
-					newFile();
-					close();
-				}}
-			>
-				<span class="entry-name">＋ New grid</span>
-				<span class="entry-desc">Start with a blank sheet.</span>
-			</button>
-			<button class="entry" onclick={() => fileInput?.click()}>
-				<span class="entry-name">⌥ Open local file…</span>
-				<span class="entry-desc">Open a .grid file from your computer.</span>
-			</button>
-			<button
-				class="entry"
-				onclick={() => {
-					saveFile();
-				}}
-			>
-				<span class="entry-name">↓ Download current file</span>
-				<span class="entry-desc">Save “{app.filename}” as a .grid file.</span>
-			</button>
-			{#if stored.length > 0}
-				<div class="section-title yours">Your files</div>
-				<div class="stored-list">
-					{#each stored as f (f.id)}
-						<div class="stored" class:active={f.id === app.fileId}>
-							<button class="stored-open" onclick={() => void openStored(f.id)}>
-								<span class="stored-name">
-									{f.filename}
-									{#if f.id === app.fileId}<span class="open-badge">open</span>{/if}
-								</span>
-								<span class="stored-meta">
-									{f.sheets} {f.sheets === 1 ? 'sheet' : 'sheets'} · {modifiedLabel(f.modified)}
-								</span>
-							</button>
+The delete button is **absent** for the currently open file, rather than
+disabled — deleting the file you are editing has no coherent outcome, so the
+affordance is simply not offered. Duplicate remains available for every row.
+
+The armed state is visible in three places at once: the label becomes
+`Delete?`, the `armed` class changes its appearance, and the `title` explains
+what a second click will do — so the confirmation is legible whether the user is
+reading, hovering, or just glancing.
+
+```svelte ! FileMenu.svelte
 							<span class="stored-actions">
 								<button
 									class="mini"
@@ -235,34 +231,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 									>{confirmDeleteId === f.id ? 'Delete?' : '✕'}</button>
 								{/if}
 							</span>
-						</div>
-					{/each}
-				</div>
-			{/if}
-		</div>
-		<div class="section examples">
-			<div class="section-title">Examples</div>
-			<div class="example-grid">
-				{#each EXAMPLES as example (example.file)}
-					<button
-						class="entry example"
-						disabled={loading !== ''}
-						onclick={() => openExample(example.file, example.name)}
-					>
-						<span class="entry-name">{example.name.replace(' (example)', '')}</span>
-						<span class="entry-desc">{example.description}</span>
-						<span class="tags">
-							{#each example.tags as tag (tag)}
-								<span class="tag {tag.toLowerCase()}">{tag}</span>
-							{/each}
-							{#if loading === example.file}<span class="tag loading">Opening…</span>{/if}
-						</span>
-					</button>
-				{/each}
-			</div>
-		</div>
-	</div>
+```
 
+## !!steps A hidden input, and covering the window
+
+Opening a local file needs a real `input[type=file]`, kept in the markup with
+`display: none` and clicked programmatically by the visible button. That is a
+different approach from
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte), which
+constructs its input on demand — both work; this one is simpler to bind to,
+that one avoids leaving an element in the tree.
+
+The container is `position: fixed` with `inset: 0`, so it covers the viewport
+entirely rather than floating over it like
+[Modal.svelte](/docs/src/lib/components/Modal.svelte). `tabindex="-1"` makes
+the div focusable so it can receive the keydown that handles Escape, and
+`outline: none` suppresses the focus ring that would otherwise draw around the
+whole screen.
+
+```svelte ! FileMenu.svelte
 	<input
 		bind:this={fileInput}
 		type="file"
@@ -282,206 +269,18 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		flex-direction: column;
 		outline: none;
 	}
-	.header {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		padding: 1rem 1.5rem;
-		border-bottom: 1px solid var(--border-light);
-	}
-	.title {
-		font-weight: 600;
-		font-size: 1.1rem;
-		color: var(--text);
-	}
-	.close {
-		margin-left: auto;
-		background: none;
-		border: none;
-		font-size: 1.1rem;
-		color: var(--muted);
-		cursor: pointer;
-	}
-	.section-title.yours {
-		margin-top: 1.2rem;
-	}
-	.stored-list {
-		display: flex;
-		flex-direction: column;
-		gap: 0.35rem;
-	}
-	.stored {
-		display: flex;
-		align-items: stretch;
-		border: 1px solid var(--border);
-		border-radius: 6px;
-		background: var(--panel);
-		overflow: hidden;
-	}
-	.stored.active {
-		border-color: var(--accent);
-		background: var(--accent-soft);
-	}
-	.stored-open {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		gap: 0.15rem;
-		text-align: left;
-		background: none;
-		border: none;
-		font: inherit;
-		cursor: pointer;
-		padding: 0.5rem 0.75rem;
-		min-width: 0;
-	}
-	.stored-name {
-		font-weight: 600;
-		font-size: 0.88rem;
-		color: var(--text);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.open-badge {
-		font-size: 0.62rem;
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		color: var(--accent);
-		border: 1px solid var(--accent);
-		border-radius: 8px;
-		padding: 0 0.4rem;
-		margin-left: 0.4rem;
-	}
-	.stored-meta {
-		font-size: 0.72rem;
-		color: var(--faint);
-	}
-	.stored-actions {
-		display: flex;
-		align-items: center;
-		gap: 0.25rem;
-		padding: 0 0.5rem;
-	}
-	.mini {
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		color: var(--muted);
-		font: inherit;
-		font-size: 0.72rem;
-		cursor: pointer;
-		padding: 0.15rem 0.4rem;
-	}
-	.mini:hover {
-		background: var(--hover);
-	}
-	.mini.danger.armed {
-		background: var(--error);
-		border-color: var(--error);
-		color: white;
-	}
-	.error {
-		background: #fde8e8;
-		color: #b71c1c;
-		padding: 0.5rem 1.5rem;
-		font-size: 0.85rem;
-	}
-	.content {
-		display: grid;
-		grid-template-columns: minmax(240px, 1fr) minmax(0, 2.2fr);
-		gap: 2.5rem;
-		padding: 1.5rem;
-		overflow-y: auto;
-		max-width: 1100px;
-		margin: 0 auto;
-		width: 100%;
-		box-sizing: border-box;
-	}
-	@media (max-width: 780px) {
-		.content {
-			grid-template-columns: 1fr;
-			gap: 1.5rem;
-		}
-	}
-	.example-grid {
-		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-		gap: 0.6rem;
-	}
-	.entry.example {
-		margin-bottom: 0;
-		gap: 0.3rem;
-	}
-	.entry:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.tags {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 0.3rem;
-		margin-top: 0.15rem;
-	}
-	.tag {
-		font-size: 0.62rem;
-		letter-spacing: 0.03em;
-		text-transform: uppercase;
-		padding: 1px 6px;
-		border-radius: 9px;
-		border: 1px solid currentColor;
-		color: var(--faint);
-	}
-	.tag.formulas {
-		color: var(--formula);
-	}
-	.tag.python {
-		color: var(--python);
-	}
-	.tag.javascript {
-		color: var(--javascript);
-	}
-	.tag.data {
-		color: var(--muted);
-	}
-	.tag.loading {
-		color: var(--accent);
-	}
-	.section-title {
-		font-size: 0.75rem;
-		text-transform: uppercase;
-		letter-spacing: 0.06em;
-		color: var(--muted);
-		margin-bottom: 0.5rem;
-	}
-	.entry {
-		display: flex;
-		flex-direction: column;
-		align-items: flex-start;
-		gap: 0.15rem;
-		width: 100%;
-		background: none;
-		border: 1px solid var(--border-light);
-		border-radius: 6px;
-		font: inherit;
-		text-align: left;
-		padding: 0.7rem 0.9rem;
-		margin-bottom: 0.5rem;
-		cursor: pointer;
-	}
-	.entry:hover {
-		border-color: #6cd4ff;
-		background: var(--accent-soft);
-	}
-	.entry-name {
-		font-weight: 600;
-		font-size: 0.9rem;
-		color: var(--text);
-	}
-	.entry-desc {
-		font-size: 0.75rem;
-		color: var(--muted);
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+The three open paths all converge on
+[state.svelte.ts](/docs/src/lib/state.svelte.ts): `newFile`, `openStoredFile`
+and `openFileFromJSON`, which import through
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) and rebuild the sheets. Both
+`openLocal` and `openExample` route through `openFileFromJSON`, so a bundled
+example and a file from disk take exactly the same code path — the only
+difference is where the text came from.
+
+Errors from either are surfaced in a banner at the top of the screen rather than
+thrown, since a malformed `.grid` file is a user-facing problem, not a bug.
