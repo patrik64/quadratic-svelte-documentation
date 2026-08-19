@@ -1,20 +1,49 @@
 ---
 title: "macros.rs"
-description: "Parses the first matching syntax rule using `try_parse()` or returns an error listing all of them if none match."
+description: "parse_one_of! — try syntax rules in order, and if none of them match, name all of them in a single error."
 source: "quadratic-core/src/formulas/parser/macros.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Twenty-six lines, one macro. Alternation is the one thing the grammar rules do
+constantly and cannot express as a plain function: "an atom is a function call,
+or a string, or a number, or an array, or a cell reference, or a parenthesized
+expression" — and when it is none of those, the error has to list every option
+that was on the table.
 
-````rust macros.rs -n
+[parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs) declares this
+module with `#[macro_use]`, so `parse_one_of!` is in scope for everything under
+[rules/](/docs/quadratic-core/src/formulas/parser/rules/mod.rs). There are three
+call sites: the atom precedence level in
+[rules/expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs),
+and twice inside the `List` combinator in
+[rules/combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs),
+which alternates between "another item" and "end of list".
+
+<Scrollycoding>
+
+## !!steps Binding each rule before it is used twice
+
+The macro cannot simply expand each rule expression inline, because every rule
+is needed *twice*: once to attempt the parse, and once — if everything fails —
+to stringify it into the error message. Evaluating `self.inner.map(Some)` twice
+would be wrong, so each rule is first bound to a local variable.
+
+That is what this arm does, one rule per expansion. It peels `$first_rule` off
+the front of the bracketed list, binds it with `let`, and recurses with that
+identifier appended to a running accumulator of already-bound names, each marked
+by a leading `@`. The literal name `this_var_is_unique` is reused at every level
+and it really is unique: `macro_rules!` hygiene gives each expansion its own
+binding, and the identifier handed back into the accumulator carries the syntax
+context of the level that created it — so the levels do not shadow each other.
+
+```rust ! macros.rs
 /// Parses the first matching syntax rule using `try_parse()` or returns an
 /// error listing all of them if none match.
 macro_rules! parse_one_of {
     ( $p:expr, [ $( @ $varname:ident, )* $first_rule:expr $(, $rule:expr )* $(,)? ] $(,)? ) => {
         {
+            // !mark
             let this_var_is_unique = $first_rule;
             parse_one_of!(
                 $p,
@@ -26,8 +55,29 @@ macro_rules! parse_one_of {
             )
         }
     };
+```
+
+## !!steps The chain, and the error that lists everything
+
+Once no unbound rules remain, only this arm can match — it requires every entry
+to be `@`-prefixed — and it emits the actual parse attempt. `None` seeded into a
+chain of `.or_else()` calls tries each rule in source order and stops at the
+first `Some`.
+
+Stopping at the first `Some` is the important part, because
+[try_parse](/docs/quadratic-core/src/formulas/parser/mod.rs) is three-valued:
+`None` means the rule's prefix did not match, so move on; `Some(Ok)` is a
+successful parse; and `Some(Err)` means the prefix *did* match but the rule then
+failed — that error is returned rather than being masked by a later alternative.
+Rules are passed by reference (`&$varname`) so they survive to be stringified,
+and if every prefix missed, `unwrap_or_else` builds one error from all of their
+names via `join_with_conjunction` in [util.rs](/docs/quadratic-core/src/util.rs),
+which renders them as "a, b, or c".
+
+```rust ! macros.rs
     ( $p:expr, [ $( @ $varname:ident, )+ ], ) => {
         None
+            // !mark(1:2)
             $( .or_else(|| $p.try_parse(&$varname)) )+
             .unwrap_or_else(|| $p.expected(
                 crate::util::join_with_conjunction("or", &[
@@ -36,4 +86,15 @@ macro_rules! parse_one_of {
             ))
     };
 }
-````
+```
+
+</Scrollycoding>
+
+The `to_string()` call in the error path is why `SyntaxRule` requires
+`fmt::Display` — see the trait definition in
+[rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs), which
+also provides the `SyntaxRule` implementation for references that makes
+`&$varname` work. The cursor rewinding that lets a failed alternative be retried
+lives in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs), and
+the resulting `Expected` message is defined in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

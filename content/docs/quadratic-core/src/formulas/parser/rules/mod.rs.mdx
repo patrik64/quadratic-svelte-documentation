@@ -1,15 +1,23 @@
 ---
 title: "mod.rs"
-description: "Rust module mod.rs of the quadratic-core formula engine."
+description: "The SyntaxRule trait — the two-method interface every formula grammar production implements, plus blanket impls for tokens and boxes."
 source: "quadratic-core/src/formulas/parser/rules/mod.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The formula parser is a hand-written recursive-descent parser, but the recursion is not spelled out as a pile of mutually recursive functions. Instead every grammar production is a *type* that implements one small trait, `SyntaxRule`, and the [Parser](/docs/quadratic-core/src/formulas/parser/mod.rs) drives those types. This 69-line module defines that trait and wires the three rule files together.
 
-````rust mod.rs -n
+Because rules are values rather than functions, they compose: a rule can be wrapped, mapped, boxed, or stored in a list of alternatives. That is what makes the combinators in [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs) possible.
+
+<Scrollycoding>
+
+## !!steps One module, three grammar files
+
+The `rules` module is split by what a rule *is*: [atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs) holds leaf rules that consume a single token (string literals, numbers, cell references), [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs) holds rules built out of other rules, and [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs) holds the operator-precedence machinery.
+
+All three are re-exported flat with `pub use ... ::*`, so callers write `rules::Expression` and never name the submodule. The `use super::*` line pulls in `Parser`, `Token`, `Span`, `FormulaResult` and the AST types from the parent parser module.
+
+```rust ! mod.rs
 use std::fmt;
 
 mod atoms;
@@ -20,7 +28,15 @@ use super::*;
 pub use atoms::*;
 pub use combinators::*;
 pub use expression::*;
+```
 
+## !!steps The two-method contract
+
+`SyntaxRule` has an associated `Output` type — what the rule produces, usually an `AstNode` — and exactly two required methods.
+
+`prefix_matches` is a cheap lookahead: it takes the `Parser` **by value** (it is `Copy`), so a rule can freely advance the copy to peek without disturbing the real cursor. The doc comment states the invariant that binds the two methods together: if `consume_match` would return `Ok`, then `prefix_matches` must return true. `consume_match` does the real work against `&mut Parser` and, as the comment warns, does *not* restore the cursor when it fails — rewinding is the caller's job.
+
+```rust ! mod.rs
 /// A grammar rule that produces an AST node from tokens.
 pub trait SyntaxRule: fmt::Debug + fmt::Display {
     /// AST node type that this rule outputs.
@@ -29,10 +45,25 @@ pub trait SyntaxRule: fmt::Debug + fmt::Display {
     /// Returns whether if it appears that the user is trying to form this
     /// construct (generally returns true if the first token matches). If
     /// `consume_match()` returns `Ok`, this function MUST return true.
+    // !mark
     fn prefix_matches(&self, p: Parser<'_>) -> bool;
     /// Consumes the tokens that are part of this syntax structure, returning
     /// the AST node produced. Does NOT restore the `Parser` if matching fails.
+    // !mark
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output>;
+    // ...
+}
+```
+
+## !!steps Mapping a rule to a different output
+
+The one provided method, `map`, wraps a rule in a `TokenMapper` that matches the same tokens but runs `f` over the result. It is the adapter that lets a single rule serve several roles.
+
+You can see why it matters in `List::consume_match`, which writes `self.inner.map(Some)` and `self.end.map(|_| None)` so two rules with different outputs can be tried as alternatives of one `Option` type, and in `ParenExpression`, which maps a parsed expression into `ast::AstNodeContents::Paren`. `TokenMapper` itself lives in [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs).
+
+```rust ! mod.rs
+pub trait SyntaxRule: fmt::Debug + fmt::Display {
+    // ...
 
     /// Applies a function to the output of this syntax rule.
     fn map<B, F: Fn(Self::Output) -> B>(self, f: F) -> TokenMapper<Self, F>
@@ -42,18 +73,15 @@ pub trait SyntaxRule: fmt::Debug + fmt::Display {
         TokenMapper { inner: self, f }
     }
 }
+```
 
-impl<O, T: SyntaxRule<Output = O> + ?Sized> SyntaxRule for Box<T> {
-    type Output = O;
+## !!steps Every token is already a rule
 
-    fn prefix_matches(&self, p: Parser<'_>) -> bool {
-        self.as_ref().prefix_matches(p)
-    }
-    fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
-        self.as_ref().consume_match(p)
-    }
-}
+The base case of the whole grammar: `Token` implements `SyntaxRule` directly, matching only itself and producing `()`. That is why rules elsewhere can write `p.parse(Token::LBrace)?` or `p.try_parse(Token::CellRangeOp)` with no wrapper type at all — a bare token *is* a production.
 
+The failure path calls `p.expected(self)`, which builds a "expected X" error using the token's `Display` impl (from [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs)) — the same mechanism every other rule uses, which is why the trait requires `fmt::Display` as a supertrait.
+
+```rust ! mod.rs
 // Any `Token` is a `SyntaxRule` that matches only itself.
 impl SyntaxRule for Token {
     type Output = ();
@@ -69,6 +97,26 @@ impl SyntaxRule for Token {
         }
     }
 }
+```
+
+## !!steps Rules behind a pointer
+
+Two forwarding impls make the trait usable through indirection. `Box<T>` works even for `?Sized` inner rules, so a boxed trait object stays a rule; `&T` forwards as well, which is what lets `Parser::parse` call `self.try_parse(&rule)` without consuming the rule value it still needs for the error message.
+
+Both impls just delegate to the inner rule and inherit its `Output`, so wrapping a rule never changes what it parses.
+
+```rust ! mod.rs
+impl<O, T: SyntaxRule<Output = O> + ?Sized> SyntaxRule for Box<T> {
+    type Output = O;
+
+    fn prefix_matches(&self, p: Parser<'_>) -> bool {
+        self.as_ref().prefix_matches(p)
+    }
+    fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
+        self.as_ref().consume_match(p)
+    }
+}
+// ...
 impl<T: SyntaxRule> SyntaxRule for &T {
     type Output = T::Output;
 
@@ -79,4 +127,8 @@ impl<T: SyntaxRule> SyntaxRule for &T {
         (*self).consume_match(p)
     }
 }
-````
+```
+
+</Scrollycoding>
+
+The trait defined here is consumed by [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs), whose `parse` and `try_parse` methods are the only places that call `prefix_matches` and `consume_match` in sequence. The concrete rules live in [atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs), [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs) and [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs); the `parse_one_of!` helper they lean on is in [macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs), and the `impl_display!` macro that satisfies this trait's `Display` bound comes from [util.rs](/docs/quadratic-core/src/util.rs). The nodes they build are described in [ast.rs](/docs/quadratic-core/src/formulas/ast.rs).

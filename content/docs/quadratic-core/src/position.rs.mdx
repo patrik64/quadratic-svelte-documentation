@@ -1,21 +1,44 @@
 ---
 title: "position.rs"
-description: "Cell position {x, y}."
+description: "The Pos type: a two-field i64 cell coordinate exported to JavaScript, with quadrant math and a Display impl."
 source: "quadratic-core/src/position.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Thirty-nine lines defining `Pos`, the coordinate every other part of
+quadratic-core speaks in. The grid is infinite in all four directions, so both
+fields are signed `i64` rather than unsigned indices — column `-3` is as valid
+as column `3`.
 
-````rust position.rs -n
+`Pos` is re-exported from the crate root and used all over
+[lib.rs](/docs/quadratic-core/src/lib.rs): as the base position a formula is
+parsed and evaluated against, and as the key type of the set of accessed cells
+that `JsGridProxy` accumulates.
+
+<Scrollycoding>
+
+## !!steps The Pos struct
+
+The derive list is doing real work here, not just ceremony. `Hash` and `Eq`
+are what let `JsGridProxy` keep a `HashSet<Pos>` of accessed cells;
+`Ord`/`PartialOrd` give a deterministic ordering; `Copy` means a position is
+passed by value everywhere and never needs borrowing; `Serialize` and
+`Deserialize` let it travel as JSON.
+
+`#[wasm_bindgen]` on the struct exports it as a real JavaScript class rather
+than a plain object — the generated `quadratic_core.d.ts` declares a `Pos`
+class whose `x` and `y` are `bigint`, since `i64` has no lossless `number`
+representation. The doc comments on the fields survive that trip and show up
+in the generated declarations.
+
+```rust ! position.rs
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use wasm_bindgen::prelude::*;
 
 /// Cell position {x, y}.
 #[derive(
+    // !mark
     Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd,
 )]
 #[wasm_bindgen]
@@ -25,8 +48,26 @@ pub struct Pos {
     /// Row
     pub y: i64,
 }
+```
+
+## !!steps A constructor for JavaScript
+
+The type has two `impl` blocks, and the split is deliberate: only the first is
+annotated with `#[wasm_bindgen]`, so only what it contains is exported. Inside
+it, `#[wasm_bindgen(constructor)]` marks `new` as the JavaScript `constructor`,
+which is why the generated bindings offer `new Pos(x, y)` instead of a free
+function.
+
+Everything else lives in a plain `impl` block that wasm-bindgen never sees —
+starting with `ORIGIN`, an associated constant for the centre of the grid.
+Associated constants are not part of the wasm-bindgen surface anyway, and
+keeping them out of the exported block avoids constraining their signatures to
+types the bridge can carry.
+
+```rust ! position.rs
 #[wasm_bindgen]
 impl Pos {
+    // !mark
     #[wasm_bindgen(constructor)]
     pub fn new(x: i64, y: i64) -> Self {
         Self { x, y }
@@ -35,9 +76,29 @@ impl Pos {
 impl Pos {
     pub const ORIGIN: Self = Self { x: 0, y: 0 };
 
+    // ...
+```
+
+## !!steps Quadrants and display
+
+The grid is bucketed into square blocks of `QUADRANT_SIZE` (16, declared in
+[lib.rs](/docs/quadratic-core/src/lib.rs)), and `quadrant` maps a position to
+the block that contains it. The key detail is `div_euclid` rather than plain
+`/`: Rust's division truncates toward zero, so `-1 / 16` would be `0` and the
+cells just left of the origin would share a quadrant with the ones just right
+of it. Euclidean division floors toward negative infinity instead, giving
+`-1` — blocks of exactly 16 on both sides of the axis. The `as _` lets the
+compiler infer the cast of `QUADRANT_SIZE` from `u64` to `i64`.
+
+The `Display` impl closes the file, rendering a position in the familiar
+parenthesised form so a `Pos` can be dropped straight into a formatted string
+or a debug message.
+
+```rust ! position.rs
     /// Returns which quadrant the cell position is in.
     pub fn quadrant(self) -> (i64, i64) {
         (
+            // !mark(1:2)
             self.x.div_euclid(crate::QUADRANT_SIZE as _),
             self.y.div_euclid(crate::QUADRANT_SIZE as _),
         )
@@ -49,4 +110,17 @@ impl fmt::Display for Pos {
         write!(f, "({}, {})", self.x, self.y)
     }
 }
-````
+```
+
+</Scrollycoding>
+
+`Pos` pairs with [cell.rs](/docs/quadratic-core/src/cell.rs), which describes
+what sits at a position, and underpins the A1 reference types in
+[cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs) — a `CellRef`
+resolves against a base `Pos` to produce an absolute one. The
+[GridProxy](/docs/quadratic-core/src/formulas/grid_proxy.rs) trait takes a
+`Pos` as the sole argument of its `get` method. On the app side the same
+coordinate is the `Coordinate` type in
+[types.ts](/docs/src/lib/core/types.ts), and
+[a1.ts](/docs/src/lib/core/a1.ts) converts between coordinates and the `nB7`
+style A1 notation.

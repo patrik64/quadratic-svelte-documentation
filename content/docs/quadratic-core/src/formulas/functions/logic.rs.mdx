@@ -1,21 +1,49 @@
 ---
 title: "logic.rs"
-description: "Rust module logic.rs of the quadratic-core formula engine."
+description: "Boolean logic, IF, and the IS type predicates — the fold seeds, strict boolean coercion, and lazy error forms behind them"
 source: "quadratic-core/src/formulas/functions/logic.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This is the "Logic functions" category: the boolean constants, the `NOT`,
+`AND`, `OR`, and `XOR` combinators, `IF`, the two error-observing forms, and
+the small family of `IS` type predicates. Fourteen functions, none of them
+longer than a dozen lines, because all the machinery lives elsewhere.
 
-````rust logic.rs -n
+The module follows the same registration contract as every sibling: a
+`CATEGORY` constant whose `get_functions` pointer returns the vector of
+`FormulaFunction` values that
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) folds
+into the global registry. Each `eval` is built by one of the three
+constructors in
+[util.rs](/docs/quadratic-core/src/formulas/functions/util.rs) — `constant_fn`
+for the constants, `array_mapped` for fixed-arity functions that should
+broadcast over arrays, and `pure_fn` for the variadic ones.
+
+<Scrollycoding>
+
+## !!steps The category and what counts as a boolean
+
+The category docs shown in the formula editor describe Excel's truthiness
+rules: `FALSE` and `0` are falsey, everything else is truthy, and `TRUE`
+behaves as `1` in numeric context.
+
+The numeric half of that is real — `Value::to_number` in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs) maps `TRUE` to `1.0`
+and `FALSE` to `0.0` — but the conversion in the other direction is stricter
+than the text suggests. `Value::to_bool` accepts only a `Value::Bool` and the
+case-insensitive strings `TRUE` and `FALSE`; every other value, numbers
+included, produces an `Expected boolean` error. That single rule explains most
+of the behavior in the steps below.
+
+```rust ! logic.rs
 use super::*;
 
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
     name: "Logic functions",
+    // !mark(1:6)
     docs: "These functions treat `FALSE` and `0` as \
            \"falsey\" and all other values are \"truthy.\"\
            \n\n\
@@ -27,12 +55,30 @@ pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
 
 fn get_functions() -> Vec<FormulaFunction> {
     vec![
+```
+
+## !!steps Constants, and the shape of an entry
+
+`TRUE` and `FALSE` are the simplest entries in the whole library:
+`util::constant_fn` returns the value and rejects any arguments at all, so
+`TRUE()` works and `TRUE(1)` is a `BadArgumentCount` error. Everything above
+`eval` is editor metadata — `arg_completion` is the snippet inserted on
+autocomplete, `usages` and `examples` feed the hover documentation assembled
+by `lsp_full_docs`.
+
+`NOT` introduces the other pattern: `util::array_mapped` over a single
+argument, which means it broadcasts elementwise over an array and inherits
+`to_bool`'s strictness. `NOT(A1)` on a cell holding the text `TRUE` works;
+on a cell holding `1` it errors.
+
+```rust ! logic.rs
         FormulaFunction {
             name: "TRUE",
             arg_completion: "",
             usages: &[""],
             examples: &["TRUE()"],
             doc: "Returns `TRUE`.",
+            // !mark
             eval: util::constant_fn(Value::Bool(true)),
         },
         FormulaFunction {
@@ -50,16 +96,30 @@ fn get_functions() -> Vec<FormulaFunction> {
             examples: &["NOT(A113)"],
             doc: "Returns `TRUE` if `a` is falsey and \
                   `FALSE` if `a` is truthy.",
+            // !mark
             eval: util::array_mapped(|[a]| Ok(Value::Bool(!a.to_bool()?))),
         },
+```
+
+## !!steps Three folds over a flattened bag of booleans
+
+`AND`, `OR`, and `XOR` are variadic, so they use `pure_fn` and iterate the raw
+argument list through `util::flat_iter_bools`. That helper flattens arrays and
+*drops* every value that will not convert — so a range of numbers contributes
+nothing at all, and a blank cell is likewise skipped. None of the three
+short-circuits: `&`, `|`, and `^` on `bool` are non-lazy, so the fold always
+consumes the entire iterator.
+
+The seeds are where they differ, and where `OR` diverges from its own
+documentation. `AND` folds `&` from `true` and `XOR` folds `^` from `false`,
+which give the documented identities. `OR` folds `|` from `true` — and
+`true | b` is `true` for every `b`, so as written `OR` returns `TRUE` for any
+input, including the empty case its doc string says should be `FALSE`.
+
+```rust ! logic.rs
         FormulaFunction {
             name: "AND",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["AND(A1:C1)", "AND(A1, B12)"],
-            doc: "Returns `TRUE` if all values are truthy \
-                  and `FALSE` if any values is falsey.\n\\
-                  Returns `TRUE` if given no values.",
+            // ...
             eval: util::pure_fn(|args| {
                 Ok(Value::Bool(
                     util::flat_iter_bools(&args.inner).fold(true, |a, b| a & b),
@@ -68,33 +128,41 @@ fn get_functions() -> Vec<FormulaFunction> {
         },
         FormulaFunction {
             name: "OR",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["OR(A1:C1)", "OR(A1, B12)"],
-            doc: "Returns `TRUE` if any value is truthy \
-                  and `FALSE` if any value is falsey.\n\
-                  Returns `FALSE` if given no values.",
+            // ...
             eval: util::pure_fn(|args| {
                 Ok(Value::Bool(
+                    // !mark
                     util::flat_iter_bools(&args.inner).fold(true, |a, b| a | b),
                 ))
             }),
         },
         FormulaFunction {
             name: "XOR",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["XOR(A1:C1)", "XOR(A1, B12)"],
-            doc: "Returns `TRUE` if an odd number of values \
-                  are truthy and `FALSE` if an even number \
-                  of values are truthy.\n\
-                  Returns `FALSE` if given no values.",
+            // ...
             eval: util::pure_fn(|args| {
                 Ok(Value::Bool(
                     util::flat_iter_bools(&args.inner).fold(false, |a, b| a ^ b),
                 ))
             }),
         },
+```
+
+## !!steps IF picks a value, it does not choose a branch
+
+`IF` takes exactly three arguments — there is no two-argument form — and is
+built with `array_mapped`, so it broadcasts: if `cond` is a range, the result
+is an array with one selection per element, and `t` and `f` may be ranges of
+the same size.
+
+The important consequence of using `array_mapped` is that `IF` is *not* lazy.
+Arguments are evaluated eagerly by the evaluator in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) before any function runs,
+so both branches have already been computed by the time this closure picks
+one, and an error in the discarded branch still fails the whole formula.
+`cond` goes through `to_bool`, so it must already be a boolean — which is why
+the examples all pass a comparison such as `A2<0` rather than a number.
+
+```rust ! logic.rs
         FormulaFunction {
             name: "IF",
             arg_completion: "${1:cond}, ${2:t}, ${3:f}",
@@ -104,10 +172,29 @@ fn get_functions() -> Vec<FormulaFunction> {
                 "IF(A2<0, \"A2 is negative\", IF(A2>0, \"A2 is positive\", \"A2 is zero\"))",
             ],
             doc: "Returns `t` if `cond` is truthy and `f` if `cond` if falsey.",
+            // !mark
             eval: util::array_mapped(|[cond, t, f]| {
                 Ok(if cond.to_bool()? { t.inner } else { f.inner })
             }),
         },
+```
+
+## !!steps IFERROR and ISERROR live in the evaluator
+
+These two functions cannot work through the normal path: eager argument
+evaluation means an error in the argument aborts the call before the function
+body ever runs. So they are implemented as lazy special forms in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs), matched by name before the
+generic `FunctionCall` arm — `IFERROR` evaluates its first argument and falls
+back to the second only on `Err`, and `ISERROR` evaluates its argument and
+reports whether the result was an error.
+
+The registrations here exist so that the editor still offers completions and
+hover docs for both names, and their `eval` bodies are the never-reached
+fallbacks: `IFERROR` returns its first argument (or `BadArgumentCount` when
+given none) and `ISERROR` unconditionally returns `FALSE`.
+
+```rust ! logic.rs
         // IFERROR and ISERROR are lazy special forms evaluated directly in
         // ast.rs (an error in their argument must not propagate); these
         // registrations exist for docs and completions only.
@@ -118,6 +205,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             examples: &["IFERROR(1/A5, \"error!\")"],
             doc: "Returns `value` unless evaluating it produces an error, \
                   in which case it returns `fallback`.",
+            // !mark(1:6)
             eval: util::pure_fn(|args| {
                 args.inner
                     .into_iter()
@@ -134,26 +222,39 @@ fn get_functions() -> Vec<FormulaFunction> {
             doc: "Returns `TRUE` if evaluating `value` produces an error.",
             eval: util::pure_fn(|_| Ok(Value::Bool(false))),
         },
+```
+
+## !!steps Three type predicates that inspect the value directly
+
+These are the only functions in the file that pattern-match on `Value` rather
+than coercing. `ISBLANK` is true only for an empty `Value::String`, which is
+exactly how an unset cell arrives: `Ctx::get_cell` in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) reads the grid and falls
+back to `String::default()`.
+
+`ISNUMBER` and `ISTEXT` are deliberately complementary rather than mutually
+exclusive by type: numeric-looking *text* counts as a number, because
+`ISNUMBER` accepts any non-blank string that `to_number` can parse, and
+`ISTEXT` requires a non-empty string that `to_number` rejects. A value that is
+neither — an array or a boolean, say — makes both return `FALSE`. Note the
+guard difference: `ISNUMBER` trims before checking for emptiness, so a string
+of spaces is not a number, while `ISTEXT` only checks `is_empty`.
+
+```rust ! logic.rs
         FormulaFunction {
             name: "ISBLANK",
-            arg_completion: "${1:value}",
-            usages: &["value"],
-            examples: &["ISBLANK(A1)"],
-            doc: "Returns `TRUE` if `value` is empty.",
+            // ...
             eval: util::array_mapped(|[v]| {
                 Ok(Value::Bool(matches!(&v.inner, Value::String(s) if s.is_empty())))
             }),
         },
         FormulaFunction {
             name: "ISNUMBER",
-            arg_completion: "${1:value}",
-            usages: &["value"],
-            examples: &["ISNUMBER(A1)"],
-            doc: "Returns `TRUE` if `value` is a number or a string that \
-                  can be read as a number.",
+            // ...
             eval: util::array_mapped(|[v]| {
                 let is_number = match &v.inner {
                     Value::Number(_) => true,
+                    // !mark
                     Value::String(s) if !s.trim().is_empty() => v.inner.to_number().is_ok(),
                     _ => false,
                 };
@@ -162,25 +263,38 @@ fn get_functions() -> Vec<FormulaFunction> {
         },
         FormulaFunction {
             name: "ISTEXT",
-            arg_completion: "${1:value}",
-            usages: &["value"],
-            examples: &["ISTEXT(A1)"],
-            doc: "Returns `TRUE` if `value` is non-empty text that cannot \
-                  be read as a number.",
+            // ...
             eval: util::array_mapped(|[v]| {
                 let is_text = match &v.inner {
+                    // !mark
                     Value::String(s) if !s.is_empty() => v.inner.to_number().is_err(),
                     _ => false,
                 };
                 Ok(Value::Bool(is_text))
             }),
         },
+```
+
+## !!steps Parity, after rounding
+
+`ISEVEN` and `ISODD` round to the nearest integer first — as their doc strings
+say, they report whether the number *rounds to* an even or odd integer — then
+take the remainder modulo 2.
+
+The two are not written as each other's negation, and the difference matters
+for negative inputs: Rust's `%` keeps the sign of the dividend, so `-3 % 2` is
+`-1`. Testing `!= 0` for odd therefore works where testing `== 1` would not,
+and the two functions agree on every value that reaches them. Non-numeric
+input errors in `to_number` for both.
+
+```rust ! logic.rs
         FormulaFunction {
             name: "ISEVEN",
             arg_completion: "${1:number}",
             usages: &["number"],
             examples: &["ISEVEN(4)"],
             doc: "Returns `TRUE` if `number` rounds to an even integer.",
+            // !mark
             eval: util::array_mapped(|[n]| {
                 Ok(Value::Bool((n.to_number()?.round() as i64) % 2 == 0))
             }),
@@ -191,37 +305,45 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &["number"],
             examples: &["ISODD(3)"],
             doc: "Returns `TRUE` if `number` rounds to an odd integer.",
+            // !mark
             eval: util::array_mapped(|[n]| {
                 Ok(Value::Bool((n.to_number()?.round() as i64) % 2 != 0))
             }),
         },
-    ]
-}
+```
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+</Scrollycoding>
 
-    #[test]
-    fn test_formula_if() {
-        let form = parse_formula("IF(A1=2, 'yep', 'nope')", pos![A0]).unwrap();
+## Implemented functions
 
-        let mut g = FnGrid(|pos| {
-            Some(match (pos.x, pos.y) {
-                (0, 1) => "2".to_string(),
-                (1, 1) => "16".to_string(),
-                _ => panic!("cell {pos} shouldn't be accessed"),
-            })
-        });
+| Name | Purpose |
+| --- | --- |
+| TRUE | Returns the boolean `TRUE`; takes no arguments |
+| FALSE | Returns the boolean `FALSE`; takes no arguments |
+| NOT | Negates one boolean argument, broadcasting over arrays |
+| AND | `TRUE` when every convertible boolean value is true; `TRUE` when given none |
+| OR | Folds `or` from a `true` seed, so it returns `TRUE` for any input |
+| XOR | `TRUE` when an odd number of convertible boolean values are true |
+| IF | Selects between two already-evaluated values based on a boolean condition |
+| IFERROR | Value unless evaluating it errors, otherwise the fallback; lazy form in `ast.rs` |
+| ISERROR | `TRUE` when evaluating the argument produces an error; lazy form in `ast.rs` |
+| ISBLANK | `TRUE` for an empty string value, which is how blank cells are represented |
+| ISNUMBER | `TRUE` for a number, or non-blank text that parses as a number |
+| ISTEXT | `TRUE` for non-empty text that does not parse as a number |
+| ISEVEN | `TRUE` when the number rounds to an even integer |
+| ISODD | `TRUE` when the number rounds to an odd integer |
 
-        assert_eq!(
-            "yep".to_string(),
-            form.eval_blocking(&mut g, pos![A0]).unwrap().to_string(),
-        );
-        assert_eq!(
-            "nope".to_string(),
-            form.eval_blocking(&mut g, pos![B0]).unwrap().to_string(),
-        );
-    }
-}
-````
+The file's test module covers `IF` end to end, parsing
+`IF(A1=2, 'yep', 'nope')` once and evaluating it from two different cells
+against a stub grid, which also exercises relative cell references.
+
+The constructors used by every entry here are documented in
+[util.rs](/docs/quadratic-core/src/formulas/functions/util.rs); the registry
+and the `FormulaFunction` fields in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs); the
+`to_bool` and `to_number` rules that decide what these functions accept in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs); and the eager
+evaluation and lazy special forms in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs). The comparison operators
+that usually produce the booleans fed to `IF` and `NOT` are in
+[operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs).

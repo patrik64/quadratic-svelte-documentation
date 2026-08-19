@@ -1,15 +1,37 @@
 ---
 title: "mod.rs"
-description: "Language server implementation for Monaco editor"
+description: "The formula language server: builds Monaco-shaped completion items and hover docs from the function registry and exports them to JavaScript"
 source: "quadratic-core/src/formulas/lsp/mod.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Everything the formula editor knows about formula functions comes from here.
+The module's own doc comment calls it a "language server implementation for
+Monaco editor", and it exports two `wasm_bindgen` entry points whose names match
+Monaco's completion and hover provider callbacks: `provideCompletionItems` and
+`provideHover`.
 
-````rust mod.rs -n
+The SvelteKit app does not run Monaco, but it does import
+`provideCompletionItems` — [runFormula.ts](/docs/src/lib/formulas/runFormula.ts)
+calls it with four `undefined` arguments and caches the resulting suggestion
+list, which [CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte)
+filters by prefix to drive its own autocomplete popup. `provideHover` is
+exported but currently has no caller on the TypeScript side.
+
+<Scrollycoding>
+
+## !!steps A language server over the function registry
+
+The module pulls in `functions` from its parent — the formula function registry
+in [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) — and
+re-exports everything from its `types` submodule, so the Monaco wire types are
+available as `lsp::CompletionItem` and friends.
+
+The `extern "C"` block binds `JSON.stringify` from JavaScript. Nothing in this
+file calls it; the responses are serialized with `serde_wasm_bindgen` instead,
+which converts straight to a `JsValue` without a string round-trip.
+
+```rust ! mod.rs
 //! Language server implementation for Monaco editor
 
 use itertools::Itertools;
@@ -23,15 +45,31 @@ pub use types::*;
 
 use super::functions;
 
+// !mark(1:4)
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = JSON)]
     fn stringify(value: &JsValue) -> String;
 }
+```
 
+## !!steps Two response envelopes
+
+Monaco expects a completion provider to return an object with a `suggestions`
+array, and a hover provider to return an object with a `contents` array. These
+two private structs are those envelopes, and they are the only reason the module
+needs `Serialize`.
+
+`CompletionList` borrows its slice (`&'a [CompletionItem]`) rather than owning
+it, which is what lets the export serialize the cached static list without
+cloning it on every keystroke. Both carry `rename_all = "camelCase"` so the
+field names cross the boundary in the shape JavaScript expects.
+
+```rust ! mod.rs
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct CompletionList<'a> {
+    // !mark
     suggestions: &'a [CompletionItem],
 }
 
@@ -40,10 +78,24 @@ struct CompletionList<'a> {
 struct Hover {
     contents: Vec<MarkdownString>,
 }
+```
 
+## !!steps The suggestion list, built once
+
+`lazy_static!` means this vector is constructed on first access and reused for
+the life of the WASM instance — the registry is static, so there is nothing to
+recompute.
+
+The pipeline walks every category, keeps the ones flagged
+`include_in_completions` (a separate switch from the `include_in_docs` flag that
+[docgen.rs](/docs/quadratic-core/src/bin/docgen.rs) reads), flattens each
+category's functions, and maps each one to a `CompletionItem`.
+
+```rust ! mod.rs
 lazy_static! {
     static ref FUNCTION_COMPLETION_ITEMS: Vec<CompletionItem> = functions::CATEGORIES
         .iter()
+        // !mark
         .filter(|category| category.include_in_completions)
         .flat_map(|category| (category.get_functions)())
         .map(|f| CompletionItem {
@@ -59,9 +111,55 @@ lazy_static! {
         })
         .collect();
 }
+```
 
+## !!steps What one suggestion carries
+
+Each field maps to a piece of the editor's popup. `label` is the function name
+you match against. `detail` is every usage signature joined by newlines — the
+editor shows the first line under the name. `documentation` is the Markdown
+`lsp_full_docs()` produces, a `# Description` section followed by a
+`# Examples` list.
+
+`insert_text` is `autocomplete_snippet()`, which is the name plus the function's
+`arg_completion` string — TextMate-style placeholders like
+`${1:array}, ${2:include}`. Declaring `INSERT_AS_SNIPPET` is what tells the
+editor to expand those placeholders instead of inserting them literally;
+`CodeEditor.svelte` implements that expansion itself in `expandSnippet`,
+selecting the first placeholder after insertion.
+
+```rust ! mod.rs
+        .map(|f| CompletionItem {
+            detail: Some(f.usages_strings().join("\n")),
+            documentation: Some(Documentation::Markdown(MarkdownString {
+                value: f.lsp_full_docs(),
+            })),
+            // !mark(1:2)
+            insert_text: Some(f.autocomplete_snippet()),
+            insert_text_rules: Some(CompletionItemInsertTextRule::INSERT_AS_SNIPPET),
+            kind: CompletionItemKind::Function,
+            label: f.name.to_string(),
+            ..Default::default()
+        })
+        .collect();
+}
+```
+
+## !!steps The completion export
+
+The exported name is set explicitly with `js_name`, because Rust's snake case
+would otherwise reach JavaScript as `provide_completion_items` and Monaco's
+provider interface wants `provideCompletionItems`.
+
+All four Monaco arguments are ignored — note the leading underscores. This
+provider is context-free: it always returns the complete function list and lets
+the editor do the filtering, which is exactly why the SvelteKit app can call it
+with `undefined` for every argument and still get a usable list.
+
+```rust ! mod.rs
 #[wasm_bindgen(js_name = "provideCompletionItems")]
 pub fn provide_completion_items(
+    // !mark(1:4)
     _text_model: JsValue,
     _position: JsValue,
     _context: JsValue,
@@ -71,20 +169,52 @@ pub fn provide_completion_items(
         suggestions: &FUNCTION_COMPLETION_ITEMS,
     })?)
 }
+```
 
+## !!steps Hover, the one place that reaches back into JavaScript
+
+`provide_hover` is `async` and does use its arguments. The `jsexpr!` macro from
+[util.rs](/docs/quadratic-core/src/util.rs) expands the JavaScript-shaped
+expression into `js_sys` reflection calls: it invokes `getWordAtPosition` on the
+Monaco text model, then reads the `word` property off the result.
+
+That word — if it is a string — goes through `functions::lookup_function`, which
+uppercases the name before looking it up, so hovering `sum` finds `SUM`. When
+nothing matches, the function returns `JsValue::NULL`, which is how a Monaco
+hover provider says "no tooltip here".
+
+```rust ! mod.rs
 #[wasm_bindgen(js_name = "provideHover")]
 pub async fn provide_hover(
     text_model: JsValue,
     position: JsValue,
     _token: JsValue,
 ) -> Result<JsValue, JsValue> {
+    // !mark
     let function = jsexpr!(text_model.getWordAtPosition(position).word)
         .as_string()
         .and_then(|name| functions::lookup_function(&name));
 
+    // ...
+}
+```
+
+## !!steps Rendering the tooltip
+
+A match produces a single `MarkdownString`: each usage signature on its own
+line wrapped in backticks, then the same `lsp_full_docs()` Markdown the
+completion items carry. So the hover card is the signature list plus the
+description and examples.
+
+The result is serialized with `serde_wasm_bindgen::to_value`, and the `?` on it
+is why the return type is `Result<JsValue, JsValue>` — a serialization failure
+surfaces on the JavaScript side as a thrown value rather than a Rust panic.
+
+```rust ! mod.rs
     match function {
         Some(function) => Ok(serde_wasm_bindgen::to_value(&Hover {
             contents: vec![MarkdownString {
+                // !mark(1:4)
                 value: function
                     .usages_strings()
                     .map(|s| format!("`{s}`\n"))
@@ -95,4 +225,17 @@ pub async fn provide_hover(
         None => Ok(JsValue::NULL),
     }
 }
-````
+```
+
+</Scrollycoding>
+
+The `CompletionItem`, `Documentation`, `MarkdownString`,
+`CompletionItemKind` and `CompletionItemInsertTextRule` types used throughout
+are defined next door in [types.rs](/docs/quadratic-core/src/formulas/lsp/types.rs).
+The registry they are built from lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), and the
+same data takes a second, offline route out of the crate through
+[docgen.rs](/docs/quadratic-core/src/bin/docgen.rs). On the app side, see
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) for the WASM glue and
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) for the popup
+that consumes it.

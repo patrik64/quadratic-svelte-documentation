@@ -1,15 +1,38 @@
 ---
 title: "docgen.rs"
-description: "Rust module docgen.rs of the quadratic-core formula engine."
+description: "A 30-line side binary that walks the formula function registry and dumps a Markdown reference table to formula_docs_output.md"
 source: "quadratic-core/src/bin/docgen.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`quadratic-core` builds as a library (a `cdylib` for WASM plus an `rlib`), but
+`Cargo.toml` also declares a second target: a `docgen` binary pointed at this
+file. It is a developer tool, not part of the app — the crate's README says to
+run `cargo run --bin docgen` and then copy/paste the generated
+`formula_docs_output.md` into Notion.
 
-````rust docgen.rs -n
+Its input is the same function registry the formula engine itself uses, so the
+generated reference can never drift from the implemented functions: add a
+function to a category in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) and it
+shows up here on the next run.
+
+<Scrollycoding>
+
+## !!steps One category at a time
+
+`main` builds the whole document in a single `String`. It iterates
+`functions::CATEGORIES` — the fixed list of twelve category descriptors
+(operators, mathematics, trigonometry, statistics, and so on) — and skips any
+whose `include_in_docs` flag is false.
+
+That flag matters because a `FormulaFunctionCategory` also carries
+`include_in_completions`, which the editor's autocomplete uses. The two are
+separate switches: a category can be offered in the formula editor without
+appearing in the written reference, or the reverse. Each included category
+contributes an `h2` with its name followed by its prose `docs` blurb.
+
+```rust ! docgen.rs
 use itertools::Itertools;
 
 const OUT_FILENAME: &str = "formula_docs_output.md";
@@ -18,26 +41,74 @@ fn main() {
     let mut output = String::new();
 
     for category in quadratic_core::formulas::functions::CATEGORIES {
+        // !mark
         if !category.include_in_docs {
             continue;
         }
 
         output.push_str(&format!("## {}\n\n", category.name));
         output.push_str(category.docs);
+```
 
+## !!steps A two-column table per category
+
+Each category emits a hand-written Markdown table header, then one row per
+function returned by `(category.get_functions)()` — a function pointer on the
+descriptor, so the list is built on demand rather than stored.
+
+A function may have several usages (different arity, optional arguments), so
+`usages_strings()` yields one `NAME(args)` string per usage; each is wrapped in
+backticks and the set is joined with `; ` to stay inside a single table cell.
+The doc string gets its newlines flattened to spaces for the same reason — a
+raw newline would break the Markdown row.
+
+```rust ! docgen.rs
         // Table header.
         output.push_str("| **Function** | **Description** |\n");
         output.push_str("| ------------ | --------------- |\n");
         for func in (category.get_functions)() {
+            // !mark(1:2)
             let usages = func.usages_strings().map(|s| format!("`{s}`")).join("; ");
             let doc = func.doc.replace('\n', " ");
             output.push_str(&format!("| {usages} | {doc} |\n"));
         }
         output.push('\n');
     }
+```
+
+## !!steps Write it out and say so
+
+The accumulated string is written to `formula_docs_output.md` in the current
+working directory, and `expect` turns a failed write into a panic — acceptable
+for a tool a developer runs by hand.
+
+The closing `println!` is part of the contract: the output file is a build
+artifact meant to be copied elsewhere, not committed. Note that the same
+registry is also exposed to the running app through the `formula_docs()` WASM
+export in [lib.rs](/docs/quadratic-core/src/lib.rs) — this binary is the
+offline path to the same data.
+
+```rust ! docgen.rs
+        output.push('\n');
+    }
 
     std::fs::write(OUT_FILENAME, output).expect("failed to write to output file");
 
+    // !mark
     println!("Docs were written to {OUT_FILENAME}. No need to check this file into git.")
 }
-````
+```
+
+</Scrollycoding>
+
+The category descriptors and the `usages_strings` / `doc` fields it reads are
+defined in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), with
+the actual entries spread across the per-category files such as
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs)
+and [lookup.rs](/docs/quadratic-core/src/formulas/functions/lookup.rs). For the
+in-app equivalents of this dump see
+[lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs), which builds
+autocomplete and hover documentation from the same registry, and
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte), which renders
+it in the UI.

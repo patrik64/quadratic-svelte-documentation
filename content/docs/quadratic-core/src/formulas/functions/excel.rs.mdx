@@ -1,15 +1,41 @@
 ---
 title: "excel.rs"
-description: "Allowlist of known Excel function names, from the modern core, used to turn \"no function with this name\" into a friendlier \"valid Excel function, but not imp…"
+description: "An allowlist of 522 known Excel function names, used to turn an unknown-function error into a not-implemented-yet error"
 source: "quadratic-core/src/formulas/functions/excel.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module implements no spreadsheet functions at all. It is a data file with
+one accessor: a set of 522 Excel function names, consulted only when a formula
+calls something the engine does not have. Typing `=BESSELI(1, 0)` then gets
+"BESSELI is a valid Excel function, but is not implemented in this version"
+instead of the blunt "There is no function with this name".
 
-````rust excel.rs -n
+That makes it the odd sibling in this directory: every other module exports a
+`CATEGORY` for the registry in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), while
+this one exports a plain predicate. It is also the only submodule declared
+`pub mod`, because its caller — the evaluator in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) — lives outside the
+`functions` module.
+
+<Scrollycoding>
+
+## !!steps A better error message, nothing more
+
+The header comment states the contract precisely, including the maintenance
+consequence: implemented functions are resolved first by `lookup_function`, so
+this list is reached only on a miss and never needs pruning when a function
+graduates from "known name" to "actually implemented". A name may appear here
+and be implemented at the same time with no ill effect.
+
+The consumer is the function-call arm of the evaluator: when
+`functions::lookup_function` returns `None`, it asks this predicate whether
+the name is at least a real Excel name, and picks between
+`UnimplementedExcelFunction(name)` and `BadFunctionName` accordingly — both
+defined in [errors.rs](/docs/quadratic-core/src/formulas/errors.rs).
+
+```rust ! excel.rs
 //! Allowlist of known Excel function names, from the modern core, used to
 //! turn "no function with this name" into a friendlier "valid Excel
 //! function, but not implemented here" for names we recognize. Implemented
@@ -20,11 +46,34 @@ use std::collections::HashSet;
 
 use lazy_static::lazy_static;
 
+// !mark
 pub fn is_valid_excel_function(name: &str) -> bool {
+    ALL_EXCEL_FUNCTIONS.contains(name.to_ascii_uppercase().as_str())
+}
+```
+
+## !!steps A const slice, hashed once on demand
+
+The names live in a `const` slice of string literals, but lookups go through a
+`HashSet` built by `lazy_static` the first time anything touches it — the same
+lazy-initialization pattern `ALL_FUNCTIONS` uses in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs). The
+set borrows the literals rather than owning strings, so the whole structure is
+522 pointers into static memory.
+
+The query is uppercased with `to_ascii_uppercase` before the lookup, matching
+how `lookup_function` normalizes names, so `=besseli(...)` reports the same
+friendly error as `=BESSELI(...)`. Only the ASCII variant is used, which is
+also all the stored names need.
+
+```rust ! excel.rs
+pub fn is_valid_excel_function(name: &str) -> bool {
+    // !mark
     ALL_EXCEL_FUNCTIONS.contains(name.to_ascii_uppercase().as_str())
 }
 
 lazy_static! {
+    // !mark
     static ref ALL_EXCEL_FUNCTIONS: HashSet<&'static str> =
         EXCEL_FUNCTIONS_LIST.iter().cloned().collect();
 }
@@ -35,8 +84,31 @@ const EXCEL_FUNCTIONS_LIST: &[&str] = &[
     "ACCRINTM",
     "ACOS",
     "ACOSH",
+```
+
+## !!steps Roughly alphabetical, and that is fine
+
+The list reads as alphabetical, but it is not sorted: `AGGREGATE` sits before
+`ADDRESS` here, and there are about two dozen similar slips further down
+(`TANH` before `TAKE`, `ISTEXT` before `ISO.CEILING`). Nothing depends on the
+order — membership is answered by the hash set — so the ordering is purely a
+convenience for humans reading or editing the file.
+
+The `A` block also shows what the list is *not*: it carries `ACOT` and
+`ACOTH`, which the engine implements, right next to `AMORDEGRC` and
+`ARABIC`, which it does not. Names are recorded without any hint of which
+side of that line they fall on.
+
+```rust ! excel.rs
+const EXCEL_FUNCTIONS_LIST: &[&str] = &[
+    "ABS",
+    "ACCRINT",
+    "ACCRINTM",
+    "ACOS",
+    "ACOSH",
     "ACOT",
     "ACOTH",
+    // !mark(1:2)
     "AGGREGATE",
     "ADDRESS",
     "AMORDEGRC",
@@ -60,250 +132,61 @@ const EXCEL_FUNCTIONS_LIST: &[&str] = &[
     "BASE",
     "BESSELI",
     "BESSELJ",
-    "BESSELK",
-    "BESSELY",
-    "BETADIST",
-    "BETA.DIST",
-    "BETAINV",
-    "BETA.INV",
-    "BIN2DEC",
-    "BIN2HEX",
-    "BIN2OCT",
-    "BINOMDIST",
-    "BINOM.DIST",
-    "BINOM.DIST.RANGE",
-    "BINOM.INV",
-    "BITAND",
-    "BITLSHIFT",
-    "BITOR",
-    "BITRSHIFT",
-    "BITXOR",
-    "BYCOL",
-    "BYROW",
-    "CALL",
-    "CEILING",
-    "CEILING.MATH",
-    "CEILING.PRECISE",
-    "CELL",
-    "CHAR",
-    "CHIDIST",
-    "CHIINV",
-    "CHITEST",
-    "CHISQ.DIST",
-    "CHISQ.DIST.RT",
-    "CHISQ.INV",
-    "CHISQ.INV.RT",
-    "CHISQ.TEST",
-    "CHOOSE",
-    "CHOOSECOLS",
-    "CHOOSEROWS",
-    "CLEAN",
-    "CODE",
-    "COLUMN",
-    "COLUMNS",
-    "COMBIN",
-    "COMBINA",
-    "COMPLEX",
-    "CONCAT",
-    "CONCATENATE",
-    "CONFIDENCE",
-    "CONFIDENCE.NORM",
-    "CONFIDENCE.T",
-    "CONVERT",
-    "COPILOT",
-    "CORREL",
-    "COS",
-    "COSH",
-    "COT",
-    "COTH",
-    "COUNT",
-    "COUNTA",
-    "COUNTBLANK",
-    "COUNTIF",
-    "COUNTIFS",
-    "COUPDAYBS",
-    "COUPDAYS",
-    "COUPDAYSNC",
-    "COUPNCD",
-    "COUPNUM",
-    "COUPPCD",
-    "COVAR",
-    "COVARIANCE.P",
-    "COVARIANCE.S",
-    "CRITBINOM",
-    "CSC",
-    "CSCH",
-    "CUBEKPIMEMBER",
-    "CUBEMEMBER",
-    "CUBEMEMBERPROPERTY",
-    "CUBERANKEDMEMBER",
-    "CUBESET",
-    "CUBESETCOUNT",
-    "CUBEVALUE",
-    "CUMIPMT",
-    "CUMPRINC",
-    "DATE",
-    "DATEDIF",
-    "DATEVALUE",
-    "DAVERAGE",
-    "DAY",
-    "DAYS",
-    "DAYS360",
-    "DB",
-    "DBCS",
-    "DCOUNT",
-    "DCOUNTA",
-    "DDB",
-    "DEC2BIN",
-    "DEC2HEX",
-    "DEC2OCT",
-    "DECIMAL",
-    "DEGREES",
-    "DELTA",
-    "DETECTLANGUAGE",
-    "DEVSQ",
-    "DGET",
-    "DISC",
-    "DMAX",
-    "DMIN",
-    "DOLLAR",
-    "DOLLARDE",
-    "DOLLARFR",
-    "DPRODUCT",
-    "DROP",
-    "DSTDEV",
-    "DSTDEVP",
-    "DSUM",
-    "DURATION",
-    "DVAR",
-    "DVARP",
-    "EDATE",
-    "EFFECT",
-    "ENCODEURL",
-    "EOMONTH",
-    "ERF",
-    "ERF.PRECISE",
-    "ERFC",
-    "ERFC.PRECISE",
-    "ERROR.TYPE",
-    "EUROCONVERT",
-    "EVEN",
-    "EXACT",
-    "EXP",
-    "EXPAND",
-    "EXPON.DIST",
-    "EXPONDIST",
-    "FACT",
-    "FACTDOUBLE",
-    "FALSE",
-    "F.DIST",
-    "FDIST",
-    "F.DIST.RT",
-    "FILTER",
-    "FILTERXML",
-    "FIND",
-    "FINDB",
-    "F.INV",
-    "F.INV.RT",
-    "FINV",
-    "FISHER",
-    "FISHERINV",
-    "FIXED",
-    "FLOOR",
-    "FLOOR.MATH",
-    "FLOOR.PRECISE",
-    "FORECAST",
-    "FORECAST.ETS",
-    "FORECAST.ETS.CONFINT",
-    "FORECAST.ETS.SEASONALITY",
-    "FORECAST.ETS.STAT",
-    "FORECAST.LINEAR",
-    "FORMULATEXT",
-    "FREQUENCY",
-    "F.TEST",
-    "FTEST",
-    "FV",
-    "FVSCHEDULE",
-    "GAMMA",
-    "GAMMA.DIST",
-    "GAMMADIST",
-    "GAMMA.INV",
-    "GAMMAINV",
-    "GAMMALN",
-    "GAMMALN.PRECISE",
-    "GAUSS",
-    "GCD",
-    "GEOMEAN",
-    "GESTEP",
-    "GETPIVOTDATA",
-    "GROUPBY",
-    "GROWTH",
-    "HARMEAN",
-    "HEX2BIN",
-    "HEX2DEC",
-    "HEX2OCT",
-    "HLOOKUP",
-    "HOUR",
-    "HSTACK",
-    "HYPERLINK",
-    "HYPGEOM.DIST",
-    "HYPGEOMDIST",
-    "IF",
-    "IFERROR",
-    "IFNA",
-    "IFS",
-    "IMABS",
-    "IMAGE",
-    "IMAGINARY",
-    "IMARGUMENT",
-    "IMCONJUGATE",
-    "IMCOS",
-    "IMCOSH",
-    "IMCOT",
-    "IMCSC",
-    "IMCSCH",
-    "IMDIV",
-    "IMEXP",
-    "IMLN",
-    "IMLOG10",
-    "IMLOG2",
-    "IMPOWER",
-    "IMPRODUCT",
-    "IMREAL",
-    "IMSEC",
-    "IMSECH",
-    "IMSIN",
-    "IMSINH",
-    "IMSQRT",
-    "IMSUB",
-    "IMSUM",
-    "IMTAN",
-    "INDEX",
-    "INDIRECT",
-    "INFO",
-    "INT",
-    "INTERCEPT",
-    "INTRATE",
-    "IPMT",
-    "IRR",
-    "ISBLANK",
-    "ISERR",
-    "ISERROR",
-    "ISEVEN",
-    "ISFORMULA",
-    "ISLOGICAL",
-    "ISNA",
-    "ISNONTEXT",
-    "ISNUMBER",
-    "ISODD",
-    "ISOMITTED",
-    "ISREF",
-    "ISTEXT",
-    "ISO.CEILING",
-    "ISOWEEKNUM",
-    "ISPMT",
+```
+
+## !!steps Both spellings of the statistical functions
+
+Seventy-one of the 522 entries contain a dot. Modern Excel renamed most of its
+statistical functions into dotted families — `NORM.DIST`, `NORM.INV`,
+`NORM.S.DIST` — while keeping the pre-2010 spellings working, and the list
+keeps both so that a formula written against either generation gets the
+"not implemented in this version" message rather than "no function with this
+name".
+
+This matters because the engine's own parser has no special handling for dots
+in function names; a name like `NORM.S.INV` is only ever going to be matched
+as a whole string, here or in the registry.
+
+```rust ! excel.rs
+    "NETWORKDAYS",
+    "NETWORKDAYS.INTL",
+    "NOMINAL",
+    // !mark(1:8)
+    "NORM.DIST",
+    "NORMDIST",
+    "NORMINV",
+    "NORM.INV",
+    "NORM.S.DIST",
+    "NORMSDIST",
+    "NORM.S.INV",
+    "NORMSINV",
+    "NOT",
+    "NOW",
+    "NPER",
+    "NPV",
+    "NUMBERVALUE",
+```
+
+## !!steps Modern additions the engine has no answer for
+
+The comment at the top of the file says the list came "from the modern core",
+and the `L`–`M` stretch shows what that means: `LAMBDA`, `LET`, `MAKEARRAY`,
+and `MAP` are recent additions to Excel, none of which this formula engine
+implements — its AST in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) has no node for a function
+value, only literals, cell references, arrays, and calls by name. Listing them
+costs one line each and converts a dead-end error into an informative one.
+
+`LOOKUP` is in the same stretch and is likewise unimplemented, while its
+neighbors `MATCH` and `LEN` do resolve (see
+[lookup.rs](/docs/quadratic-core/src/formulas/functions/lookup.rs) and
+[string.rs](/docs/quadratic-core/src/formulas/functions/string.rs)) — another
+reminder that presence here says nothing either way.
+
+```rust ! excel.rs
     "JIS",
     "KURT",
+    // !mark(1:2)
     "LAMBDA",
     "LARGE",
     "LCM",
@@ -326,209 +209,23 @@ const EXCEL_FUNCTIONS_LIST: &[&str] = &[
     "MAKEARRAY",
     "MAP",
     "MATCH",
-    "MAX",
-    "MAXA",
-    "MAXIFS",
-    "MDETERM",
-    "MDURATION",
-    "MEDIAN",
-    "MID",
-    "MIDB",
-    "MIN",
-    "MINIFS",
-    "MINA",
-    "MINUTE",
-    "MINVERSE",
-    "MIRR",
-    "MMULT",
-    "MOD",
-    "MODE",
-    "MODE.MULT",
-    "MODE.SNGL",
-    "MONTH",
-    "MROUND",
-    "MULTINOMIAL",
-    "MUNIT",
-    "N",
-    "NA",
-    "NEGBINOM.DIST",
-    "NEGBINOMDIST",
-    "NETWORKDAYS",
-    "NETWORKDAYS.INTL",
-    "NOMINAL",
-    "NORM.DIST",
-    "NORMDIST",
-    "NORMINV",
-    "NORM.INV",
-    "NORM.S.DIST",
-    "NORMSDIST",
-    "NORM.S.INV",
-    "NORMSINV",
-    "NOT",
-    "NOW",
-    "NPER",
-    "NPV",
-    "NUMBERVALUE",
-    "OCT2BIN",
-    "OCT2DEC",
-    "OCT2HEX",
-    "ODD",
-    "ODDFPRICE",
-    "ODDFYIELD",
-    "ODDLPRICE",
-    "ODDLYIELD",
-    "OFFSET",
-    "OR",
-    "PDURATION",
-    "PEARSON",
-    "PERCENTILE.EXC",
-    "PERCENTILE.INC",
-    "PERCENTILE",
-    "PERCENTOF",
-    "PERCENTRANK.EXC",
-    "PERCENTRANK.INC",
-    "PERCENTRANK",
-    "PERMUT",
-    "PERMUTATIONA",
-    "PHI",
-    "PHONETIC",
-    "PI",
-    "PIVOTBY",
-    "PMT",
-    "POISSON.DIST",
-    "POISSON",
-    "POWER",
-    "PPMT",
-    "PRICE",
-    "PRICEDISC",
-    "PRICEMAT",
-    "PROB",
-    "PRODUCT",
-    "PROPER",
-    "PV",
-    "QUARTILE",
-    "QUARTILE.EXC",
-    "QUARTILE.INC",
-    "QUOTIENT",
-    "RADIANS",
-    "RAND",
-    "RANDARRAY",
-    "RANDBETWEEN",
-    "RANK.AVG",
-    "RANK.EQ",
-    "RANK",
-    "RATE",
-    "RECEIVED",
-    "REDUCE",
-    "REGEXEXTRACT",
-    "REGEXREPLACE",
-    "REGEXTEST",
-    "REGISTER.ID",
-    "REPLACE",
-    "REPLACEB",
-    "REPT",
-    "RIGHT",
-    "RIGHTB",
-    "ROMAN",
-    "ROUND",
-    "ROUNDDOWN",
-    "ROUNDUP",
-    "ROW",
-    "ROWS",
-    "RRI",
-    "RSQ",
-    "RTD",
-    "SCAN",
-    "SEARCH",
-    "SEARCHB",
-    "SEC",
-    "SECH",
-    "SECOND",
-    "SEQUENCE",
-    "SERIESSUM",
-    "SHEET",
-    "SHEETS",
-    "SIGN",
-    "SIN",
-    "SINH",
-    "SKEW",
-    "SKEW.P",
-    "SLN",
-    "SLOPE",
-    "SMALL",
-    "SORT",
-    "SORTBY",
-    "SQRT",
-    "SQRTPI",
-    "STANDARDIZE",
-    "STDEV",
-    "STDEV.P",
-    "STDEV.S",
-    "STDEVA",
-    "STDEVP",
-    "STDEVPA",
-    "STEYX",
-    "STOCKHISTORY",
-    "SUBSTITUTE",
-    "SUBTOTAL",
-    "SUM",
-    "SUMIF",
-    "SUMIFS",
-    "SUMPRODUCT",
-    "SUMSQ",
-    "SUMX2MY2",
-    "SUMX2PY2",
-    "SUMXMY2",
-    "SWITCH",
-    "SYD",
-    "T",
-    "TAN",
-    "TANH",
-    "TAKE",
-    "TBILLEQ",
-    "TBILLPRICE",
-    "TBILLYIELD",
-    "T.DIST",
-    "T.DIST.2T",
-    "T.DIST.RT",
-    "TDIST",
-    "TEXT",
-    "TEXTAFTER",
-    "TEXTBEFORE",
-    "TEXTJOIN",
-    "TEXTSPLIT",
-    "TIME",
-    "TIMEVALUE",
-    "T.INV",
-    "T.INV.2T",
-    "TINV",
-    "TOCOL",
-    "TOROW",
-    "TODAY",
-    "TRANSLATE",
-    "TRANSPOSE",
-    "TREND",
-    "TRIM",
-    "TRIMMEAN",
-    "TRIMRANGE",
-    "TRUE",
-    "TRUNC",
-    "T.TEST",
-    "TTEST",
-    "TYPE",
-    "UNICHAR",
-    "UNICODE",
-    "UNIQUE",
-    "UPPER",
-    "VALUE",
-    "VALUETOTEXT",
-    "VAR",
-    "VAR.P",
-    "VAR.S",
-    "VARA",
-    "VARP",
-    "VARPA",
-    "VDB",
+```
+
+## !!steps The tail end
+
+The file simply stops after `ZTEST`; there is no trailing logic, no test
+module, and no export beyond the predicate at the top. The last stretch is
+worth a look anyway because it is dense with the dynamic-array and lookup
+functions users reach for most: `XLOOKUP`, `XMATCH`, `VSTACK`, `WRAPROWS`,
+alongside the financial `XIRR` and `XNPV` that
+[financial.rs](/docs/quadratic-core/src/formulas/functions/financial.rs) does
+implement.
+
+Adding a newly recognized name is a one-line change here; making it actually
+work means adding a `FormulaFunction` to one of the category modules, after
+which this entry quietly stops being consulted for that name.
+
+```rust ! excel.rs
     "VLOOKUP",
     "VSTACK",
     "WEBSERVICE",
@@ -541,6 +238,7 @@ const EXCEL_FUNCTIONS_LIST: &[&str] = &[
     "WRAPCOLS",
     "WRAPROWS",
     "XIRR",
+    // !mark(1:2)
     "XLOOKUP",
     "XMATCH",
     "XNPV",
@@ -553,4 +251,30 @@ const EXCEL_FUNCTIONS_LIST: &[&str] = &[
     "Z.TEST",
     "ZTEST",
 ];
-````
+```
+
+</Scrollycoding>
+
+## Implemented functions
+
+This module declares no spreadsheet functions — it stores names, with no
+semantics attached to any of them, so there is nothing here to give a
+per-function behavior. The complete set of items it defines is:
+
+| Name | Purpose |
+| --- | --- |
+| is_valid_excel_function | Returns whether a name, uppercased, is in the allowlist |
+| ALL_EXCEL_FUNCTIONS | Lazily built `HashSet` of the names, used for membership tests |
+| EXCEL_FUNCTIONS_LIST | The `const` slice holding all 522 recognized Excel function names |
+
+The predicate's only caller is the function-call evaluator in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs); the two error variants it
+chooses between are in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs); and the registry
+whose miss triggers the whole path is
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs). The
+categories that determine which of these 522 names actually resolve include
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs),
+[statistics.rs](/docs/quadratic-core/src/formulas/functions/statistics.rs),
+[datetime.rs](/docs/quadratic-core/src/formulas/functions/datetime.rs), and
+[financial.rs](/docs/quadratic-core/src/formulas/functions/financial.rs).

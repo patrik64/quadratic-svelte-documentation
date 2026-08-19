@@ -1,17 +1,23 @@
 ---
 title: "combinators.rs"
-description: "Rule that matches the same tokens but applies some function to the result."
+description: "Higher-order grammar rules — map a rule's output, surround it with brackets, repeat it as a separated list, or match nothing at all."
 source: "quadratic-core/src/formulas/parser/rules/combinators.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+If [atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs) holds the leaves of the grammar, this file holds the branches. Every type here is generic over some inner rule and implements `SyntaxRule` by delegating to it: `TokenMapper` transforms the output, `Surround` wraps it in brackets, `List` repeats it with separators, and `Epsilon` and `EndOfFile` match no tokens at all.
 
-````rust combinators.rs -n
-use super::*;
+Because rules are values (see [rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs)), these combinators can be composed inline at the call site — `Surround::paren(Expression.map(...))` is a complete grammar production written as a single expression.
 
+<Scrollycoding>
+
+## !!steps Mapping a rule's output
+
+`TokenMapper` pairs an inner rule with a function. It is what `SyntaxRule::map` returns, so you rarely write the struct name yourself.
+
+The `SyntaxRule` impl is pure delegation: `prefix_matches` forwards untouched — mapping cannot change *which* tokens match, only what they produce — and `consume_match` runs the inner rule and applies `f` to the result with `Result::map`. The bounds `F: Fn(R::Output) -> B` fix the new `Output` type to `B`.
+
+```rust ! combinators.rs
 /// Rule that matches the same tokens but applies some function to the
 /// result.
 #[derive(Copy, Clone)]
@@ -21,6 +27,27 @@ pub struct TokenMapper<R, F> {
     /// Function to apply to the result.
     pub f: F,
 }
+// ...
+impl<B, R: SyntaxRule, F: Fn(R::Output) -> B> SyntaxRule for TokenMapper<R, F> {
+    type Output = B;
+
+    fn prefix_matches(&self, p: Parser<'_>) -> bool {
+        self.inner.prefix_matches(p)
+    }
+    fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
+        // !mark
+        self.inner.consume_match(p).map(&self.f)
+    }
+}
+```
+
+## !!steps Why the formatting impls are hand-written
+
+`SyntaxRule` requires both `fmt::Debug` and `fmt::Display`, but `TokenMapper` holds a closure and closures implement neither — so `#[derive(Debug)]` would not compile. Both impls are therefore written by hand with a bound only on `R`.
+
+`Debug` prints the inner rule and stops with `.finish()`, quietly omitting the function field. `Display` forwards entirely to the inner rule, which is the behaviour that matters for errors: a mapped rule describes itself in "expected ..." messages exactly as the rule it wraps.
+
+```rust ! combinators.rs
 impl<R: fmt::Debug, F> fmt::Debug for TokenMapper<R, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TokenMapper")
@@ -30,20 +57,19 @@ impl<R: fmt::Debug, F> fmt::Debug for TokenMapper<R, F> {
 }
 impl<R: fmt::Display, F> fmt::Display for TokenMapper<R, F> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // !mark
         self.inner.fmt(f)
     }
 }
-impl<B, R: SyntaxRule, F: Fn(R::Output) -> B> SyntaxRule for TokenMapper<R, F> {
-    type Output = B;
+```
 
-    fn prefix_matches(&self, p: Parser<'_>) -> bool {
-        self.inner.prefix_matches(p)
-    }
-    fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
-        self.inner.consume_match(p).map(&self.f)
-    }
-}
+## !!steps Bracketing a rule
 
+`Surround` stores an inner rule plus the two delimiter tokens. The fields are private, so the only way to build one is the `paren` constructor, which fills in `Token::LParen` and `Token::RParen` — the doc comment mentions brackets as a possibility, but parentheses are the only pair the crate constructs today.
+
+Note that `start` and `end` are plain `Token` values used as rules: because `Token` itself implements `SyntaxRule`, they can be handed straight to `p.parse` without a wrapper.
+
+```rust ! combinators.rs
 /// Rule that matches tokens by certain symbols, such as
 /// parentheses or brackets.
 #[derive(Debug, Copy, Clone)]
@@ -67,6 +93,15 @@ impl<R> Surround<R> {
         }
     }
 }
+```
+
+## !!steps Three parses and a merged span
+
+Matching is three `p.parse` calls in a row, each propagating its error with `?`, so an unclosed paren surfaces as "expected `)`" pointing at wherever the parser gave up.
+
+The interesting part is the span bookkeeping. `span1` is captured with `peek_next_span()` *before* anything is consumed — the span of the opening delimiter — and `span2` is `p.span()` after the closing one. `Span::merge` joins them, so the resulting `Spanned` covers the brackets as well as their contents. `Surround`'s own `Display` composes a sentence out of the three parts, which is what `ParenExpression` reuses for its error text.
+
+```rust ! combinators.rs
 impl<R: fmt::Display> fmt::Display for Surround<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -83,6 +118,7 @@ impl<R: Copy + SyntaxRule> SyntaxRule for Surround<R> {
         self.start.prefix_matches(p)
     }
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
+        // !mark
         let span1 = p.peek_next_span();
 
         p.parse(self.start)?;
@@ -94,7 +130,15 @@ impl<R: Copy + SyntaxRule> SyntaxRule for Surround<R> {
         Ok(Spanned { span, inner: ret })
     }
 }
+```
 
+## !!steps A separated, bracketed list
+
+`List` generalises `Surround` with a separator and repetition. Its fields are `pub(super)`, so sibling rule modules can build one with struct literal syntax — `FunctionCall` in [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs) does exactly that, and notably passes `Token::FunctionCall` as the `start` delimiter because the lexer emits the function name and its opening paren as one token.
+
+`sep_name` exists purely for error messages: the `Display` impl spells out "comma-separated list of expression, surrounded by ...", which reads far better than the raw token would.
+
+```rust ! combinators.rs
 /// Rule that matches a list of things surrounded by a symbol pair,
 /// such as a comma-separated list enclosed in parentheses.
 #[derive(Debug, Copy, Clone)]
@@ -121,6 +165,15 @@ impl<R: fmt::Display> fmt::Display for List<R> {
         )
     }
 }
+```
+
+## !!steps Alternation as the loop condition
+
+The loop body is two alternations, each expressed with `parse_one_of!` from [macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs). The `map` calls are what make them type-check: `self.inner.map(Some)` and `self.end.map(|_| None)` produce rules with different token shapes but the same `Option` output, so one `match` can branch on which of the two fired.
+
+The first alternation asks "item or closing bracket?", the second "separator or closing bracket?". Because the closing bracket is accepted in both positions, the list tolerates being empty *and* tolerates a trailing separator — the two comments on the `None` arms name exactly those cases. If neither alternative matches, `parse_one_of!` raises an error listing both.
+
+```rust ! combinators.rs
 impl<R: Copy + SyntaxRule> SyntaxRule for List<R> {
     type Output = Spanned<Vec<R::Output>>;
 
@@ -134,11 +187,13 @@ impl<R: Copy + SyntaxRule> SyntaxRule for List<R> {
         p.parse(self.start)?;
         loop {
             // End the list or consume an item.
+            // !mark
             match parse_one_of!(p, [self.inner.map(Some), self.end.map(|_| None)])? {
                 Some(item) => items.push(item), // There is an item.
                 None => break,                  // End of list; empty list, or trailing separator.
             }
             // End the list or consume a separator.
+            // !mark
             match parse_one_of!(p, [self.sep.map(Some), self.end.map(|_| None)])? {
                 Some(_) => continue, // There is a separator.
                 None => break,       // End of list, no trailing separator.
@@ -150,7 +205,15 @@ impl<R: Copy + SyntaxRule> SyntaxRule for List<R> {
         Ok(Spanned { span, inner: items })
     }
 }
+```
 
+## !!steps Two rules that match nothing
+
+`Epsilon` always matches and consumes nothing. Its purpose is stated in the doc comment — a fallback in an alternation — and the atom level of [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs) uses it as the last arm of `parse_one_of!` so that "no atom here" comes back as `None` instead of an error, letting the caller produce a better message. Its `Display` name is simply "nothing".
+
+`EndOfFile` describes itself as end of file, and its `prefix_matches` returns true when `p.next()` yields `None`. Its `consume_match`, however, returns `Ok` on `Some(_)` and calls `p.expected(self)` on `None` — the reverse of the lookahead. No other code in the crate references `EndOfFile`; the end-of-input check that `parse_formula` actually performs is `Parser::ok_if_not_eof` in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs).
+
+```rust ! combinators.rs
 /// Rule that matches no tokens; always succeeds (useful as a fallback when
 /// matching multiple possible rules).
 #[derive(Debug, Copy, Clone)]
@@ -159,6 +222,7 @@ impl_display!(for Epsilon, "nothing");
 impl SyntaxRule for Epsilon {
     type Output = ();
 
+    // !mark
     fn prefix_matches(&self, _p: Parser<'_>) -> bool {
         true
     }
@@ -184,4 +248,8 @@ impl SyntaxRule for EndOfFile {
         }
     }
 }
-````
+```
+
+</Scrollycoding>
+
+These combinators are consumed almost entirely by [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs) — `List` for argument lists, `Surround` for parenthesised expressions, `Epsilon` for the atom fallback — and they implement the trait declared in [rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs). The `parse_one_of!` macro they lean on is in [macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs), `impl_display!` in [util.rs](/docs/quadratic-core/src/util.rs), and the `Spanned` and `Span::merge` helpers in [span.rs](/docs/quadratic-core/src/formulas/span.rs).

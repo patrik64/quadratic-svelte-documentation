@@ -1,17 +1,40 @@
 ---
 title: "statistics.rs"
-description: "Rust module statistics.rs of the quadratic-core formula engine."
+description: "Aggregates over flattened ranges plus the Excel criteria parser shared by COUNTIF, SUMIF, and the database functions"
 source: "quadratic-core/src/formulas/functions/statistics.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "Statistics functions" category of the formula engine. It is
+deliberately small: nine functions that reduce a pile of arguments — scalars,
+ranges, arrays, or any mix — down to a single number. What makes it interesting
+is not the arithmetic but the *bookkeeping*: which values count, which are
+silently skipped, and which quietly convert to zero.
 
-````rust statistics.rs -n
-use super::*;
+It also owns `Criterion`, the Excel-style criteria parser behind `COUNTIF`,
+`SUMIF`, and `AVERAGEIF`. That type is `pub(super)`, so
+[database.rs](/docs/quadratic-core/src/formulas/functions/database.rs) imports
+it to evaluate its criteria tables against the same rules. Like every sibling
+module, registration happens through a single `CATEGORY` constant that
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) folds
+into the global `ALL_FUNCTIONS` map.
 
+<Scrollycoding>
+
+## !!steps The category, and why AVERAGE is not sum over length
+
+`CATEGORY` is the registration point: a name, category docs, and a
+`get_functions` pointer that builds the `FormulaFunction` values on demand.
+
+`AVERAGE` looks trivial, but the numerator and denominator come from two
+*different* helpers, and that asymmetry is the whole behavior. `util::sum`
+walks every value that converts to a number, and a blank cell converts to `0`;
+`util::count_numeric` explicitly returns 0 for an empty string. So blanks add
+nothing to the total and nothing to the divisor, while genuinely non-numeric
+text is skipped by both. `AVERAGE("", "a", 12, -3.5, 42.5)` is therefore
+`51 / 3`, not `51 / 5`.
+
+```rust ! statistics.rs
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
@@ -30,10 +53,26 @@ fn get_functions() -> Vec<FormulaFunction> {
             doc: "Returns the arithmetic mean of all values.",
             eval: util::pure_fn(|args| {
                 Ok(Value::Number(
+                    // !mark
                     util::sum(&args.inner) / util::count_numeric(&args.inner) as f64,
                 ))
             }),
         },
+```
+
+## !!steps COUNT, MIN and MAX over a flattened stream
+
+`COUNT` exposes `count_numeric` directly, so it agrees with `AVERAGE`'s
+divisor by construction.
+
+`MIN` and `MAX` fold `util::flat_iter_numbers` — every argument flattened and
+converted, non-numeric values dropped — starting from `+∞` and `-∞`
+respectively. Two consequences fall straight out of the seed values: with no
+numeric input at all the identity element is returned rather than an error
+(documented in each `doc` string), and because a blank cell *does* convert to
+`0`, blanks inside a range participate as zeros rather than being ignored.
+
+```rust ! statistics.rs
         FormulaFunction {
             name: "COUNT",
             arg_completion: "${1:a, b, ...}",
@@ -50,6 +89,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             doc: "Returns the smallest value.\nReturns +∞ if given no values.",
             eval: util::pure_fn(|args| {
                 Ok(Value::Number(
+                    // !mark
                     util::flat_iter_numbers(&args.inner).fold(f64::INFINITY, f64::min),
                 ))
             }),
@@ -62,10 +102,26 @@ fn get_functions() -> Vec<FormulaFunction> {
             doc: "Returns the largest value.\nReturns -∞ if given no values.",
             eval: util::pure_fn(|args| {
                 Ok(Value::Number(
+                    // !mark
                     util::flat_iter_numbers(&args.inner).fold(-f64::INFINITY, f64::max),
                 ))
             }),
         },
+```
+
+## !!steps Counting cells instead of numbers
+
+`COUNTA` and `COUNTBLANK` are the only two functions here that care about
+values rather than numbers, and they are exact mirrors: one filter is the
+negation of the other, so together they always account for every cell.
+
+"Blank" has a precise meaning in this engine — a `Value::String` that
+`is_empty()`. The test is on the raw string, not a trimmed one, so a cell
+containing a single space is *not* blank and is counted by `COUNTA`. Note also
+that numbers, booleans, and text all count as non-empty; the pattern match only
+singles out the empty string.
+
+```rust ! statistics.rs
         FormulaFunction {
             name: "COUNTA",
             arg_completion: "${1:a, b, ...}",
@@ -77,6 +133,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                     .inner
                     .iter()
                     .flat_map(|v| flatten_values(&v.inner))
+                    // !mark
                     .filter(|v| !matches!(v, Value::String(s) if s.is_empty()))
                     .count();
                 Ok(Value::Number(count as f64))
@@ -93,11 +150,26 @@ fn get_functions() -> Vec<FormulaFunction> {
                     .inner
                     .iter()
                     .flat_map(|v| flatten_values(&v.inner))
+                    // !mark
                     .filter(|v| matches!(v, Value::String(s) if s.is_empty()))
                     .count();
                 Ok(Value::Number(count as f64))
             }),
         },
+```
+
+## !!steps COUNTIF and the local flattener
+
+`COUNTIF` sets the shape for the whole conditional family: pull exactly two
+arguments out with `two_args` (which stringifies the criteria and errors with
+`BadArgumentCount` if a third is present), parse the criteria once, then filter.
+
+The flattening helper is local to this module and different from the `util`
+ones: `flatten_values` produces `Vec<Value>` — the values themselves, in row
+order — rather than coercing to numbers. Criteria have to inspect text and
+blanks, so the raw values must survive the flattening step.
+
+```rust ! statistics.rs
         FormulaFunction {
             name: "COUNTIF",
             arg_completion: "${1:range}, ${2:criteria}",
@@ -108,6 +180,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                   or text with the wildcards `*` and `?`.",
             eval: util::pure_fn(|args| {
                 let (range, criteria) = two_args(args)?;
+                // !mark
                 let criterion = Criterion::parse(&criteria);
                 let count = flatten_values(&range.inner)
                     .iter()
@@ -116,13 +189,32 @@ fn get_functions() -> Vec<FormulaFunction> {
                 Ok(Value::Number(count as f64))
             }),
         },
-        FormulaFunction {
-            name: "SUMIF",
-            arg_completion: "${1:range}, ${2:criteria}",
-            usages: &["range, criteria", "range, criteria, sum_range"],
-            examples: &["SUMIF(A1:A10, \">5\")", "SUMIF(A1:A10, \"apple\", B1:B10)"],
-            doc: "Adds the values in `range` (or the corresponding values in \
-                  `sum_range`, if given) whose `range` entry matches `criteria`.",
+// ...
+/// Flattens a value (possibly an array) into a list of scalar values.
+fn flatten_values(v: &Value) -> Vec<Value> {
+    match v {
+        Value::Array(rows) => rows.iter().flatten().cloned().collect(),
+        other => vec![other.clone()],
+    }
+}
+```
+
+## !!steps Testing one range, summing another
+
+`SUMIF` and `AVERAGEIF` take an optional third range: the criteria are checked
+against `range`, but the arithmetic uses the *corresponding* entries of
+`sum_range` / `average_range`. "Corresponding" is implemented by `zip` over the
+two flattened lists, which means the pairing is strictly positional and stops
+at the shorter of the two — a mismatched second range is truncated, not an
+error. When the third argument is omitted, the test list is cloned and each
+value is compared against itself.
+
+The two differ only at the end. `SUMIF` sums the surviving values, so no
+matches yields `0`. `AVERAGEIF` has to divide, so it checks for an empty
+result set first and raises `DivideByZero` at the call's span rather than
+returning `NaN`.
+
+```rust ! statistics.rs
             eval: util::pure_fn(|args| {
                 let (range, criteria, other) = two_or_three_args(args)?;
                 let criterion = Criterion::parse(&criteria);
@@ -133,29 +225,14 @@ fn get_functions() -> Vec<FormulaFunction> {
                 };
                 let total: f64 = test_values
                     .iter()
+                    // !mark
                     .zip(sum_values.iter())
                     .filter(|(test, _)| criterion.matches(test))
                     .filter_map(|(_, v)| v.to_number().ok())
                     .sum();
                 Ok(Value::Number(total))
             }),
-        },
-        FormulaFunction {
-            name: "AVERAGEIF",
-            arg_completion: "${1:range}, ${2:criteria}",
-            usages: &["range, criteria", "range, criteria, average_range"],
-            examples: &["AVERAGEIF(A1:A10, \">0\")"],
-            doc: "Averages the values in `range` (or the corresponding values in \
-                  `average_range`, if given) whose `range` entry matches `criteria`.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let (range, criteria, other) = two_or_three_args(args)?;
-                let criterion = Criterion::parse(&criteria);
-                let test_values = flatten_values(&range.inner);
-                let avg_values = match &other {
-                    Some(v) => flatten_values(&v.inner),
-                    None => test_values.clone(),
-                };
+// ...
                 let numbers: Vec<f64> = test_values
                     .iter()
                     .zip(avg_values.iter())
@@ -163,64 +240,30 @@ fn get_functions() -> Vec<FormulaFunction> {
                     .filter_map(|(_, v)| v.to_number().ok())
                     .collect();
                 if numbers.is_empty() {
+                    // !mark
                     return Err(FormulaErrorMsg::DivideByZero.with_span(span));
                 }
                 Ok(Value::Number(numbers.iter().sum::<f64>() / numbers.len() as f64))
             }),
-        },
-    ]
-}
+```
 
-/// Flattens a value (possibly an array) into a list of scalar values.
-fn flatten_values(v: &Value) -> Vec<Value> {
-    match v {
-        Value::Array(rows) => rows.iter().flatten().cloned().collect(),
-        other => vec![other.clone()],
-    }
-}
+## !!steps Parsing a criteria string
 
-fn two_args(args: Spanned<Vec<Spanned<Value>>>) -> FormulaResult<(Spanned<Value>, String)> {
-    let span = args.span;
-    let mut a = args.inner.into_iter();
-    match (a.next(), a.next(), a.next()) {
-        (Some(range), Some(criteria), None) => Ok((range, criteria.to_string())),
-        _ => Err(FormulaErrorMsg::BadArgumentCount.with_span(span)),
-    }
-}
+`Criterion::parse` strips an optional comparison prefix, and the order of the
+`strip_prefix` chain is what makes it correct: the two-character operators
+`>=`, `<=`, and `<>` are tried before the single-character `>`, `<`, and `=`,
+so `">=10"` is not read as `>` followed by the text `"=10"`.
 
-fn two_or_three_args(
-    args: Spanned<Vec<Spanned<Value>>>,
-) -> FormulaResult<(Spanned<Value>, String, Option<Spanned<Value>>)> {
-    let span = args.span;
-    let mut a = args.inner.into_iter();
-    match (a.next(), a.next(), a.next(), a.next()) {
-        (Some(range), Some(criteria), third, None) => Ok((range, criteria.to_string(), third)),
-        _ => Err(FormulaErrorMsg::BadArgumentCount.with_span(span)),
-    }
-}
+Whatever remains decides the variant. If the rest parses as an `f64` the
+criterion becomes a numeric comparison; otherwise it becomes a text comparison,
+lowercased so that matching is case-insensitive. With no prefix at all, a
+numeric string yields `MatchNumber` and anything else yields `MatchText`, which
+is the only variant that goes through wildcard matching.
 
-/// Excel-style criteria for COUNTIF/SUMIF/AVERAGEIF: a comparison prefix
-/// (`>`, `>=`, `<`, `<=`, `<>`, `=`) followed by a number or text, or a bare
-/// value; text comparison is case-insensitive and supports `*`/`?` wildcards.
-pub(super) enum Criterion {
-    CompareNumber(CompareOp, f64),
-    CompareText(CompareOp, String),
-    MatchText(String), // lowercase, may contain wildcards
-    MatchNumber(f64),
-}
-
-#[derive(Copy, Clone, PartialEq)]
-pub(super) enum CompareOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
+```rust ! statistics.rs
 impl Criterion {
     pub(super) fn parse(criteria: &str) -> Self {
+        // !mark(1:3)
         let (op, rest) = if let Some(rest) = criteria.strip_prefix(">=") {
             (Some(CompareOp::Ge), rest)
         } else if let Some(rest) = criteria.strip_prefix("<=") {
@@ -247,12 +290,28 @@ impl Criterion {
             },
         }
     }
+```
 
+## !!steps Matching, and the blank-cell guard
+
+`matches` contains the subtlest rule in the file. `Value::to_number` returns
+`Ok(0.0)` for an empty or whitespace-only string, so without intervention every
+blank cell in a range would satisfy `"<1"` or `"=0"`. Both numeric variants
+therefore re-inspect the original value and reject blanks explicitly *before*
+comparing — the same guard appears in `CompareNumber` and in `MatchNumber`.
+
+Text comparisons lowercase both sides and then use Rust's ordinary string
+ordering for `<` and `>`, so ranking is lexicographic. `MatchText` is the
+wildcard path: it hands the lowercased pattern and value to
+`util::wildcard_match`, which supports `*`, `?`, and `~` as an escape.
+
+```rust ! statistics.rs
     pub(super) fn matches(&self, value: &Value) -> bool {
         match self {
             Criterion::CompareNumber(op, n) => match value.to_number() {
                 Ok(v) => {
                     // empty cells never match numeric comparisons
+                    // !mark
                     if matches!(value, Value::String(s) if s.trim().is_empty()) {
                         return false;
                     }
@@ -275,60 +334,37 @@ impl Criterion {
                 !matches!(value, Value::String(s) if s.trim().is_empty()) && v == *n
             }),
             Criterion::MatchText(pattern) => {
+                // !mark
                 util::wildcard_match(pattern, &value.to_string().to_lowercase())
             }
         }
     }
-}
+```
 
-fn compare(op: CompareOp, a: f64, b: f64) -> bool {
-    match op {
-        CompareOp::Eq => a == b,
-        CompareOp::Ne => a != b,
-        CompareOp::Lt => a < b,
-        CompareOp::Le => a <= b,
-        CompareOp::Gt => a > b,
-        CompareOp::Ge => a >= b,
-    }
-}
+</Scrollycoding>
 
+## Implemented functions
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+| Name | Purpose |
+| --- | --- |
+| AVERAGE | Arithmetic mean of all numeric values, blanks excluded from the divisor |
+| COUNT | Number of numeric values |
+| MIN | Smallest value; positive infinity when given no values |
+| MAX | Largest value; negative infinity when given no values |
+| COUNTA | Number of non-empty values |
+| COUNTBLANK | Number of empty values |
+| COUNTIF | Number of values in a range matching a criteria string |
+| SUMIF | Sum of matching values, optionally taken from a parallel sum range |
+| AVERAGEIF | Mean of matching values, optionally taken from a parallel average range |
 
-    #[test]
-    fn test_formula_average() {
-        let form = parse_formula("AVERAGE(3, B1:D3)", pos![nAn1]).unwrap();
-
-        let mut g = FnGrid(|pos| {
-            if (1..=3).contains(&pos.x) && (1..=3).contains(&pos.y) {
-                Some((pos.x * 3 + pos.y).to_string()) // 4 .. 12
-            } else {
-                panic!("cell {pos} shouldn't be accessed")
-            }
-        });
-
-        assert_eq!(
-            "7.5".to_string(),
-            form.eval_blocking(&mut g, pos![nAn1]).unwrap().to_string(),
-        );
-
-        assert_eq!(
-            "17",
-            eval_to_string(&mut g, "AVERAGE(\"\", \"a\", 12, -3.5, 42.5)"),
-        );
-        assert_eq!("5.5", eval_to_string(&mut g, "AVERAGE(1..10)"));
-        assert_eq!("5", eval_to_string(&mut g, "AVERAGE(0..10)"));
-    }
-
-    #[test]
-    fn test_count() {
-        let g = &mut NoGrid;
-        assert_eq!("0", eval_to_string(g, "COUNT()"));
-        assert_eq!("3", eval_to_string(g, "COUNT(\"\", \"a\", 12, -3.5, 42.5)"));
-        assert_eq!("10", eval_to_string(g, "COUNT(1..10)"));
-        assert_eq!("11", eval_to_string(g, "COUNT(0..10)"));
-    }
-}
-````
+The helpers every `eval` here leans on — `pure_fn`, `sum`, `count_numeric`,
+`flat_iter_numbers`, and `wildcard_match` — live in
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), and
+the conversion rules that decide what counts as a number are in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs).
+[database.rs](/docs/quadratic-core/src/formulas/functions/database.rs) reuses
+`Criterion` for its criteria tables, and
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs)
+provides the plain `SUM` and `PRODUCT` aggregates that these build on. The
+registry that consumes `CATEGORY` is
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs).

@@ -1,17 +1,38 @@
 ---
 title: "mathematics.rs"
-description: "Rust module mathematics.rs of the quadratic-core formula engine."
+description: "The Mathematics functions category: sums and products, powers and logarithms, three rounding modes, increment rounding, MOD, and PI and TAU"
 source: "quadratic-core/src/formulas/functions/mathematics.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "Mathematics functions" category of the formula engine.
+Most of its eighteen functions are thin wrappers over `f64` methods, so the
+interesting code is in the three shared helpers at the top of the file: a
+rounding-mode enum used by `ROUND`, `ROUNDUP`, and `ROUNDDOWN`, and an
+increment-rounding helper shared by `CEILING` and `FLOOR`.
 
-````rust mathematics.rs -n
-use super::*;
+Like every sibling in this directory, the module exports a `CATEGORY` constant
+whose `get_functions` pointer produces the actual `FormulaFunction` values;
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) collects
+all categories into the global `ALL_FUNCTIONS` map that the evaluator looks up
+by uppercase name.
 
+<Scrollycoding>
+
+## !!steps One category, eighteen functions
+
+The `CATEGORY` constant registers the module: a display name, category-level
+docs for the formula editor (empty here), and a `get_functions` pointer
+returning `Vec<FormulaFunction>`.
+
+`SUM` and `PRODUCT` are the two aggregate functions, and both delegate to
+helpers in [util.rs](/docs/quadratic-core/src/formulas/functions/util.rs) that
+flatten every argument — ranges included — into a stream of numbers, silently
+skipping values that are not numeric. That is why `SUM("", "abc", 12)` is 12
+rather than an error. An empty argument list gives the identity of each
+operation: `0` for `SUM`, `1` for `PRODUCT`.
+
+```rust ! mathematics.rs
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
@@ -20,6 +41,128 @@ pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     get_functions,
 };
 
+// ...
+
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "SUM",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["SUM(B2:C6, 15, E1)"],
+            doc: "Adds all values.\nReturns `0` if given no values.",
+            // !mark
+            eval: util::pure_fn(|args| Ok(Value::Number(util::sum(&args.inner)))),
+        },
+        FormulaFunction {
+            name: "PRODUCT",
+            arg_completion: "${1:a, b, ...}",
+            usages: &["a, b, ..."],
+            examples: &["PRODUCT(B2:C6, 0.002, E1)"],
+            doc: "Multiplies all values.\nReturns 1 if given no values.",
+            // !mark
+            eval: util::pure_fn(|args| Ok(Value::Number(util::product(&args.inner)))),
+        },
+        // ...
+    ]
+}
+```
+
+## !!steps Fixed-arity functions are one-liners
+
+Where an aggregate uses `util::pure_fn` and inspects the whole argument list,
+a fixed-arity function uses `util::array_mapped`, which destructures the
+arguments into an array of exactly `N` values. The arity is therefore checked
+by the framework, not by the function body — calling `ABS()` or
+`ABS(16, 17)` fails with `BadArgumentCount` before this closure ever runs.
+
+`array_mapped` also broadcasts: passing a range to `SQRT` evaluates the
+closure once per cell and returns an array. `ABS`, `SQRT`, `POWER`, `EXP`,
+`LN`, `LOG10`, and `INT` all follow this pattern, each forwarding to the
+matching `f64` method after `to_number` coerces the argument.
+
+```rust ! mathematics.rs
+        FormulaFunction {
+            name: "ABS",
+            arg_completion: "${1:number}",
+            usages: &["number"],
+            examples: &["ABS(-4)"],
+            doc: "Returns the absolute value of a number.",
+            // !mark
+            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.abs()))),
+        },
+        FormulaFunction {
+            name: "SQRT",
+            arg_completion: "${1:number}",
+            usages: &["number"],
+            examples: &["SQRT(2)"],
+            doc: "Returns the square root of a number.",
+            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.sqrt()))),
+        },
+        FormulaFunction {
+            name: "POWER",
+            arg_completion: "${1:base}, ${2:exponent}",
+            usages: &["base, exponent"],
+            examples: &["POWER(2, 10)"],
+            doc: "Returns `base` raised to the power of `exponent`.",
+            eval: util::array_mapped(|[base, exponent]| {
+                Ok(Value::Number(base.to_number()?.powf(exponent.to_number()?)))
+            }),
+        },
+```
+
+## !!steps An optional second argument means manual arity checks
+
+`LOG` accepts either one or two arguments, so it cannot use `array_mapped`'s
+fixed arity. The pattern used throughout this file appears here in full: take
+an iterator over the arguments, `let`-else on the first (a missing first
+argument is `BadArgumentCount`), let the second stay an `Option`, and then
+reject a third with `a.next().is_some()`.
+
+The base defaults to 10 when omitted, and a base of zero or less is rejected
+with `BadNumber` rather than being handed to `f64::log`, which would return
+a NaN or an infinity. Note that the error is spanned to the whole call, not
+to the base argument.
+
+```rust ! mathematics.rs
+            doc: "Returns the logarithm of a number. Uses base 10 unless a base is given.",
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                // !mark
+                let (Some(number), base) = (a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                if a.next().is_some() {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                }
+                let base = match base {
+                    Some(b) => b.to_number()?,
+                    None => 10.0,
+                };
+                // !mark
+                if base <= 0.0 {
+                    return Err(FormulaErrorMsg::BadNumber.with_span(span));
+                }
+                Ok(Value::Number(number.to_number()?.log(base)))
+            }),
+```
+
+## !!steps Three rounding modes, one implementation
+
+`ROUND`, `ROUNDUP`, and `ROUNDDOWN` differ only in which way a tie or a
+fraction goes, so they share `round_fn` and pass a `RoundMode`. The
+digit-count argument goes through `to_integer`, which itself rounds, and
+becomes a power-of-ten scale factor: multiply, round, divide back. A negative
+digit count therefore rounds to tens, hundreds, and so on, because the factor
+is less than 1.
+
+The three modes map onto three `f64` methods. `Nearest` is `f64::round`, which
+breaks ties away from zero. `AwayFromZero` has to branch on the sign — `ceil`
+for positives, `floor` for negatives — since neither method alone means "away
+from zero". `TowardZero` is exactly `trunc`.
+
+```rust ! mathematics.rs
 #[derive(Copy, Clone)]
 enum RoundMode {
     Nearest,
@@ -41,6 +184,7 @@ fn round_fn(args: Spanned<Vec<Spanned<Value>>>, mode: RoundMode) -> FormulaResul
         Some(d) => d.to_integer()?,
         None => 0,
     };
+    // !mark(1:2)
     let factor = 10.0_f64.powi(digits as i32);
     let x = number.to_number()? * factor;
     let rounded = match mode {
@@ -56,7 +200,23 @@ fn round_fn(args: Spanned<Vec<Spanned<Value>>>, mode: RoundMode) -> FormulaResul
     };
     Ok(Value::Number(rounded / factor))
 }
+```
 
+## !!steps CEILING and FLOOR round to a multiple
+
+`CEILING` and `FLOOR` snap to a multiple of an increment rather than to a
+number of decimal places, and they share `increment_round`. The only
+difference between them is the `fn(f64) -> f64` passed in: `f64::ceil` or
+`f64::floor`, applied to the value divided by the increment before
+multiplying back.
+
+The increment defaults to 1, which makes bare `CEILING(8.1)` and
+`FLOOR(8.9)` behave like ordinary ceiling and floor. A zero increment would
+divide by zero, so it short-circuits to `0` — the comment records that this
+matches the behavior of the modern quadratic-core rather than being an
+accident.
+
+```rust ! mathematics.rs
 /// Shared implementation for CEILING/FLOOR: `(number)` or `(number, increment)`.
 /// Matches the modern core: a zero increment yields 0.
 fn increment_round(args: Spanned<Vec<Spanned<Value>>>, round: fn(f64) -> f64) -> FormulaResult {
@@ -72,173 +232,56 @@ fn increment_round(args: Spanned<Vec<Spanned<Value>>>, round: fn(f64) -> f64) ->
         Some(i) => i.to_number()?,
         None => 1.0,
     };
+    // !mark
     if increment == 0.0 {
         return Ok(Value::Number(0.0));
     }
     let n = number.to_number()?;
+    // !mark
     Ok(Value::Number(round(n / increment) * increment))
 }
+```
 
-fn get_functions() -> Vec<FormulaFunction> {
-    vec![
-        FormulaFunction {
-            name: "SUM",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["SUM(B2:C6, 15, E1)"],
-            doc: "Adds all values.\nReturns `0` if given no values.",
-            eval: util::pure_fn(|args| Ok(Value::Number(util::sum(&args.inner)))),
-        },
-        FormulaFunction {
-            name: "PRODUCT",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["PRODUCT(B2:C6, 0.002, E1)"],
-            doc: "Multiplies all values.\nReturns 1 if given no values.",
-            eval: util::pure_fn(|args| Ok(Value::Number(util::product(&args.inner)))),
-        },
-        FormulaFunction {
-            name: "ABS",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["ABS(-4)"],
-            doc: "Returns the absolute value of a number.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.abs()))),
-        },
-        FormulaFunction {
-            name: "SQRT",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["SQRT(2)"],
-            doc: "Returns the square root of a number.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.sqrt()))),
-        },
-        FormulaFunction {
-            name: "POWER",
-            arg_completion: "${1:base}, ${2:exponent}",
-            usages: &["base, exponent"],
-            examples: &["POWER(2, 10)"],
-            doc: "Returns `base` raised to the power of `exponent`.",
-            eval: util::array_mapped(|[base, exponent]| {
-                Ok(Value::Number(base.to_number()?.powf(exponent.to_number()?)))
-            }),
-        },
-        FormulaFunction {
-            name: "EXP",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["EXP(1)"],
-            doc: "Returns e raised to the power of `number`.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.exp()))),
-        },
-        FormulaFunction {
-            name: "LN",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["LN(50)"],
-            doc: "Returns the natural logarithm of a number.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.ln()))),
-        },
-        FormulaFunction {
-            name: "LOG",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, base"],
-            examples: &["LOG(100)", "LOG(8, 2)"],
-            doc: "Returns the logarithm of a number. Uses base 10 unless a base is given.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(number), base) = (a.next(), a.next()) else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
-                if a.next().is_some() {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                }
-                let base = match base {
-                    Some(b) => b.to_number()?,
-                    None => 10.0,
-                };
-                if base <= 0.0 {
-                    return Err(FormulaErrorMsg::BadNumber.with_span(span));
-                }
-                Ok(Value::Number(number.to_number()?.log(base)))
-            }),
-        },
-        FormulaFunction {
-            name: "LOG10",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["LOG10(1000)"],
-            doc: "Returns the base-10 logarithm of a number.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.log10()))),
-        },
-        FormulaFunction {
-            name: "MOD",
-            arg_completion: "${1:number}, ${2:divisor}",
-            usages: &["number, divisor"],
-            examples: &["MOD(7, 3)", "MOD(-7, 3)"],
+## !!steps MOD follows the sign of the divisor
+
+Rust's `%` on floats is a *remainder*: it keeps the sign of the dividend, so
+`-7 % 3` is `-1`. Spreadsheets expect a *modulo* whose result takes the sign
+of the divisor, making `MOD(-7, 3)` equal `2`. The double-remainder
+expression `((n % d) + d) % d` converts one into the other — adding `d` lifts
+a negative remainder into range, and the second `%` brings values back down
+when the first remainder was already non-negative.
+
+A zero divisor is caught up front and reported as `DivideByZero`, spanned to
+the divisor argument so the editor underlines the offending expression.
+
+```rust ! mathematics.rs
             doc: "Returns the remainder after dividing `number` by `divisor`. \
                   The result has the same sign as `divisor`.",
             eval: util::array_mapped(|[number, divisor]| {
                 let d = divisor.to_number()?;
+                // !mark
                 if d == 0.0 {
                     return Err(FormulaErrorMsg::DivideByZero.with_span(divisor.span));
                 }
                 let n = number.to_number()?;
+                // !mark
                 Ok(Value::Number(((n % d) + d) % d))
             }),
         },
-        FormulaFunction {
-            name: "ROUND",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, digits"],
-            examples: &["ROUND(3.14159)", "ROUND(3.14159, 2)"],
-            doc: "Rounds a number to the given number of digits after the decimal point \
-                  (default 0).",
-            eval: util::pure_fn(|args| round_fn(args, RoundMode::Nearest)),
-        },
-        FormulaFunction {
-            name: "ROUNDUP",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, digits"],
-            examples: &["ROUNDUP(3.14159, 2)"],
-            doc: "Rounds a number away from zero to the given number of digits after the \
-                  decimal point (default 0).",
-            eval: util::pure_fn(|args| round_fn(args, RoundMode::AwayFromZero)),
-        },
-        FormulaFunction {
-            name: "ROUNDDOWN",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, digits"],
-            examples: &["ROUNDDOWN(3.14159, 2)"],
-            doc: "Rounds a number toward zero to the given number of digits after the \
-                  decimal point (default 0).",
-            eval: util::pure_fn(|args| round_fn(args, RoundMode::TowardZero)),
-        },
-        FormulaFunction {
-            name: "INT",
-            arg_completion: "${1:number}",
-            usages: &["number"],
-            examples: &["INT(8.9)", "INT(-8.9)"],
-            doc: "Rounds a number down to the nearest integer.",
-            eval: util::array_mapped(|[number]| Ok(Value::Number(number.to_number()?.floor()))),
-        },
-        FormulaFunction {
-            name: "CEILING",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, increment"],
-            examples: &["CEILING(8.1)", "CEILING(6.5, 2)"],
-            doc: "Rounds a number up to the next multiple of `increment` (default 1).",
-            eval: util::pure_fn(|args| increment_round(args, f64::ceil)),
-        },
-        FormulaFunction {
-            name: "FLOOR",
-            arg_completion: "${1:number}",
-            usages: &["number", "number, increment"],
-            examples: &["FLOOR(8.9)", "FLOOR(6.5, 2)"],
-            doc: "Rounds a number down to the previous multiple of `increment` (default 1).",
-            eval: util::pure_fn(|args| increment_round(args, f64::floor)),
-        },
+```
+
+## !!steps Constants are zero-argument functions
+
+`PI` and `TAU` are still `FormulaFunction` values, not parser-level literals,
+which is why they are written with parentheses in a formula. `util::constant_fn`
+builds an `eval` that verifies the argument list is empty — `PI(16)` is a
+`BadArgumentCount` error — and otherwise clones the stored value.
+
+`std::f64::consts::TAU` is 2π, so `TAU()` starts with `6.283`; the
+trigonometric functions that consume these constants live in
+[trigonometry.rs](/docs/quadratic-core/src/formulas/functions/trigonometry.rs).
+
+```rust ! mathematics.rs
         // Constants
         FormulaFunction {
             name: "PI",
@@ -246,6 +289,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &[""],
             examples: &["PI()"],
             doc: "Returns π, the circle constant.",
+            // !mark
             eval: util::constant_fn(Value::Number(std::f64::consts::PI)),
         },
         FormulaFunction {
@@ -254,107 +298,48 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &[""],
             examples: &["TAU()"],
             doc: "Returns τ, the circle constant equal to 2π.",
+            // !mark
             eval: util::constant_fn(Value::Number(std::f64::consts::TAU)),
         },
     ]
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+</Scrollycoding>
 
-    #[test]
-    fn test_sum() {
-        let g = &mut NoGrid;
-        assert_eq!("0", eval_to_string(g, "SUM(\"\", \"abc\")"));
-        assert_eq!("12", eval_to_string(g, "SUM(\"\", \"abc\", 12)"));
-        assert_eq!("27", eval_to_string(g, "SUM(0..5, \"\", \"abc\", 12)"));
-    }
+## Implemented functions
 
-    #[test]
-    fn test_product() {
-        let g = &mut NoGrid;
-        assert_eq!("1", eval_to_string(g, "PRODUCT(\"\", \"abc\")"));
-        assert_eq!("12", eval_to_string(g, "PRODUCT(\"\", \"abc\", 12)"));
-        assert_eq!(
-            "1440",
-            eval_to_string(g, "PRODUCT(1..5, \"\", \"abc\", 12)")
-        );
-        assert_eq!("0", eval_to_string(g, "PRODUCT(0..5, \"\", \"abc\", 12)"));
-    }
+| Name | Purpose |
+| --- | --- |
+| SUM | Adds all values, ranges included; `0` when given none |
+| PRODUCT | Multiplies all values; `1` when given none |
+| ABS | Absolute value |
+| SQRT | Square root |
+| POWER | `base` raised to `exponent` |
+| EXP | e raised to a number |
+| LN | Natural logarithm |
+| LOG | Logarithm in base 10, or in a given base |
+| LOG10 | Base-10 logarithm |
+| MOD | Remainder after division, taking the sign of the divisor |
+| ROUND | Rounds to a number of decimal digits, default 0 |
+| ROUNDUP | Rounds away from zero to a number of decimal digits |
+| ROUNDDOWN | Rounds toward zero to a number of decimal digits |
+| INT | Rounds down to the nearest integer |
+| CEILING | Rounds up to the next multiple of an increment, default 1 |
+| FLOOR | Rounds down to the previous multiple of an increment, default 1 |
+| PI | The circle constant π |
+| TAU | The circle constant τ, equal to 2π |
 
-    #[test]
-    fn test_formula_abs() {
-        let g = &mut NoGrid;
-        assert_eq!("10", eval_to_string(g, "ABS(-10)"));
-        assert_eq!("10", eval_to_string(g, "ABS(10)"));
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("ABS()", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("ABS(16, 17)", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-    }
-
-    #[test]
-    fn test_formula_sqrt() {
-        let g = &mut NoGrid;
-        crate::util::assert_f64_approx_eq(3.0_f64.sqrt(), &eval_to_string(g, "SQRT(3)"));
-        assert_eq!("4", eval_to_string(g, "SQRT(16)"));
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("SQRT()", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("SQRT(16, 17)", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-    }
-
-    #[test]
-    fn test_formula_pi() {
-        let g = &mut NoGrid;
-        assert!(eval_to_string(g, "PI()").starts_with("3.14159"));
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("PI(16)", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-    }
-
-    #[test]
-    fn test_formula_tau() {
-        let g = &mut NoGrid;
-        assert!(eval_to_string(g, "TAU()").starts_with("6.283"));
-        assert_eq!(
-            FormulaErrorMsg::BadArgumentCount,
-            parse_formula("TAU(16)", Pos::ORIGIN)
-                .unwrap()
-                .eval_blocking(g, Pos::ORIGIN)
-                .unwrap_err()
-                .msg,
-        );
-    }
-}
-````
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs); the
+`pure_fn`, `array_mapped`, `constant_fn`, `sum`, and `product` helpers used
+above come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), and
+the `to_number` and `to_integer` coercions on arguments are defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs). Arithmetic operators
+such as `+` and `*` are separate functions in
+[operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs);
+aggregates beyond `SUM` live in
+[statistics.rs](/docs/quadratic-core/src/formulas/functions/statistics.rs), and
+the errors raised here are described in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

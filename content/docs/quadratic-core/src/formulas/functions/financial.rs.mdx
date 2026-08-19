@@ -1,26 +1,41 @@
 ---
 title: "financial.rs"
-description: "Financial functions, backported from the modern quadratic-core's `financial/{loan,investment}.rs`: payments, rates, depreciation, and (X)NPV/(X)IRR. The bond…"
+description: "Loan, annuity, depreciation, and cash-flow functions sharing time-value-of-money helpers and iterative solvers with a bisection fallback"
 source: "quadratic-core/src/formulas/functions/financial.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "Financial functions" category of the formula engine:
+payments and rates (`PMT`, `FV`, `PV`, `NPER`, `RATE`), loan amortization
+(`IPMT`, `PPMT`, `CUMIPMT`, `CUMPRINC`), depreciation (`SLN`, `SYD`, `DB`,
+`DDB`, `VDB`), and cash-flow analysis (`NPV`, `IRR`, `MIRR`, `XNPV`, `XIRR`).
+Its header notes that these were backported from the modern quadratic-core's
+`financial/loan.rs` and `financial/investment.rs`, and that the
+bond, securities, and treasury families remain unported.
 
-````rust financial.rs -n
-//! Financial functions, backported from the modern quadratic-core's
-//! `financial/{loan,investment}.rs`: payments, rates, depreciation, and
-//! (X)NPV/(X)IRR. The bond/securities/treasury families remain unported.
-//!
-//! RATE, IRR, and XIRR solve iteratively: Newton-Raphson exactly as the
-//! modern core does it, plus a bisection fallback (which the modern core
-//! lacks) that only runs when Newton fails to converge.
+Like every sibling in this directory, the module exports a `CATEGORY`
+constant whose `get_functions` pointer produces the actual `FormulaFunction`
+values; [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs)
+flattens all categories into the global `ALL_FUNCTIONS` map that the evaluator
+looks up by uppercase name. Everything below is built from a handful of shared
+private helpers rather than one closure per formula.
 
-use super::datetime::{days_from_civil, parse_date_str};
-use super::*;
+<Scrollycoding>
 
+## !!steps One category, twenty-one functions
+
+The `CATEGORY` constant is the registration point: a display name, a docs
+blurb for the formula editor — here the sign convention, cash outflows
+negative and inflows positive — and the `get_functions` pointer. Each entry
+in the returned vector is a `FormulaFunction` bundling name, autocomplete
+snippet, usage strings, examples, docs, and an `eval` closure.
+
+`PMT` shows the shape every function in this file follows: `util::pure_fn`
+wraps a closure over the raw argument list, `Args::new` checks the arity,
+optional arguments fall back to defaults, and the actual arithmetic lives in
+a shared free function.
+
+```rust ! financial.rs
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
@@ -29,9 +44,45 @@ pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     get_functions,
 };
 
-// ---------- shared helpers (ported verbatim from the modern core) ----------
+// ...
 
+fn get_functions() -> Vec<FormulaFunction> {
+    vec![
+        FormulaFunction {
+            name: "PMT",
+            arg_completion: "${1:rate}, ${2:nper}, ${3:pv}",
+            usages: &["rate, nper, pv", "rate, nper, pv, fv, type"],
+            examples: &["PMT(0.08/12, 12*5, 10000)"],
+            doc: "Payment for a loan with constant payments and interest rate.",
+            eval: util::pure_fn(|args| {
+                let a = Args::new(args, 3, 5)?;
+                let fv = a.opt_num(3)?.unwrap_or(0.0);
+                let t = normalize_payment_type(a.opt_num(4)?);
+                // !mark
+                Ok(Value::Number(calculate_pmt(a.num(0)?, a.num(1)?, a.num(2)?, fv, t)))
+            }),
+        },
+        // ...
+    ]
+}
+```
+
+## !!steps Time value of money in three helpers
+
+`calculate_pmt`, `calculate_fv`, and `calculate_pv` are the same equation
+solved for three different unknowns, and `PMT`, `FV`, and `PV` are barely more
+than argument shuffling on top of them. Two quantities recur: `pvif`, the
+compounding factor `(1 + rate)^nper`, and `fvifa`, the annuity factor
+`(pvif - 1) / rate`.
+
+Each helper special-cases a zero rate, because both factors degenerate there —
+with no interest, the payments simply divide the principal evenly across the
+periods. Signs follow the Excel convention: the results are negated so that a
+loan taken as a positive present value produces a negative payment.
+
+```rust ! financial.rs
 fn calculate_pmt(rate: f64, nper: f64, pv: f64, fv: f64, payment_type: f64) -> f64 {
+    // !mark
     if rate == 0.0 {
         -(pv + fv) / nper
     } else {
@@ -60,163 +111,31 @@ fn calculate_pv(rate: f64, nper: f64, pmt: f64, fv: f64, payment_type: f64) -> f
         (-fv - pmt * (1.0 + rate * payment_type) * fvifa) / pvif
     }
 }
+```
 
+## !!steps Payment timing, and NPER in closed form
+
+The optional `type` argument selects when payments fall due.
+`normalize_payment_type` collapses it to exactly `0.0` or `1.0`: anything
+non-zero (and any missing argument defaults to zero) means an annuity due,
+payments at the start of each period. Everywhere else in the file that value
+appears as the factor `1 + rate * t`, which advances one period of interest
+onto every payment.
+
+`NPER` is the one member of the family that does not call a shared helper: it
+inverts the annuity equation analytically. A zero rate reduces to a plain
+division — guarded against a zero payment — and otherwise the period count is
+a ratio of logarithms. Because the logarithm's argument can go non-positive
+for inputs that never amortize, the code rejects that case rather than
+returning a NaN.
+
+```rust ! financial.rs
 fn normalize_payment_type(payment_type: Option<f64>) -> f64 {
     if payment_type.unwrap_or(0.0) != 0.0 { 1.0 } else { 0.0 }
 }
 
-/// Bisection fallback for the rate solvers: scans (-0.9999, 10) for a sign
-/// change of `f`, then halves the bracket. Returns None when no root is
-/// bracketed.
-fn bisect(f: impl Fn(f64) -> f64) -> Option<f64> {
-    const STEPS: usize = 400;
-    let x = |i: usize| -0.9999 + (10.0 + 0.9999) * i as f64 / STEPS as f64;
-    let mut lo = x(0);
-    let mut flo = f(lo);
-    let mut bracket = None;
-    for i in 1..=STEPS {
-        let hi = x(i);
-        let fhi = f(hi);
-        if flo.is_finite() && fhi.is_finite() && flo * fhi <= 0.0 {
-            bracket = Some((lo, hi));
-            break;
-        }
-        lo = hi;
-        flo = fhi;
-    }
-    let (mut lo, mut hi) = bracket?;
-    let mut flo = f(lo);
-    for _ in 0..200 {
-        let mid = (lo + hi) / 2.0;
-        let fm = f(mid);
-        if !fm.is_finite() {
-            return None;
-        }
-        if flo * fm <= 0.0 {
-            hi = mid;
-        } else {
-            lo = mid;
-            flo = fm;
-        }
-    }
-    Some((lo + hi) / 2.0)
-}
+// ...
 
-// ---------- argument plumbing (pure_fn takes a flat Spanned<Vec>) ----------
-
-struct Args {
-    span: crate::formulas::Span,
-    values: Vec<Spanned<Value>>,
-}
-
-impl Args {
-    fn new(args: Spanned<Vec<Spanned<Value>>>, min: usize, max: usize) -> FormulaResult<Self> {
-        if args.inner.len() < min || args.inner.len() > max {
-            return Err(FormulaErrorMsg::BadArgumentCount.with_span(args.span));
-        }
-        Ok(Self { span: args.span, values: args.inner })
-    }
-
-    fn num(&self, i: usize) -> FormulaResult<f64> {
-        self.values[i].to_number()
-    }
-
-    fn opt_num(&self, i: usize) -> FormulaResult<Option<f64>> {
-        self.values.get(i).map(|v| v.to_number()).transpose()
-    }
-
-    /// All numbers of argument `i`, arrays flattened.
-    fn numbers_of(&self, i: usize) -> Vec<f64> {
-        util::flat_iter_numbers(&self.values[i..=i]).collect()
-    }
-
-    /// Dates of argument `i` as day counts, arrays flattened.
-    fn days_of(&self, i: usize) -> FormulaResult<Vec<i64>> {
-        let strings: Vec<String> = util::flat_iter_strings(&self.values[i..=i]).collect();
-        strings
-            .iter()
-            .map(|s| {
-                parse_date_str(s).map(|(y, m, d)| days_from_civil(y, m, d)).ok_or_else(|| {
-                    FormulaErrorMsg::Expected {
-                        expected: "a date like 2026-08-06".into(),
-                        got: Some(s.clone().into()),
-                    }
-                    .with_span(self.values[i].span)
-                })
-            })
-            .collect()
-    }
-
-    fn invalid(&self) -> crate::formulas::FormulaError {
-        FormulaErrorMsg::Expected { expected: "valid financial arguments".into(), got: None }
-            .with_span(self.span)
-    }
-}
-
-/// Amortization walk shared by IPMT/PPMT/CUMIPMT/CUMPRINC: returns the
-/// balance entering `per` given the standard payment.
-fn balance_before(rate: f64, pv: f64, pmt: f64, payment_type: f64, per: i64) -> f64 {
-    let mut balance = pv;
-    for _ in 1..per {
-        if payment_type == 1.0 {
-            balance += pmt;
-        }
-        let interest = balance * rate;
-        balance = balance + interest + pmt;
-        if payment_type == 1.0 {
-            balance -= pmt;
-        }
-    }
-    balance
-}
-
-fn get_functions() -> Vec<FormulaFunction> {
-    vec![
-        FormulaFunction {
-            name: "PMT",
-            arg_completion: "${1:rate}, ${2:nper}, ${3:pv}",
-            usages: &["rate, nper, pv", "rate, nper, pv, fv, type"],
-            examples: &["PMT(0.08/12, 12*5, 10000)"],
-            doc: "Payment for a loan with constant payments and interest rate.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 5)?;
-                let fv = a.opt_num(3)?.unwrap_or(0.0);
-                let t = normalize_payment_type(a.opt_num(4)?);
-                Ok(Value::Number(calculate_pmt(a.num(0)?, a.num(1)?, a.num(2)?, fv, t)))
-            }),
-        },
-        FormulaFunction {
-            name: "FV",
-            arg_completion: "${1:rate}, ${2:nper}, ${3:pmt}",
-            usages: &["rate, nper, pmt", "rate, nper, pmt, pv, type"],
-            examples: &["FV(0.08/12, 12*5, -200)"],
-            doc: "Future value of an investment with periodic payments.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 5)?;
-                let pv = a.opt_num(3)?.unwrap_or(0.0);
-                let t = normalize_payment_type(a.opt_num(4)?);
-                Ok(Value::Number(calculate_fv(a.num(0)?, a.num(1)?, a.num(2)?, pv, t)))
-            }),
-        },
-        FormulaFunction {
-            name: "PV",
-            arg_completion: "${1:rate}, ${2:nper}, ${3:pmt}",
-            usages: &["rate, nper, pmt", "rate, nper, pmt, fv, type"],
-            examples: &["PV(0.08/12, 12*5, -200)"],
-            doc: "Present value of an investment with periodic payments.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 5)?;
-                let fv = a.opt_num(3)?.unwrap_or(0.0);
-                let t = normalize_payment_type(a.opt_num(4)?);
-                Ok(Value::Number(calculate_pv(a.num(0)?, a.num(1)?, a.num(2)?, fv, t)))
-            }),
-        },
-        FormulaFunction {
-            name: "NPER",
-            arg_completion: "${1:rate}, ${2:pmt}, ${3:pv}",
-            usages: &["rate, pmt, pv", "rate, pmt, pv, fv, type"],
-            examples: &["NPER(0.08/12, -200, 10000)"],
-            doc: "Number of payment periods for an investment.",
             eval: util::pure_fn(|args| {
                 let a = Args::new(args, 3, 5)?;
                 let (rate, pmt, pv) = (a.num(0)?, a.num(1)?, a.num(2)?);
@@ -230,66 +149,51 @@ fn get_functions() -> Vec<FormulaFunction> {
                 }
                 let pmt_factor = 1.0 + rate * t;
                 let log_arg = (pmt * pmt_factor - fv * rate) / (pmt * pmt_factor + pv * rate);
+                // !mark(1:3)
                 if log_arg <= 0.0 {
                     return Err(a.invalid());
                 }
                 Ok(Value::Number(log_arg.ln() / (1.0 + rate).ln()))
             }),
-        },
-        FormulaFunction {
-            name: "RATE",
-            arg_completion: "${1:nper}, ${2:pmt}, ${3:pv}",
-            usages: &["nper, pmt, pv", "nper, pmt, pv, fv, type, guess"],
-            examples: &["RATE(12*5, -200, 10000)"],
-            doc: "Interest rate per period, solved iteratively.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 6)?;
-                let (nper, pmt, pv) = (a.num(0)?, a.num(1)?, a.num(2)?);
-                let fv = a.opt_num(3)?.unwrap_or(0.0);
-                let t = normalize_payment_type(a.opt_num(4)?);
-                let guess = a.opt_num(5)?.unwrap_or(0.1);
+```
 
-                let objective = |rate: f64| {
-                    let pvif = (1.0 + rate).powf(nper);
-                    let fvifa = if rate == 0.0 { nper } else { (pvif - 1.0) / rate };
-                    pv * pvif + pmt * (1.0 + rate * t) * fvifa + fv
-                };
+## !!steps The amortization walk
 
-                let mut rate = guess;
-                for _ in 0..100 {
-                    let pvif = (1.0 + rate).powf(nper);
-                    let fvifa = if rate == 0.0 { nper } else { (pvif - 1.0) / rate };
-                    let f = pv * pvif + pmt * (1.0 + rate * t) * fvifa + fv;
-                    let df = if rate == 0.0 {
-                        pv * nper + pmt * t * nper + pmt * nper * (nper - 1.0) / 2.0
-                    } else {
-                        let dpvif = nper * (1.0 + rate).powf(nper - 1.0);
-                        let dfvifa = (dpvif * rate - pvif + 1.0) / (rate * rate);
-                        pv * dpvif + pmt * t * fvifa + pmt * (1.0 + rate * t) * dfvifa
-                    };
-                    if df.abs() < 1e-15 {
-                        break;
-                    }
-                    let new_rate = rate - f / df;
-                    if (new_rate - rate).abs() < 1e-10 {
-                        rate = new_rate;
-                        break;
-                    }
-                    rate = new_rate;
-                }
+There is no closed form here: `balance_before` simply replays the loan period
+by period, adding interest and applying the standard payment, and returns the
+balance entering period `per`. For an annuity due it adds the payment before
+charging interest and takes it back off afterwards, so the period's interest
+is computed on the reduced balance. `IPMT`, `PPMT`, `CUMIPMT`, and `CUMPRINC`
+all share this walk, which makes them linear in the period index.
 
-                if !rate.is_finite() || rate < -1.0 {
-                    rate = bisect(objective).ok_or_else(|| a.invalid())?;
-                }
-                Ok(Value::Number(rate))
-            }),
-        },
-        FormulaFunction {
-            name: "IPMT",
-            arg_completion: "${1:rate}, ${2:per}, ${3:nper}, ${4:pv}",
-            usages: &["rate, per, nper, pv", "rate, per, nper, pv, fv, type"],
-            examples: &["IPMT(0.08/12, 1, 12*5, 10000)"],
-            doc: "Interest portion of a loan payment for a given period.",
+`IPMT` recomputes the standard payment, replays the balance, and returns the
+negated interest on it. The annuity-due edge case is explicit: when payments
+are due at the start and the period is the first one, no interest has accrued
+yet, so the answer is exactly zero. `PPMT` calls the same code and returns
+`pmt - ipmt`, which is why interest and principal always sum back to the
+payment.
+
+```rust ! financial.rs
+/// Amortization walk shared by IPMT/PPMT/CUMIPMT/CUMPRINC: returns the
+/// balance entering `per` given the standard payment.
+fn balance_before(rate: f64, pv: f64, pmt: f64, payment_type: f64, per: i64) -> f64 {
+    let mut balance = pv;
+    for _ in 1..per {
+        // !mark(1:3)
+        if payment_type == 1.0 {
+            balance += pmt;
+        }
+        let interest = balance * rate;
+        balance = balance + interest + pmt;
+        if payment_type == 1.0 {
+            balance -= pmt;
+        }
+    }
+    balance
+}
+
+// ...
+
             eval: util::pure_fn(|args| {
                 let a = Args::new(args, 4, 6)?;
                 let (rate, per, nper, pv) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
@@ -302,213 +206,25 @@ fn get_functions() -> Vec<FormulaFunction> {
                 let balance = balance_before(rate, pv, pmt, t, per as i64);
                 Ok(Value::Number(if t == 1.0 && per == 1.0 { 0.0 } else { -(balance * rate) }))
             }),
-        },
-        FormulaFunction {
-            name: "PPMT",
-            arg_completion: "${1:rate}, ${2:per}, ${3:nper}, ${4:pv}",
-            usages: &["rate, per, nper, pv", "rate, per, nper, pv, fv, type"],
-            examples: &["PPMT(0.08/12, 1, 12*5, 10000)"],
-            doc: "Principal portion of a loan payment for a given period.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 4, 6)?;
-                let (rate, per, nper, pv) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
-                let fv = a.opt_num(4)?.unwrap_or(0.0);
-                let t = normalize_payment_type(a.opt_num(5)?);
-                if per < 1.0 || per > nper || !per.is_finite() {
-                    return Err(a.invalid());
-                }
-                let pmt = calculate_pmt(rate, nper, pv, fv, t);
-                let balance = balance_before(rate, pv, pmt, t, per as i64);
-                let ipmt = if t == 1.0 && per == 1.0 { 0.0 } else { -(balance * rate) };
-                Ok(Value::Number(pmt - ipmt))
-            }),
-        },
-        FormulaFunction {
-            name: "ISPMT",
-            arg_completion: "${1:rate}, ${2:per}, ${3:nper}, ${4:pv}",
-            usages: &["rate, per, nper, pv"],
-            examples: &["ISPMT(0.08/12, 1, 12, 10000)"],
-            doc: "Interest paid during a period, using simple interest.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 4, 4)?;
-                let (rate, per, nper, pv) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
-                Ok(Value::Number(pv * rate * (per / nper - 1.0)))
-            }),
-        },
-        FormulaFunction {
-            name: "CUMIPMT",
-            arg_completion: "${1:rate}, ${2:nper}, ${3:pv}, ${4:start}, ${5:end}, ${6:type}",
-            usages: &["rate, nper, pv, start_period, end_period, type"],
-            examples: &["CUMIPMT(0.08/12, 12*5, 10000, 1, 12, 0)"],
-            doc: "Cumulative interest paid between two periods (negative: a \
-                  cash outflow).",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 6, 6)?;
-                let (rate, nper, pv) = (a.num(0)?, a.num(1)?, a.num(2)?);
-                let (start, end) = (a.num(3)?, a.num(4)?);
-                let t = normalize_payment_type(Some(a.num(5)?));
-                if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1.0 || end < start
-                    || end > nper || !end.is_finite()
-                {
-                    return Err(a.invalid());
-                }
-                let pmt = calculate_pmt(rate, nper, pv, 0.0, t);
-                let mut balance = pv;
-                let mut cum_interest = 0.0;
-                for period in 1..=end as i64 {
-                    if t == 1.0 {
-                        balance += pmt;
-                    }
-                    let interest = balance * rate;
-                    if period >= start as i64 {
-                        cum_interest += interest;
-                    }
-                    balance = balance + interest + pmt;
-                    if t == 1.0 {
-                        balance -= pmt;
-                    }
-                }
-                Ok(Value::Number(-cum_interest))
-            }),
-        },
-        FormulaFunction {
-            name: "CUMPRINC",
-            arg_completion: "${1:rate}, ${2:nper}, ${3:pv}, ${4:start}, ${5:end}, ${6:type}",
-            usages: &["rate, nper, pv, start_period, end_period, type"],
-            examples: &["CUMPRINC(0.08/12, 12*5, 10000, 1, 12, 0)"],
-            doc: "Cumulative principal paid between two periods (negative: a \
-                  cash outflow).",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 6, 6)?;
-                let (rate, nper, pv) = (a.num(0)?, a.num(1)?, a.num(2)?);
-                let (start, end) = (a.num(3)?, a.num(4)?);
-                let t = normalize_payment_type(Some(a.num(5)?));
-                if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 || start < 1.0 || end < start
-                    || end > nper || !end.is_finite()
-                {
-                    return Err(a.invalid());
-                }
-                let pmt = calculate_pmt(rate, nper, pv, 0.0, t);
-                let mut balance = pv;
-                let mut cum_principal = 0.0;
-                for period in 1..=end as i64 {
-                    if t == 1.0 {
-                        balance += pmt;
-                    }
-                    let interest = balance * rate;
-                    if period >= start as i64 {
-                        cum_principal += pmt + interest;
-                    }
-                    balance = balance + interest + pmt;
-                    if t == 1.0 {
-                        balance -= pmt;
-                    }
-                }
-                Ok(Value::Number(cum_principal))
-            }),
-        },
-        FormulaFunction {
-            name: "SLN",
-            arg_completion: "${1:cost}, ${2:salvage}, ${3:life}",
-            usages: &["cost, salvage, life"],
-            examples: &["SLN(1000, 100, 10)"],
-            doc: "Straight-line depreciation for one period.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 3)?;
-                let life = a.num(2)?;
-                if life == 0.0 {
-                    return Err(FormulaErrorMsg::DivideByZero.with_span(a.span));
-                }
-                Ok(Value::Number((a.num(0)? - a.num(1)?) / life))
-            }),
-        },
-        FormulaFunction {
-            name: "SYD",
-            arg_completion: "${1:cost}, ${2:salvage}, ${3:life}, ${4:per}",
-            usages: &["cost, salvage, life, per"],
-            examples: &["SYD(1000, 100, 10, 1)"],
-            doc: "Sum-of-years-digits depreciation for a period.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 4, 4)?;
-                let (cost, salvage, life, per) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
-                if life <= 0.0 || per < 1.0 || per > life {
-                    return Err(a.invalid());
-                }
-                let sum_of_years = life * (life + 1.0) / 2.0;
-                Ok(Value::Number((cost - salvage) * (life - per + 1.0) / sum_of_years))
-            }),
-        },
-        FormulaFunction {
-            name: "DB",
-            arg_completion: "${1:cost}, ${2:salvage}, ${3:life}, ${4:period}",
-            usages: &["cost, salvage, life, period", "cost, salvage, life, period, month"],
-            examples: &["DB(1000, 100, 10, 1)"],
-            doc: "Fixed-declining-balance depreciation for a period.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 4, 5)?;
-                let (cost, salvage, life, period) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
-                let month = a.opt_num(4)?.unwrap_or(12.0);
-                if life <= 0.0 || period < 1.0 || month <= 0.0 || month > 12.0 {
-                    return Err(a.invalid());
-                }
-                if cost <= 0.0 {
-                    return Ok(Value::Number(0.0));
-                }
-                let rate = (((1.0 - (salvage / cost).powf(1.0 / life)) * 1000.0).round() / 1000.0)
-                    .max(0.0);
-                let mut value = cost;
-                let mut depreciation = 0.0;
-                for p in 1..=period as i64 {
-                    depreciation = if p == 1 {
-                        cost * rate * month / 12.0
-                    } else if p as f64 == (life + 1.0).floor() {
-                        value * rate * (12.0 - month) / 12.0
-                    } else {
-                        value * rate
-                    };
-                    value -= depreciation;
-                }
-                Ok(Value::Number(depreciation))
-            }),
-        },
-        FormulaFunction {
-            name: "DDB",
-            arg_completion: "${1:cost}, ${2:salvage}, ${3:life}, ${4:period}",
-            usages: &["cost, salvage, life, period", "cost, salvage, life, period, factor"],
-            examples: &["DDB(1000, 100, 10, 1)"],
-            doc: "Double-declining-balance depreciation for a period.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 4, 5)?;
-                let (cost, salvage, life, period) = (a.num(0)?, a.num(1)?, a.num(2)?, a.num(3)?);
-                let factor = a.opt_num(4)?.unwrap_or(2.0);
-                if life <= 0.0 || period < 1.0 || period > life || factor <= 0.0 {
-                    return Err(a.invalid());
-                }
-                if cost <= 0.0 {
-                    return Ok(Value::Number(0.0));
-                }
-                let rate = factor / life;
-                let mut value = cost;
-                let mut depreciation = 0.0;
-                for _ in 1..=period as i64 {
-                    depreciation = value * rate;
-                    if value - depreciation < salvage {
-                        depreciation = (value - salvage).max(0.0);
-                    }
-                    value -= depreciation;
-                }
-                Ok(Value::Number(depreciation))
-            }),
-        },
-        FormulaFunction {
-            name: "VDB",
-            arg_completion: "${1:cost}, ${2:salvage}, ${3:life}, ${4:start}, ${5:end}",
-            usages: &["cost, salvage, life, start_period, end_period",
-                "cost, salvage, life, start_period, end_period, factor, no_switch"],
-            examples: &["VDB(1000, 100, 10, 0, 1)"],
-            doc: "Variable declining-balance depreciation between two periods, \
-                  switching to straight-line when that depreciates faster \
-                  (unless `no_switch` is true).",
+```
+
+## !!steps Declining balance, with a straight line escape
+
+`VDB` is the most involved of the five depreciation functions. It walks the
+asset's life in slices of at most one period — the fractional `start` and
+`end` bounds are what force the `min` on `next` — and at each slice computes
+two candidates: the declining-balance amount at `factor / life`, and the
+straight-line amount that would write the remaining book value down to
+salvage over the remaining life.
+
+Taking `ddb.max(sln)` is the switch: once straight-line depreciates faster,
+it wins for the rest of the schedule, unless the optional `no_switch`
+argument suppresses it. The result is then clamped so the book value never
+falls below salvage, and only slices at or after `start` are accumulated —
+which is how the same loop serves both the depreciation of a single period
+and of a range.
+
+```rust ! financial.rs
             eval: util::pure_fn(|args| {
                 let a = Args::new(args, 5, 7)?;
                 let (cost, salvage, life) = (a.num(0)?, a.num(1)?, a.num(2)?);
@@ -534,6 +250,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                     } else {
                         0.0
                     };
+                    // !mark(1:2)
                     let dep = if no_switch { ddb } else { ddb.max(sln) };
                     let dep = dep.min(value - salvage).max(0.0);
                     if period >= start {
@@ -544,44 +261,30 @@ fn get_functions() -> Vec<FormulaFunction> {
                 }
                 Ok(Value::Number(total))
             }),
-        },
-        FormulaFunction {
-            name: "NPV",
-            arg_completion: "${1:rate}, ${2:values}",
-            usages: &["rate, value1, [value2, …]"],
-            examples: &["NPV(0.1, {-10000, 3000, 4200, 6800})"],
-            doc: "Net present value of periodic cash flows at a discount rate.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                if args.inner.len() < 2 {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                }
-                let rate = args.inner[0].to_number()?;
-                let mut npv = 0.0;
-                for (i, v) in util::flat_iter_numbers(&args.inner[1..]).enumerate() {
-                    npv += v / (1.0 + rate).powi(i as i32 + 1);
-                }
-                Ok(Value::Number(npv))
-            }),
-        },
-        FormulaFunction {
-            name: "IRR",
-            arg_completion: "${1:values}",
-            usages: &["values", "values, guess"],
-            examples: &["IRR({-10000, 3000, 4200, 6800})"],
-            doc: "Internal rate of return of periodic cash flows, solved \
-                  iteratively.",
+```
+
+## !!steps Newton Raphson, then a fallback
+
+`RATE`, `IRR`, and `XIRR` have no closed form, so each runs the same shape of
+solver: at most 100 Newton-Raphson steps from a guess that defaults to `0.1`,
+accumulating the objective and its derivative in one pass, bailing out when
+the derivative is smaller than `1e-15` or when successive rates differ by less
+than `1e-10`.
+
+`IRR` first insists on at least two cash flows with at least one of each sign,
+since a series that never crosses zero has no rate of return. Note the
+exponent: `IRR` discounts the first flow at period 0, whereas `NPV` discounts
+its first value at period 1 — the two functions do not treat their inputs
+alike. When Newton lands somewhere non-finite or at or below `-1.0`, the
+closure hands its `npv_at` objective to `bisect`; `RATE` does the same, with
+the slightly looser test `rate < -1.0`.
+
+```rust ! financial.rs
             eval: util::pure_fn(|args| {
                 let a = Args::new(args, 1, 2)?;
                 let cash_flows = a.numbers_of(0);
                 let guess = a.opt_num(1)?.unwrap_or(0.1);
-                if cash_flows.len() < 2
-                    || !cash_flows.iter().any(|&v| v > 0.0)
-                    || !cash_flows.iter().any(|&v| v < 0.0)
-                {
-                    return Err(a.invalid());
-                }
-
+                // ...
                 let npv_at = |rate: f64| {
                     cash_flows
                         .iter()
@@ -610,48 +313,114 @@ fn get_functions() -> Vec<FormulaFunction> {
                     rate = new_rate;
                 }
 
+                // !mark(1:3)
                 if !rate.is_finite() || rate <= -1.0 {
                     rate = bisect(npv_at).ok_or_else(|| a.invalid())?;
                 }
                 Ok(Value::Number(rate))
             }),
-        },
-        FormulaFunction {
-            name: "MIRR",
-            arg_completion: "${1:values}, ${2:finance_rate}, ${3:reinvest_rate}",
-            usages: &["values, finance_rate, reinvest_rate"],
-            examples: &["MIRR({-10000, 3000, 4200, 6800}, 0.1, 0.12)"],
-            doc: "Modified internal rate of return, with separate rates for \
-                  financing and reinvestment.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 3, 3)?;
-                let cash_flows = a.numbers_of(0);
-                let (finance_rate, reinvest_rate) = (a.num(1)?, a.num(2)?);
-                let n = cash_flows.len();
-                if n < 2 {
-                    return Err(a.invalid());
-                }
-                let mut npv_neg = 0.0;
-                let mut fv_pos = 0.0;
-                for (i, &cf) in cash_flows.iter().enumerate() {
-                    if cf < 0.0 {
-                        npv_neg += cf / (1.0 + finance_rate).powi(i as i32);
-                    } else {
-                        fv_pos += cf * (1.0 + reinvest_rate).powi((n - 1 - i) as i32);
+```
+
+## !!steps The bisection fallback
+
+`bisect` is what the module header calls out as an addition the modern core
+lacks: a slower but far more robust second attempt. It sweeps 400 sample
+points across the interval from just above `-1.0` (where the discount factors
+blow up) to a rate of 10, looking for the first pair of finite samples whose
+values have opposite signs. No sign change means no bracketed root, and the
+`?` on `bracket` returns `None`, which the callers turn into an error.
+
+With a bracket in hand it runs 200 halvings — far more than needed for `f64`
+precision, but cheap and unconditional — keeping the half that still straddles
+the sign change and returning the midpoint. A non-finite evaluation anywhere
+in the refinement aborts rather than propagating a NaN into the answer.
+
+```rust ! financial.rs
+/// Bisection fallback for the rate solvers: scans (-0.9999, 10) for a sign
+/// change of `f`, then halves the bracket. Returns None when no root is
+/// bracketed.
+fn bisect(f: impl Fn(f64) -> f64) -> Option<f64> {
+    const STEPS: usize = 400;
+    let x = |i: usize| -0.9999 + (10.0 + 0.9999) * i as f64 / STEPS as f64;
+    let mut lo = x(0);
+    let mut flo = f(lo);
+    let mut bracket = None;
+    for i in 1..=STEPS {
+        let hi = x(i);
+        let fhi = f(hi);
+        // !mark
+        if flo.is_finite() && fhi.is_finite() && flo * fhi <= 0.0 {
+            bracket = Some((lo, hi));
+            break;
+        }
+        lo = hi;
+        flo = fhi;
+    }
+    let (mut lo, mut hi) = bracket?;
+    let mut flo = f(lo);
+    for _ in 0..200 {
+        let mid = (lo + hi) / 2.0;
+        let fm = f(mid);
+        if !fm.is_finite() {
+            return None;
+        }
+        if flo * fm <= 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+            flo = fm;
+        }
+    }
+    Some((lo + hi) / 2.0)
+}
+```
+
+## !!steps Flat arguments, and cash flows on arbitrary dates
+
+`pure_fn` hands each closure a single flat `Spanned<Vec<Spanned<Value>>>`, so
+this file wraps it in a small `Args` struct: `Args::new` enforces the arity
+window up front and reports `FormulaErrorMsg::BadArgumentCount` against the
+call's span, `num` and `opt_num` read a required or optional scalar, and the
+two accessors below flatten a whole argument — a range, an inline array, or a
+scalar — into a list. `days_of` stringifies each element and pushes it through
+`parse_date_str` and `days_from_civil` from
+[datetime.rs](/docs/quadratic-core/src/formulas/functions/datetime.rs), so
+dates arrive as plain day counts with the offending argument's span attached
+to any parse error.
+
+`XNPV` and `XIRR` build on that to drop the assumption that flows are evenly
+spaced. Both require the value and date lists to have equal, non-empty
+lengths, and both anchor on the *first* date in the list rather than on the
+earliest one. Elapsed days become years by dividing by `365.0` — a flat
+actual/365 count, the only day-count convention in this file; no function here
+takes a basis argument. `XIRR` precomputes the same amount-and-years pairs
+once and then runs the Newton loop from the previous steps over them.
+
+```rust ! financial.rs
+    fn numbers_of(&self, i: usize) -> Vec<f64> {
+        util::flat_iter_numbers(&self.values[i..=i]).collect()
+    }
+
+    /// Dates of argument `i` as day counts, arrays flattened.
+    fn days_of(&self, i: usize) -> FormulaResult<Vec<i64>> {
+        let strings: Vec<String> = util::flat_iter_strings(&self.values[i..=i]).collect();
+        strings
+            .iter()
+            .map(|s| {
+                // !mark
+                parse_date_str(s).map(|(y, m, d)| days_from_civil(y, m, d)).ok_or_else(|| {
+                    FormulaErrorMsg::Expected {
+                        expected: "a date like 2026-08-06".into(),
+                        got: Some(s.clone().into()),
                     }
-                }
-                if npv_neg == 0.0 || fv_pos == 0.0 {
-                    return Err(a.invalid());
-                }
-                Ok(Value::Number((-fv_pos / npv_neg).powf(1.0 / (n - 1) as f64) - 1.0))
-            }),
-        },
-        FormulaFunction {
-            name: "XNPV",
-            arg_completion: "${1:rate}, ${2:values}, ${3:dates}",
-            usages: &["rate, values, dates"],
-            examples: &["XNPV(0.1, {-10000, 3000}, {\"2026-01-01\", \"2026-06-01\"})"],
-            doc: "Net present value of cash flows on arbitrary dates.",
+                    .with_span(self.values[i].span)
+                })
+            })
+            .collect()
+    }
+
+// ...
+
             eval: util::pure_fn(|args| {
                 let a = Args::new(args, 3, 3)?;
                 let rate = a.num(0)?;
@@ -664,168 +433,50 @@ fn get_functions() -> Vec<FormulaFunction> {
                 let xnpv = values
                     .iter()
                     .zip(&days)
+                    // !mark
                     .map(|(&v, &d)| v / (1.0 + rate).powf((d - d0) as f64 / 365.0))
                     .sum::<f64>();
                 Ok(Value::Number(xnpv))
             }),
-        },
-        FormulaFunction {
-            name: "XIRR",
-            arg_completion: "${1:values}, ${2:dates}",
-            usages: &["values, dates", "values, dates, guess"],
-            examples: &["XIRR({-10000, 12000}, {\"2026-01-01\", \"2026-12-31\"})"],
-            doc: "Internal rate of return of cash flows on arbitrary dates, \
-                  solved iteratively.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 2, 3)?;
-                let values = a.numbers_of(0);
-                let days = a.days_of(1)?;
-                let guess = a.opt_num(2)?.unwrap_or(0.1);
-                if values.len() != days.len() || values.is_empty() {
-                    return Err(a.invalid());
-                }
-                let d0 = days[0];
-                let flows: Vec<(f64, f64)> = values
-                    .iter()
-                    .zip(&days)
-                    .map(|(&v, &d)| (v, (d - d0) as f64 / 365.0))
-                    .collect();
+```
 
-                let xnpv_at = |rate: f64| {
-                    flows.iter().map(|&(cf, years)| cf / (1.0 + rate).powf(years)).sum::<f64>()
-                };
+</Scrollycoding>
 
-                let mut rate = guess;
-                for _ in 0..100 {
-                    let mut xnpv = 0.0;
-                    let mut dxnpv = 0.0;
-                    for &(cf, years) in &flows {
-                        let factor = (1.0 + rate).powf(years);
-                        xnpv += cf / factor;
-                        if years != 0.0 {
-                            dxnpv -= years * cf / factor / (1.0 + rate);
-                        }
-                    }
-                    if dxnpv.abs() < 1e-15 {
-                        break;
-                    }
-                    let new_rate = rate - xnpv / dxnpv;
-                    if (new_rate - rate).abs() < 1e-10 {
-                        rate = new_rate;
-                        break;
-                    }
-                    rate = new_rate;
-                }
+## Implemented functions
 
-                if !rate.is_finite() || rate <= -1.0 {
-                    rate = bisect(xnpv_at).ok_or_else(|| a.invalid())?;
-                }
-                Ok(Value::Number(rate))
-            }),
-        },
-        FormulaFunction {
-            name: "FVSCHEDULE",
-            arg_completion: "${1:principal}, ${2:schedule}",
-            usages: &["principal, schedule"],
-            examples: &["FVSCHEDULE(1000, {0.09, 0.11, 0.1})"],
-            doc: "Future value of a principal after a schedule of compound \
-                  interest rates.",
-            eval: util::pure_fn(|args| {
-                let a = Args::new(args, 2, 2)?;
-                let mut fv = a.num(0)?;
-                for rate in a.numbers_of(1) {
-                    fv *= 1.0 + rate;
-                }
-                Ok(Value::Number(fv))
-            }),
-        },
-    ]
-}
+| Name | Purpose |
+| --- | --- |
+| PMT | Payment for a loan with constant payments and interest rate |
+| FV | Future value of an investment with periodic payments |
+| PV | Present value of an investment with periodic payments |
+| NPER | Number of payment periods, solved in closed form |
+| RATE | Interest rate per period, solved iteratively |
+| IPMT | Interest portion of a loan payment for a given period |
+| PPMT | Principal portion of a loan payment for a given period |
+| ISPMT | Interest paid during a period, using simple interest |
+| CUMIPMT | Cumulative interest between two periods, returned as a negative outflow |
+| CUMPRINC | Cumulative principal between two periods, returned as a negative outflow |
+| SLN | Straight-line depreciation for one period |
+| SYD | Sum-of-years-digits depreciation for a period |
+| DB | Fixed-declining-balance depreciation for a period, with an optional partial first month |
+| DDB | Double-declining-balance depreciation for a period, with an optional factor |
+| VDB | Variable declining-balance depreciation between two periods, switching to straight-line unless suppressed |
+| NPV | Net present value of periodic cash flows at a discount rate |
+| IRR | Internal rate of return of periodic cash flows, solved iteratively |
+| MIRR | Modified internal rate of return, with separate financing and reinvestment rates |
+| XNPV | Net present value of cash flows on arbitrary dates |
+| XIRR | Internal rate of return of cash flows on arbitrary dates, solved iteratively |
+| FVSCHEDULE | Future value of a principal after a schedule of compound interest rates |
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
-
-    fn eval_num(s: &str) -> f64 {
-        eval_to_string(&mut NoGrid, s).parse().unwrap()
-    }
-
-    #[test]
-    fn test_pmt_fv_pv() {
-        // canonical Excel values
-        let pmt = eval_num("PMT(0.08/12, 60, 10000)");
-        assert!((pmt - -202.7639429).abs() < 1e-4, "PMT was {pmt}");
-        let fv = eval_num("FV(0.08/12, 60, -200)");
-        assert!((fv - 14695.3712).abs() < 1e-3, "FV was {fv}");
-        let pv = eval_num("PV(0.08/12, 60, -200)");
-        assert!((pv - 9863.6867).abs() < 1e-3, "PV was {pv}");
-        assert_eq!(-200.0, eval_num("PMT(0, 50, 10000)"));
-    }
-
-    #[test]
-    fn test_nper_rate() {
-        assert!((eval_num("NPER(0.08/12, -200, 10000)") - 61.02).abs() < 0.1);
-        // RATE(60, -202.7639446, 10000) should recover 0.08/12
-        assert!((eval_num("RATE(60, -202.7639446, 10000)") - 0.0066666667).abs() < 1e-8);
-    }
-
-    #[test]
-    fn test_ipmt_ppmt() {
-        let ipmt = eval_num("IPMT(0.08/12, 1, 60, 10000)");
-        let ppmt = eval_num("PPMT(0.08/12, 1, 60, 10000)");
-        assert!((ipmt - -66.6666667).abs() < 1e-6);
-        // interest + principal = the payment
-        assert!((ipmt + ppmt - eval_num("PMT(0.08/12, 60, 10000)")).abs() < 1e-9);
-        assert!((eval_num("ISPMT(0.08/12, 1, 12, 10000)") - -61.1111111).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_cumulative() {
-        let cumipmt = eval_num("CUMIPMT(0.08/12, 60, 10000, 1, 12, 0)");
-        assert!(cumipmt < 0.0, "CUMIPMT returns a negative cash outflow");
-        assert!((cumipmt - -738.766).abs() < 0.01, "CUMIPMT was {cumipmt}");
-        let cumprinc = eval_num("CUMPRINC(0.08/12, 60, 10000, 1, 60, 0)");
-        // over the full life, all principal is repaid
-        assert!((cumprinc - -10000.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn test_depreciation() {
-        assert_eq!(90.0, eval_num("SLN(1000, 100, 10)"));
-        assert!((eval_num("SYD(1000, 100, 10, 1)") - 163.6363636).abs() < 1e-6);
-        assert_eq!(200.0, eval_num("DDB(1000, 100, 10, 1)"));
-        assert!((eval_num("DB(1000, 100, 10, 1)") - 206.0).abs() < 0.01);
-        assert!((eval_num("VDB(1000, 100, 10, 0, 1)") - 200.0).abs() < 1e-9);
-    }
-
-    #[test]
-    fn test_npv_irr() {
-        let npv = eval_num("NPV(0.1, {-10000, 3000, 4200, 6800})");
-        assert!((npv - 1188.44).abs() < 0.5, "NPV was {npv}");
-        let irr = eval_num("IRR({-10000, 3000, 4200, 6800})");
-        // NPV at IRR must be ~0
-        let check = -10000.0 + 3000.0 / (1.0 + irr) + 4200.0 / (1.0 + irr).powi(2)
-            + 6800.0 / (1.0 + irr).powi(3);
-        assert!(check.abs() < 1e-6);
-        let mirr = eval_num("MIRR({-10000, 3000, 4200, 6800}, 0.1, 0.12)");
-        // hand-check: FV+ at 12% = 15267.2 → (1.52672)^(1/3) − 1
-        assert!((mirr - 0.151471).abs() < 1e-5, "MIRR was {mirr}");
-    }
-
-    #[test]
-    fn test_xnpv_xirr() {
-        let xirr = eval_num(
-            "XIRR({-10000; 12000}, {\"2026-01-01\"; \"2026-12-31\"})"
-        );
-        // ~20% over almost exactly one year
-        assert!((xirr - 0.2).abs() < 0.01, "XIRR was {xirr}");
-        let xnpv = eval_num(
-            "XNPV(0.1, {-10000; 11000}, {\"2026-01-01\"; \"2027-01-01\"})"
-        );
-        // 11000 discounted one year at 10% ≈ 10000 → XNPV ≈ -3
-        assert!(xnpv.abs() < 10.0, "XNPV was {xnpv}");
-        let fvs = eval_num("FVSCHEDULE(1000, {0.09, 0.11, 0.1})");
-        assert!((fvs - 1331.0).abs() < 1.0, "FVSCHEDULE was {fvs}");
-    }
-}
-````
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), and the
+`pure_fn`, `flat_iter_numbers`, and `flat_iter_strings` helpers every closure
+here relies on come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs).
+Date arguments are parsed by `parse_date_str` and `days_from_civil`, both
+imported from
+[datetime.rs](/docs/quadratic-core/src/formulas/functions/datetime.rs); the
+`Value` type these functions return is defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), and the error variants
+they raise in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

@@ -1,15 +1,31 @@
 ---
 title: "span.rs"
-description: "Structs for tracking locations and substrings within strings. A contiguous span of text from one byte index to another in a &str."
+description: "Byte-index Span and the Spanned wrapper that pin every token, AST node and error to its exact place in the formula source."
 source: "quadratic-core/src/formulas/span.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Everything the engine reports back to the app — a parse error, a runtime
+error, the location of a cell reference — is tied to a byte range in the
+original formula string. This file defines the two types that carry that
+information: `Span`, a pair of byte indices, and `Spanned<T>`, any value
+tagged with one. When a formula fails, the span is what lets the editor point
+at the exact offending characters: it crosses the WASM boundary as
+`error_span` in the result [runFormula.ts](/docs/src/lib/formulas/runFormula.ts)
+receives.
 
-````rust span.rs -n
+<Scrollycoding>
+
+## !!steps Two byte indices
+
+A `Span` is a half-open range: `start` is the byte index of the first
+character, `end` is the index *after* the last one. It derives `Copy`, so
+spans are passed around by value everywhere, and `Serialize`/`Deserialize`,
+because spans are shipped to JavaScript verbatim —
+[lib.rs](/docs/quadratic-core/src/lib.rs) serializes `Span` directly inside
+its `JsFormulaParseResult`.
+
+```rust ! span.rs
 //! Structs for tracking locations and substrings within strings.
 
 use serde::{Deserialize, Serialize};
@@ -24,6 +40,18 @@ pub struct Span {
     /// The byte index after the last character.
     pub end: usize,
 }
+```
+
+## !!steps Constructing and slicing
+
+Three operations cover the engine's needs. `empty` makes a zero-width span at
+a position. `merge` computes the smallest span covering two others — the
+min/max hull, which is how a compound expression's span comes to cover both
+of its operands. `of_str` goes the other way: given the original source
+string, it slices the spanned text back out. Note that `merge` is generic
+over anything convertible `Into<Span>` — the next step shows why.
+
+```rust ! span.rs
 impl Span {
     /// Returns a 0-length span at the given index.
     pub fn empty(idx: usize) -> Self {
@@ -37,6 +65,7 @@ impl Span {
         let span1: Span = span1.into();
         let span2: Span = span2.into();
         Self {
+            // !mark(1:2)
             start: std::cmp::min(span1.start, span2.start),
             end: std::cmp::max(span1.end, span2.end),
         }
@@ -46,6 +75,18 @@ impl Span {
         &s[self.start..self.end]
     }
 }
+```
+
+## !!steps Anything spanned is a span
+
+These two `From` impls let a `Spanned<T>` — owned or borrowed — be used
+wherever a plain `Span` is expected. Combined with the `Into<Span>` bounds on
+`merge`, callers can pass spanned values directly:
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) writes
+`Span::merge(x, y)` on two `Spanned<Value>` arguments to blame an error on
+the whole argument pair.
+
+```rust ! span.rs
 impl<T> From<Spanned<T>> for Span {
     fn from(spanned: Spanned<T>) -> Self {
         spanned.span
@@ -56,7 +97,17 @@ impl<T> From<&Spanned<T>> for Span {
         spanned.span
     }
 }
+```
 
+## !!steps The Spanned wrapper
+
+`Spanned<T>` is just a pair — the data plus where it came from — with both
+fields public. It is the pervasive wrapper of the engine: the parser
+produces spanned AST nodes, and evaluation threads `Spanned<Value>` through
+every function call so that a bad value can always be traced back to source
+text.
+
+```rust ! span.rs
 /// Any data with an associated span.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Spanned<T> {
@@ -65,6 +116,17 @@ pub struct Spanned<T> {
     /// The data.
     pub inner: T,
 }
+```
+
+## !!steps Transparent ergonomics
+
+`Borrow` and `BorrowMut` let generic code view a `Spanned<T>` as its payload.
+More visibly, `Display` forwards straight to `inner` — formatting a spanned
+value never leaks byte offsets into user-facing output, so a
+`Spanned<Value>` prints exactly like the value itself when it becomes a
+cell's displayed result.
+
+```rust ! span.rs
 impl<T> Borrow<T> for Spanned<T> {
     fn borrow(&self) -> &T {
         &self.inner
@@ -77,9 +139,20 @@ impl<T> BorrowMut<T> for Spanned<T> {
 }
 impl<T: fmt::Display> fmt::Display for Spanned<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // !mark
         self.inner.fmt(f)
     }
 }
+```
+
+## !!steps Building and mapping
+
+`new` builds a spanned value from raw indices. `map` is the workhorse:
+transform the payload, keep the span. It lets evaluation convert and compute
+on values while the result still points at the original source characters —
+so an error raised three transformations later lands on the right underline.
+
+```rust ! span.rs
 impl<T> Spanned<T> {
     /// Constructs a Spanned<T> spanning the given byte indices.
     pub fn new(start: usize, end: usize, inner: T) -> Self {
@@ -91,9 +164,20 @@ impl<T> Spanned<T> {
     /// Apply a function to the inside of this Spanned<T>.
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Spanned<U> {
         Spanned {
+            // !mark
             span: self.span,
             inner: f(self.inner),
         }
     }
 }
-````
+```
+
+</Scrollycoding>
+
+Spans attach to failures in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs), ride through
+evaluation in [ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs), and are
+serialized for the app by [lib.rs](/docs/quadratic-core/src/lib.rs) — both as
+`error_span` in `eval_formula` results and as cell-reference locations in
+`parse_formula`, consumed via
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts).

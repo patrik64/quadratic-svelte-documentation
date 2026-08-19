@@ -1,23 +1,34 @@
 ---
 title: "ast.rs"
-description: "Abstract syntax tree of a formula expression."
+description: "The formula AST and its async recursive evaluator: function calls, arrays, cell references, and literals, evaluated against a grid"
 source: "quadratic-core/src/formulas/ast.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The middle of the pipeline. `ast.rs` defines the tree the
+[parser](/docs/quadratic-core/src/formulas/parser/mod.rs) produces, and — in the
+same file — the interpreter that walks it. There is no separate evaluator
+module: `eval` is an inherent method on the AST node.
 
-````rust ast.rs -n
-use futures::future::{FutureExt, LocalBoxFuture};
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
-use std::fmt;
+The tree is deliberately tiny. Six node kinds cover the whole formula language,
+because operators are not a separate node type: `1 + 2` is parsed as a
+`FunctionCall` whose `func` is the string `"+"`, so binary, prefix, and suffix
+operators all reuse the function-dispatch path.
 
-use super::*;
+<Scrollycoding>
 
+## !!steps A formula is one node
+
+`Formula` is a thin wrapper around a single root `AstNode`; its `Display` just
+forwards to that node, so printing a formula renders it back as source text. The
+whole tree derives `Serialize` and `Deserialize`, so a parsed formula can be
+carried around as data.
+
+The key line is the type alias: `AstNode` is `Spanned<AstNodeContents>`. Every
+node in the tree carries the byte range it was parsed from, which is what makes
+runtime errors point at the exact sub-expression that failed.
+
+```rust ! ast.rs
 /// Abstract syntax tree of a formula expression.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Formula {
@@ -29,6 +40,7 @@ impl fmt::Display for Formula {
     }
 }
 
+// !mark
 pub type AstNode = Spanned<AstNodeContents>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -43,6 +55,21 @@ pub enum AstNodeContents {
     String(String),
     Number(f64),
 }
+```
+
+## !!steps Printing the tree back out
+
+`Display` reconstructs source text from the tree. Function calls are always
+printed in call syntax — `f(a, b)` — even for what the user wrote as `a + b`,
+since the AST no longer distinguishes them. `Paren` is kept as a node rather
+than being folded away, so explicit grouping survives a round trip.
+
+Array literals print in the spreadsheet convention: elements joined by `, `
+within a row, rows joined by `; `, wrapped in braces. Strings and numbers use
+Rust's `Debug` formatting (`{s:?}` and `{n:?}`) so quoting and float precision
+are handled for free.
+
+```rust ! ast.rs
 impl fmt::Display for AstNodeContents {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -58,6 +85,7 @@ impl fmt::Display for AstNodeContents {
                 Ok(())
             }
             AstNodeContents::Paren(contents) => write!(f, "({contents})"),
+            // !mark(1:4)
             AstNodeContents::Array(a) => write!(
                 f,
                 "{{{}}}",
@@ -69,6 +97,23 @@ impl fmt::Display for AstNodeContents {
         }
     }
 }
+```
+
+## !!steps Naming a node for error messages
+
+`type_string` produces the phrase used in "expected X, got Y" errors. Since
+operators are stored as function calls, it inspects the callee name to recover
+the distinction the AST dropped: the six comparison spellings report as
+"comparison", a name made only of alphanumerics and underscores reports as
+"function call", and anything else — `+`, `&`, `%` — reports as "expression".
+
+`to_cell_ref` is the one place a node is coerced back to a specific shape. It
+accepts a `CellRef` node, transparently unwraps `Paren` so `(A1):(B2)` works,
+and otherwise builds a `FormulaErrorMsg::Expected` error attached to
+`self.span`. Note that `Paren` also delegates `type_string` to its contents, so
+the error names the inner expression rather than "parentheses".
+
+```rust ! ast.rs
 impl AstNodeContents {
     fn type_string(&self) -> &'static str {
         match self {
@@ -89,6 +134,7 @@ impl Spanned<AstNodeContents> {
     pub fn to_cell_ref(&self) -> FormulaResult<CellRef> {
         match &self.inner {
             AstNodeContents::CellRef(cellref) => Ok(*cellref),
+            // !mark
             AstNodeContents::Paren(contents) => contents.to_cell_ref(),
             _ => Err(FormulaErrorMsg::Expected {
                 expected: "cell reference".into(),
@@ -98,7 +144,23 @@ impl Spanned<AstNodeContents> {
         }
     }
 }
+```
 
+## !!steps Async all the way down, and a box to make it compile
+
+Evaluation is `async` because reading a cell goes through a `GridProxy`, which
+in the browser is a JavaScript callback. `eval` builds a fresh
+[`Ctx`](/docs/quadratic-core/src/formulas/ctx.rs) holding the grid proxy and the
+formula's own position, then evaluates the root node.
+
+`eval_blocking` is the synchronous escape hatch — `pollster::block_on` drives
+the future to completion on the current thread, and the doc comment scopes it to
+grid proxies that are not actually async. The recursive `eval` on `AstNode` has
+to return a `LocalBoxFuture` rather than an `async fn`: a recursive async
+function needs an indirection to have a finite size, and the comment links to
+the async book chapter that explains it.
+
+```rust ! ast.rs
 impl Formula {
     /// Evaluates a formula, blocking on async calls.
     ///
@@ -113,6 +175,7 @@ impl Formula {
 
     /// Evaluates a formula.
     pub async fn eval(&self, grid: &mut dyn GridProxy, pos: Pos) -> FormulaResult<Spanned<Value>> {
+        // !mark
         self.ast.eval(&mut Ctx { grid, pos }).await
     }
 }
@@ -126,7 +189,21 @@ impl AstNode {
         // https://rust-lang.github.io/async-book/07_workarounds/04_recursion.html
         async move { self.eval_inner(ctx).await }.boxed_local()
     }
+```
 
+## !!steps The range operator builds an array
+
+`eval_inner` is one big `match`, and the first arm is special-cased on the
+callee name `":"`. Its two arguments are not evaluated as values — they are
+coerced with `to_cell_ref` and resolved against `ctx.pos`, turning relative
+references into absolute grid positions.
+
+The corners are then normalized with `min`/`max` on each axis, so `B4:A1` and
+`A1:B4` describe the same rectangle. The loop reads every cell in row-major
+order into a `Value::Array`; each cell goes through `ctx.get_cell`, which
+detects circular references and substitutes an empty value for blank cells.
+
+```rust ! ast.rs
     async fn eval_inner<'ctx: 'a, 'a>(
         &'a self,
         ctx: &'a mut Ctx<'ctx>,
@@ -137,6 +214,7 @@ impl AstNode {
                 if args.len() != 2 {
                     internal_error!("invalid arguments to cell range operator");
                 }
+                // !mark(1:2)
                 let corner1 = args[0].to_cell_ref()?.resolve_from(ctx.pos);
                 let corner2 = args[1].to_cell_ref()?.resolve_from(ctx.pos);
 
@@ -158,7 +236,23 @@ impl AstNode {
 
                 Value::Array(array)
             }
+```
 
+## !!steps Two functions that must see their arguments fail
+
+`IFERROR` and `ISERROR` cannot be ordinary functions. The generic path below
+evaluates every argument first and propagates the first error with `?`, which
+would mean an erroring argument never reaches the function at all. The comment
+names this directly: these forms "observe errors in their arguments instead of
+propagating them".
+
+So both are handled inline and lazily. `IFERROR` evaluates its first argument
+and, on `Err`, evaluates the fallback instead — the second argument is untouched
+in the success case. `ISERROR` evaluates its single argument purely for whether
+it succeeded, discarding the value. Both match the callee name with
+`eq_ignore_ascii_case`, so formula names are case-insensitive.
+
+```rust ! ast.rs
             // Lazy special forms: these observe errors in their arguments
             // instead of propagating them, so they cannot go through the
             // eager-evaluation path below.
@@ -166,6 +260,7 @@ impl AstNode {
                 if args.len() != 2 {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(self.span));
                 }
+                // !mark(1:4)
                 match args[0].eval(&mut *ctx).await {
                     Ok(v) => v.inner,
                     Err(_) => args[1].eval(&mut *ctx).await?.inner,
@@ -177,7 +272,24 @@ impl AstNode {
                 }
                 Value::Bool(args[0].eval(&mut *ctx).await.is_err())
             }
+```
 
+## !!steps Everything else is a function lookup
+
+The general arm is eager: arguments are evaluated left to right in a plain loop
+(sequentially, not concurrently — each `await` completes before the next starts),
+and the collected values are wrapped in a single `Spanned` carrying the *call
+site's* span. That is what lets a function report an arity error pointing at the
+whole call.
+
+`functions::lookup_function` resolves the name against the function table; the
+found entry's `eval` is invoked with the context and arguments. The failure
+branch is a nice touch: if the name is not implemented here but *is* a valid
+Excel function, the user gets `UnimplementedExcelFunction` with the uppercased
+name instead of a generic "bad function name", and the error is spanned to
+`func.span` — just the identifier, not the arguments.
+
+```rust ! ast.rs
             // Other operator/function
             AstNodeContents::FunctionCall { func, args } => {
                 let mut arg_values = vec![];
@@ -191,6 +303,7 @@ impl AstNode {
 
                 let func_name = &func.inner;
                 match functions::lookup_function(&func_name) {
+                    // !mark
                     Some(f) => (f.eval)(&mut *ctx, spanned_arg_values).await?,
                     None => {
                         let msg = if functions::excel::is_valid_excel_function(func_name) {
@@ -202,7 +315,22 @@ impl AstNode {
                     }
                 }
             }
+```
 
+## !!steps The leaves
+
+The remaining arms are short. `Paren` evaluates its contents and unwraps the
+inner value, discarding the child's span — the result is re-spanned at the end
+with the paren node's own span. Array literals evaluate every element in reading
+order into a `Value::Array`, using `smallvec` for rows just like the range
+operator does.
+
+A bare `CellRef` is a single `ctx.get_cell`, and the two literal kinds simply
+clone or copy their payload into a `Value`. Whatever branch ran, the tail wraps
+the result in `Spanned` with `self.span`, so the value that flows back up the
+tree stays attached to the source text that produced it.
+
+```rust ! ast.rs
             AstNodeContents::Paren(expr) => expr.eval(ctx).await?.inner,
 
             AstNodeContents::Array(a) => {
@@ -224,10 +352,27 @@ impl AstNode {
             AstNodeContents::Number(n) => Value::Number(*n),
         };
 
+        // !mark(1:4)
         Ok(Spanned {
             span: self.span,
             inner: value,
         })
     }
 }
-````
+```
+
+</Scrollycoding>
+
+The tree comes from
+[parser/rules/expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs),
+which is where operators get lowered into `FunctionCall` nodes with the operator
+text as the callee. The function table `eval` calls into lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) — with
+operators themselves implemented in
+[functions/operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs).
+The values produced here are defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), cell reading and circular
+reference detection in [ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs), the
+reference type in [cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs),
+and the error types in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

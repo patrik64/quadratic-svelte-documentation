@@ -1,15 +1,39 @@
 ---
 title: "trigonometry.rs"
-description: "Rust module trigonometry.rs of the quadratic-core formula engine."
+description: "The Trigonometric functions category — a local macro generates twelve function/inverse pairs, plus DEGREES, RADIANS, and ATAN2"
 source: "quadratic-core/src/formulas/functions/trigonometry.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Twenty-seven functions in about 120 lines of declarations: six circular
+functions, six hyperbolic ones, an inverse for each, the two angle-unit
+converters, and `ATAN2`. Almost none of them are written out by hand — a
+`macro_rules!` macro defined *inside* `get_functions` expands one table row
+into a matched pair of `FormulaFunction` values.
 
-````rust trigonometry.rs -n
+Like every sibling in this directory, the module exports a `CATEGORY`
+constant whose `get_functions` pointer produces those values;
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) merges
+all categories into the global `ALL_FUNCTIONS` map that the evaluator consults
+by uppercase name.
+
+<Scrollycoding>
+
+## !!steps Angles are radians, except at the boundary
+
+`CATEGORY` is the registration point, and `get_functions` starts by seeding a
+mutable vector with the only two functions that deal in degrees at all.
+`DEGREES` and `RADIANS` are thin wrappers over Rust's `f64::to_degrees` and
+`f64::to_radians`; every other function in the module takes or returns
+radians, which is what the shared `arg_completion` of `"${1:radians}"` in the
+macro below advertises.
+
+Both are built with `util::array_mapped`, the constructor from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs) that
+distributes a scalar operation elementwise over array arguments — so
+`DEGREES(A1:A10)` works without any extra code.
+
+```rust ! trigonometry.rs
 use super::*;
 
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
@@ -21,11 +45,53 @@ pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
 };
 
 fn get_functions() -> Vec<FormulaFunction> {
+    // ...
+    let mut all_trig_functions = vec![
+        FormulaFunction {
+            name: "DEGREES",
+            arg_completion: "${1:radians}",
+            usages: &["radians"],
+            examples: &["DEGREES(PI() / 2)"],
+            doc: "Converts radians to degrees",
+            // !mark
+            eval: util::array_mapped(|[radians]| {
+                Ok(Value::Number(radians.to_number()?.to_degrees()))
+            }),
+        },
+        FormulaFunction {
+            name: "RADIANS",
+            arg_completion: "${1:degrees}",
+            usages: &["degrees"],
+            examples: &["RADIANS(90)"],
+            doc: "Converts degrees to radians",
+            eval: util::array_mapped(|[degrees]| {
+                Ok(Value::Number(degrees.to_number()?.to_radians()))
+            }),
+        },
+    ];
+```
+
+## !!steps A macro that takes a table
+
+`trig_functions_and_inverses!` accepts two documentation URLs followed by a
+semicolon-separated table of rows. Each row carries a short name, a
+human-readable full name, a closure for the function, a closure for its
+inverse, and an optional range string — the `$(, $inv_range:literal)?`
+fragment makes that last column skippable per row.
+
+The first half of the expansion builds the forward function. The closure is
+bound to a named `fn(f64) -> f64` first so it can be moved into the `eval`
+closure, and the whole documentation string is assembled at compile time with
+`concat!` — a markdown link built from the full name and the shared URL,
+followed by a fixed sentence ending.
+
+```rust ! trigonometry.rs
     macro_rules! trig_functions_and_inverses {
         (
             url: $url:literal;
             inverse_url: $inv_url:literal;
             $(
+                // !mark
                 $short_name:literal, $full_name:literal, $f:expr, $inv_f:expr $(, $inv_range:literal)?
             );+ $(;)?
         ) => {
@@ -45,9 +111,29 @@ fn get_functions() -> Vec<FormulaFunction> {
                             eval: util::array_mapped(move |[radians]| Ok(Value::Number(f(radians.to_number()?)))),
                         }
                     },
+```
+
+## !!steps The inverse half, named by concatenation
+
+The second half of each expansion is the inverse. Its name is
+`concat!("A", $short_name)`, which is the entire naming convention: `SIN`
+becomes `ASIN`, `COTH` becomes `ACOTH`. The optional range column is spliced
+in with `$(", ranging from ", $inv_range,)?`, so rows that supplied one get a
+sentence like "in radians, ranging from 0 to π" and rows that did not simply
+end after "in radians".
+
+Two details are worth knowing. The range text is documentation only — nothing
+in the `eval` closure enforces or checks it, and the `SIN` row below declares
+`0 to π` for `ASIN` even though `f64::asin` returns values from `-π/2` to
+`π/2`, which is what the test table at the bottom of the file expects. And the
+inverse's `examples` entry is built from `$short_name` rather than the
+prefixed name, so `ASIN` lists `SIN(A1)` as its example.
+
+```rust ! trigonometry.rs
                     {
                         let inv_f: fn(f64) -> f64 = $inv_f;
                         FormulaFunction {
+                            // !mark
                             name: concat!("A", $short_name),
                             arg_completion: "${1:number}",
                             usages: &["number"],
@@ -64,30 +150,22 @@ fn get_functions() -> Vec<FormulaFunction> {
             ]
         };
     }
+```
 
-    let mut all_trig_functions = vec![
-        FormulaFunction {
-            name: "DEGREES",
-            arg_completion: "${1:radians}",
-            usages: &["radians"],
-            examples: &["DEGREES(PI() / 2)"],
-            doc: "Converts radians to degrees",
-            eval: util::array_mapped(|[radians]| {
-                Ok(Value::Number(radians.to_number()?.to_degrees()))
-            }),
-        },
-        FormulaFunction {
-            name: "RADIANS",
-            arg_completion: "${1:degrees}",
-            usages: &["degrees"],
-            examples: &["RADIANS(90)"],
-            doc: "Converts degrees to radians",
-            eval: util::array_mapped(|[degrees]| {
-                Ok(Value::Number(degrees.to_number()?.to_radians()))
-            }),
-        },
-    ];
+## !!steps Six circular functions from six lines
 
+The first invocation is the whole circular family, and it reads like a table
+because it is one. `SIN`, `COS`, and `TAN` map onto the `f64` methods
+directly. The three reciprocal functions have no `f64` equivalent, so they are
+spelled as identities: cosecant is `sin(x).recip()`, secant is
+`cos(x).recip()`, cotangent is `tan(x).recip()`.
+
+Their inverses invert in the other order — `x.recip().asin()` for `ACSC`,
+`x.recip().acos()` for `ASEC` — because the reciprocal has to be undone before
+the arc function. `ACOT` is the exception: instead of a closure it names the
+`arc_cotangent` helper, for reasons the last step explains.
+
+```rust ! trigonometry.rs
     all_trig_functions.extend(trig_functions_and_inverses![
         url: "https://en.wikipedia.org/wiki/Trigonometric_functions";
         inverse_url: "https://en.wikipedia.org/wiki/Inverse_trigonometric_functions";
@@ -95,14 +173,30 @@ fn get_functions() -> Vec<FormulaFunction> {
         "SIN",  "sine",                 |x| x.sin(),          |x| x.asin(),            "0 to π";
         "COS",  "cosine",               |x| x.cos(),          |x| x.acos(),            "0 to π";
         "TAN",  "tangent",              |x| x.tan(),          |x| x.atan(),         "-π/2 to π/2";
+        // !mark(1:3)
         "CSC",  "cosecant",             |x| x.sin().recip(),  |x| x.recip().asin(), "-π/2 to π/2";
         "SEC",  "secant",               |x| x.cos().recip(),  |x| x.recip().acos(),    "0 to π";
         "COT",  "cotangent",            |x| x.tan().recip(),  arc_cotangent,           "0 to π";
     ]);
+```
 
+## !!steps The hyperbolic family, same shape
+
+The second invocation reuses the macro unchanged, passing the hyperbolic
+Wikipedia URLs so the generated docs link to the right articles. The pattern
+is identical: three direct `f64` methods, three reciprocals, and inverses that
+apply `recip()` before the arc function.
+
+The difference is what is missing — no row supplies an `inv_range`, so the
+optional fragment expands to nothing and every hyperbolic inverse gets a doc
+string that stops at "of a number, in radians." Twelve more functions,
+eleven lines of source.
+
+```rust ! trigonometry.rs
     all_trig_functions.extend(trig_functions_and_inverses![
         url: "https://en.wikipedia.org/wiki/Hyperbolic_functions";
         inverse_url: "https://en.wikipedia.org/wiki/Inverse_hyperbolic_functions";
+        // !mark
         //                              function,             inverse function;
         "SINH", "hyperbolic sine",      |x| x.sinh(),         |x| x.asinh();
         "COSH", "hyperbolic cosine",    |x| x.cosh(),         |x| x.acosh();
@@ -111,7 +205,25 @@ fn get_functions() -> Vec<FormulaFunction> {
         "SECH", "hyperbolic secant",    |x| x.cosh().recip(), |x| x.recip().acosh();
         "COTH", "hyperbolic cotangent", |x| x.tanh().recip(), |x| x.recip().atanh();
     ]);
+```
 
+## !!steps ATAN2 is spliced in by index
+
+`ATAN2` takes two arguments, so it cannot come out of the pair macro. It is
+written by hand and `insert`ed at a fixed position rather than pushed, which
+only affects the order functions appear in the generated documentation and
+completions — the registry in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) keys
+everything by name. Counting the vector so far — `DEGREES`, `RADIANS`, then
+the `SIN`/`ASIN`, `COS`/`ACOS`, `TAN`/`ATAN` pairs — index 6 places it
+immediately before the tangent pair.
+
+The behavior worth remembering is in the last line: the arguments are declared
+`x, y`, and the doc says so explicitly, but `f64::atan2` is called as
+`atan2(y, x)`. The formula-level argument order is the reverse of the usual
+`atan2` convention.
+
+```rust ! trigonometry.rs
     let index_of_atan = 5;
     all_trig_functions.insert(
         index_of_atan + 1,
@@ -124,14 +236,28 @@ fn get_functions() -> Vec<FormulaFunction> {
                   point `(x, y)`. Note that the argument order is reversed compared to \
                   the [typical `atan2()` function](https://en.wikipedia.org/wiki/Atan2).",
             eval: util::array_mapped(|[x, y]| {
+                // !mark
                 Ok(Value::Number(f64::atan2(y.to_number()?, x.to_number()?)))
             }),
         },
     );
+```
 
-    all_trig_functions
-}
+## !!steps Why ACOT needs its own function
 
+Every other inverse is a one-liner, and `ACOT` could have been
+`|x| x.recip().atan()` — but the comment spells out why that is wrong. Taking
+the reciprocal first sends `x` near zero to a huge magnitude, so the naive
+version jumps from near `π/2` to near `-π/2` as `x` crosses zero, and at
+exactly zero it divides by zero.
+
+`arc_cotangent` restores a continuous branch on `0` to `π`: positive inputs
+use the plain arctangent of the reciprocal, negative inputs get `π` added to
+lift them into the upper half, and zero returns `FRAC_PI_2` outright. The
+tests at the bottom of the file pin this down, checking `ACOT(-1)` at `0.75π`
+rather than `-0.25π`.
+
+```rust ! trigonometry.rs
 /// Inverse cotangent function with the correct range.
 ///
 /// If we just use `.recip().atan()`, then the range is discontinuous and we
@@ -140,359 +266,60 @@ fn arc_cotangent(x: f64) -> f64 {
     if x > 0.0 {
         x.recip().atan()
     } else if x < 0.0 {
+        // !mark
         x.recip().atan() + std::f64::consts::PI
     } else {
         std::f64::consts::FRAC_PI_2
     }
 }
+```
 
-#[cfg(test)]
-mod tests {
+</Scrollycoding>
 
-    use crate::formulas::tests::*;
+## Implemented functions
 
-    fn test_trig_fn(name: &str, input_output_pairs: &[(f64, f64)]) {
-        let g = &mut NoGrid;
-        for &(input, expected_output) in input_output_pairs {
-            println!("Testing that {name}({input}) = {expected_output}");
-            crate::util::assert_f64_approx_eq(
-                expected_output,
-                &eval_to_string(g, &format!("{name}({input})")),
-            );
-        }
-    }
+Listed in the order `get_functions` builds them, which is the order they appear
+in the generated documentation.
 
-    use std::f64::consts::PI;
+| Name | Purpose |
+| --- | --- |
+| DEGREES | Converts radians to degrees |
+| RADIANS | Converts degrees to radians |
+| SIN | Sine of an angle in radians |
+| ASIN | Inverse sine of a number, in radians |
+| COS | Cosine of an angle in radians |
+| ACOS | Inverse cosine of a number, in radians |
+| ATAN2 | Counterclockwise angle in radians from the X axis to a point, taking x before y |
+| TAN | Tangent of an angle in radians |
+| ATAN | Inverse tangent of a number, in radians |
+| CSC | Cosecant, computed as the reciprocal of sine |
+| ACSC | Inverse cosecant, the arcsine of the reciprocal |
+| SEC | Secant, computed as the reciprocal of cosine |
+| ASEC | Inverse secant, the arccosine of the reciprocal |
+| COT | Cotangent, computed as the reciprocal of tangent |
+| ACOT | Inverse cotangent with a continuous range, via the `arc_cotangent` helper |
+| SINH | Hyperbolic sine |
+| ASINH | Inverse hyperbolic sine |
+| COSH | Hyperbolic cosine |
+| ACOSH | Inverse hyperbolic cosine |
+| TANH | Hyperbolic tangent |
+| ATANH | Inverse hyperbolic tangent |
+| CSCH | Hyperbolic cosecant, the reciprocal of hyperbolic sine |
+| ACSCH | Inverse hyperbolic cosecant, the inverse hyperbolic sine of the reciprocal |
+| SECH | Hyperbolic secant, the reciprocal of hyperbolic cosine |
+| ASECH | Inverse hyperbolic secant, the inverse hyperbolic cosine of the reciprocal |
+| COTH | Hyperbolic cotangent, the reciprocal of hyperbolic tangent |
+| ACOTH | Inverse hyperbolic cotangent, the inverse hyperbolic tangent of the reciprocal |
 
-    #[test]
-    fn test_formula_radian_degree_conversion() {
-        let g = &mut NoGrid;
-
-        assert_eq!("-4", eval_to_string(g, "RADIANS(-720) / PI()"));
-        assert_eq!("-720", eval_to_string(g, "DEGREES(-PI() * 4)"));
-    }
-
-    #[test]
-    fn test_formula_trigonometry() {
-        let g = &mut NoGrid;
-
-        let test_cases = &[
-            (-2.0 * PI, 0.0),
-            (-1.5 * PI, 1.0),
-            (-1.0 * PI, 0.0),
-            (-0.75 * PI, -0.70711),
-            (-0.5 * PI, -1.0),
-            (-0.25 * PI, -0.70711),
-            (0.0 * PI, 0.0),
-            (0.25 * PI, 0.70711),
-            (0.5 * PI, 1.0),
-            (0.75 * PI, 0.70711),
-            (1.0 * PI, 0.0),
-            (1.5 * PI, -1.0),
-            (2.0 * PI, 0.0),
-        ];
-        test_trig_fn("SIN", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, 1.0),
-            (-1.5 * PI, 0.0),
-            (-1.0 * PI, -1.0),
-            (-0.75 * PI, -0.70711),
-            (-0.5 * PI, 0.0),
-            (-0.25 * PI, 0.70711),
-            (0.0 * PI, 1.0),
-            (0.25 * PI, 0.70711),
-            (0.5 * PI, 0.0),
-            (0.75 * PI, -0.70711),
-            (1.0 * PI, -1.0),
-            (1.5 * PI, 0.0),
-            (2.0 * PI, 1.0),
-        ];
-        test_trig_fn("COS", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, 0.0),
-            (-1.0 * PI, 0.0),
-            (-0.75 * PI, 1.0),
-            (-0.25 * PI, -1.0),
-            (0.0 * PI, 0.0),
-            (0.25 * PI, 1.0),
-            (0.75 * PI, -1.0),
-            (1.0 * PI, 0.0),
-            (2.0 * PI, 0.0),
-        ];
-        test_trig_fn("TAN", test_cases);
-
-        let test_cases = &[
-            (-1.5 * PI, 1.0),
-            (-0.75 * PI, -1.41421),
-            (-0.5 * PI, -1.0),
-            (-0.25 * PI, -1.41421),
-            (0.25 * PI, 1.41421),
-            (0.5 * PI, 1.0),
-            (0.75 * PI, 1.41421),
-            (1.5 * PI, -1.0),
-        ];
-        test_trig_fn("CSC", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, 1.0),
-            (-1.0 * PI, -1.0),
-            (-0.75 * PI, -1.41421),
-            (-0.25 * PI, 1.41421),
-            (0.0 * PI, 1.0),
-            (0.25 * PI, 1.41421),
-            (0.75 * PI, -1.41421),
-            (1.0 * PI, -1.0),
-            (2.0 * PI, 1.0),
-        ];
-        test_trig_fn("SEC", test_cases);
-
-        let test_cases = &[
-            (-1.5 * PI, 0.0),
-            (-0.9 * PI, 3.07768),
-            (-0.75 * PI, 1.0),
-            (-0.5 * PI, 0.0),
-            (-0.25 * PI, -1.0),
-            (0.25 * PI, 1.0),
-            (0.5 * PI, 0.0),
-            (0.75 * PI, -1.0),
-            (0.9 * PI, -3.07768),
-            (1.5 * PI, 0.0),
-        ];
-        test_trig_fn("COT", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, -267.74489),
-            (-1.5 * PI, -55.6544),
-            (-1.0 * PI, -11.54874),
-            (-0.75 * PI, -5.22797),
-            (-0.5 * PI, -2.3013),
-            (-0.25 * PI, -0.86867),
-            (0.0 * PI, 0.0),
-            (0.25 * PI, 0.86867),
-            (0.5 * PI, 2.3013),
-            (0.75 * PI, 5.22797),
-            (1.0 * PI, 11.54874),
-            (1.5 * PI, 55.6544),
-            (2.0 * PI, 267.74489),
-        ];
-        test_trig_fn("SINH", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, 267.74676),
-            (-1.5 * PI, 55.66338),
-            (-1.0 * PI, 11.59195),
-            (-0.75 * PI, 5.32275),
-            (-0.5 * PI, 2.50918),
-            (-0.25 * PI, 1.32461),
-            (0.0 * PI, 1.0),
-            (0.25 * PI, 1.32461),
-            (0.5 * PI, 2.50918),
-            (0.75 * PI, 5.32275),
-            (1.0 * PI, 11.59195),
-            (1.5 * PI, 55.66338),
-            (2.0 * PI, 267.74676),
-        ];
-        test_trig_fn("COSH", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, -0.99999),
-            (-1.5 * PI, -0.99984),
-            (-1.0 * PI, -0.99627),
-            (-0.75 * PI, -0.98219),
-            (-0.5 * PI, -0.91715),
-            (-0.25 * PI, -0.65579),
-            (0.0 * PI, 0.0),
-            (0.25 * PI, 0.65579),
-            (0.5 * PI, 0.91715),
-            (0.75 * PI, 0.98219),
-            (1.0 * PI, 0.99627),
-            (1.5 * PI, 0.99984),
-            (2.0 * PI, 0.99999),
-        ];
-        test_trig_fn("TANH", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, -0.00373),
-            (-1.5 * PI, -0.01797),
-            (-1.0 * PI, -0.08659),
-            (-0.75 * PI, -0.19128),
-            (-0.5 * PI, -0.43454),
-            (-0.25 * PI, -1.15118),
-            (0.25 * PI, 1.15118),
-            (0.5 * PI, 0.43454),
-            (0.75 * PI, 0.19128),
-            (1.0 * PI, 0.08659),
-            (1.5 * PI, 0.01797),
-            (2.0 * PI, 0.00373),
-        ];
-        test_trig_fn("CSCH", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, 0.00373),
-            (-1.5 * PI, 0.01797),
-            (-1.0 * PI, 0.08627),
-            (-0.75 * PI, 0.18787),
-            (-0.5 * PI, 0.39854),
-            (-0.25 * PI, 0.75494),
-            (0.0 * PI, 1.0),
-            (0.25 * PI, 0.75494),
-            (0.5 * PI, 0.39854),
-            (0.75 * PI, 0.18787),
-            (1.0 * PI, 0.08627),
-            (1.5 * PI, 0.01797),
-            (2.0 * PI, 0.00373),
-        ];
-        test_trig_fn("SECH", test_cases);
-
-        let test_cases = &[
-            (-2.0 * PI, -1.00001),
-            (-1.5 * PI, -1.00016),
-            (-1.0 * PI, -1.00374),
-            (-0.75 * PI, -1.01813),
-            (-0.5 * PI, -1.09033),
-            (-0.25 * PI, -1.52487),
-            (0.25 * PI, 1.52487),
-            (0.5 * PI, 1.09033),
-            (0.75 * PI, 1.01813),
-            (1.0 * PI, 1.00374),
-            (1.5 * PI, 1.00016),
-            (2.0 * PI, 1.00001),
-        ];
-        test_trig_fn("COTH", test_cases);
-
-        assert!(eval_to_string(g, "ATAN2(2, 1)").starts_with("0.4636"));
-    }
-
-    #[test]
-    fn test_formula_inverse_trigonometry() {
-        let test_cases = &[
-            (-1.0, -0.5 * PI),
-            (-0.70711, -0.25 * PI),
-            (0.0, 0.0 * PI),
-            (0.70711, 0.25 * PI),
-            (1.0, 0.5 * PI),
-        ];
-        test_trig_fn("ASIN", test_cases);
-
-        let test_cases = &[
-            (1.0, 0.0 * PI),
-            (0.70711, 0.25 * PI),
-            (0.0, 0.5 * PI),
-            (-0.70711, 0.75 * PI),
-            (-1.0, 1.0 * PI),
-        ];
-        test_trig_fn("ACOS", test_cases);
-
-        let test_cases = &[(-1.0, -0.25 * PI), (0.0, 0.0 * PI), (1.0, 0.25 * PI)];
-        test_trig_fn("ATAN", test_cases);
-
-        let test_cases = &[
-            (-1.0, -0.5 * PI),
-            (-1.41421, -0.25 * PI),
-            (1.41421, 0.25 * PI),
-            (1.0, 0.5 * PI),
-        ];
-        test_trig_fn("ACSC", test_cases);
-
-        let test_cases = &[
-            (1.0, 0.0 * PI),
-            (1.41421, 0.25 * PI),
-            (-1.41421, 0.75 * PI),
-            (-1.0, 1.0 * PI),
-        ];
-        test_trig_fn("ASEC", test_cases);
-
-        let test_cases = &[
-            (1.0, 0.25 * PI),
-            (0.0, 0.5 * PI),
-            (-1.0, 0.75 * PI),
-            (-3.07768, 0.9 * PI),
-        ];
-        test_trig_fn("ACOT", test_cases);
-
-        let test_cases = &[
-            (-267.74489, -2.0 * PI),
-            (-55.6544, -1.5 * PI),
-            (-11.54874, -1.0 * PI),
-            (-5.22797, -0.75 * PI),
-            (-2.3013, -0.5 * PI),
-            (-0.86867, -0.25 * PI),
-            (0.0, 0.0 * PI),
-            (0.86867, 0.25 * PI),
-            (2.3013, 0.5 * PI),
-            (5.22797, 0.75 * PI),
-            (11.54874, 1.0 * PI),
-            (55.6544, 1.5 * PI),
-            (267.74489, 2.0 * PI),
-        ];
-        test_trig_fn("ASINH", test_cases);
-
-        let test_cases = &[
-            (1.0, 0.0 * PI),
-            (1.32461, 0.25 * PI),
-            (2.50918, 0.5 * PI),
-            (5.32275, 0.75 * PI),
-            (11.59195, 1.0 * PI),
-            (55.66338, 1.5 * PI),
-            (267.74676, 2.0 * PI),
-        ];
-        test_trig_fn("ACOSH", test_cases);
-
-        let test_cases = &[
-            (-0.99627208, -1.0 * PI),
-            (-0.98219338, -0.75 * PI),
-            (-0.91715234, -0.5 * PI),
-            (-0.6557942, -0.25 * PI),
-            (0.0, 0.0 * PI),
-            (0.6557942, 0.25 * PI),
-            (0.91715234, 0.5 * PI),
-            (0.98219338, 0.75 * PI),
-            (0.99627208, 1.0 * PI),
-        ];
-        test_trig_fn("ATANH", test_cases);
-
-        let test_cases = &[
-            (-0.0037349, -2.0 * PI),
-            (-0.01796803, -1.5 * PI),
-            (-0.08658954, -1.0 * PI),
-            (-0.19127876, -0.75 * PI),
-            (-0.43453721, -0.5 * PI),
-            (-1.15118387, -0.25 * PI),
-            (1.15118387, 0.25 * PI),
-            (0.43453721, 0.5 * PI),
-            (0.19127876, 0.75 * PI),
-            (0.08658954, 1.0 * PI),
-            (0.01796803, 1.5 * PI),
-            (0.0037349, 2.0 * PI),
-        ];
-        test_trig_fn("ACSCH", test_cases);
-
-        let test_cases = &[
-            (1.0, 0.0 * PI),
-            (0.754939709, 0.25 * PI),
-            (0.398536815, 0.5 * PI),
-            (0.187872734, 0.75 * PI),
-            (0.086266738, 1.0 * PI),
-            (0.017965132, 1.5 * PI),
-            (0.003734872, 2.0 * PI),
-        ];
-        test_trig_fn("ASECH", test_cases);
-
-        let test_cases = &[
-            (-1.000161412, -1.5 * PI),
-            (-1.00374187, -1.0 * PI),
-            (-1.01812944, -0.75 * PI),
-            (-1.09033141, -0.5 * PI),
-            (-1.52486862, -0.25 * PI),
-            (1.52486862, 0.25 * PI),
-            (1.09033141, 0.5 * PI),
-            (1.01812944, 0.75 * PI),
-            (1.00374187, 1.0 * PI),
-            (1.000161412, 1.5 * PI),
-        ];
-        test_trig_fn("ACOTH", test_cases);
-    }
-}
-````
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), and
+`array_mapped` — used by every `eval` here — comes from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), built
+on the elementwise `array_map` in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs). `PI` and the rest of the
+numeric built-ins are in
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs);
+the `to_number` coercion each closure calls is defined on `Value` in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs). The `eval_to_string`
+and `NoGrid` helpers driving the test tables at the bottom of the file come
+from [formulas/tests.rs](/docs/quadratic-core/src/formulas/tests.rs).

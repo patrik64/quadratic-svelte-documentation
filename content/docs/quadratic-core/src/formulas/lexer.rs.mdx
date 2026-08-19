@@ -1,23 +1,36 @@
 ---
 title: "lexer.rs"
-description: "Functions for lossless tokenization."
+description: "Lossless tokenizer: one joined regex splits formula text into spanned tokens, with nested block comments and a numeric-range fixup"
 source: "quadratic-core/src/formulas/lexer.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The first stage of the formula engine. `lexer.rs` turns raw formula text into a
+stream of `Spanned<Token>` — a token kind plus the byte range it came from. Its
+module doc calls this *lossless* tokenization: nothing is thrown away, not
+whitespace and not comments, so the byte offsets always line up with the
+original source string.
 
-````rust lexer.rs -n
-//! Functions for lossless tokenization.
+Losslessness matters twice over. The [parser](/docs/quadratic-core/src/formulas/parser/mod.rs)
+skips whitespace and comments itself while keeping accurate spans for error
+messages, and `find_cell_references` re-lexes the same source to hand the app a
+list of cell references with byte ranges that still index into the user's
+original text.
 
-use lazy_static::lazy_static;
-use regex::Regex;
-use strum_macros::Display;
+<Scrollycoding>
 
-use super::{Span, Spanned};
+## !!steps One token at a time
 
+`tokenize` is the whole public surface: it returns a lazy iterator built from
+`std::iter::from_fn`. The closure owns a single piece of mutable state,
+`token_start`, and each call asks `Token::consume_from_input` for the next
+token plus the index just past it. That pair becomes a `Span`, `token_start`
+advances to the end, and the token is wrapped as a `Spanned` value.
+
+Because the end of one token is the start of the next, the spans tile the input
+with no gaps — the losslessness guarantee falls straight out of this loop.
+
+```rust ! lexer.rs
 pub fn tokenize(input_str: &str) -> impl '_ + Iterator<Item = Spanned<Token>> {
     let mut token_start = 0;
     std::iter::from_fn(move || {
@@ -26,16 +39,27 @@ pub fn tokenize(input_str: &str) -> impl '_ + Iterator<Item = Spanned<Token>> {
                 start: token_start,
                 end: token_end,
             };
+            // !mark
             token_start = token_end;
             Spanned { span, inner: token }
         })
     })
 }
+```
 
-fn new_fullmatch_regex(s: &str) -> Regex {
-    Regex::new(&("^(".to_owned() + s + ")")).unwrap()
-}
+## !!steps The interesting patterns, documented in ASCII
 
+Three of the token patterns are complicated enough to earn their own constants,
+each with an ASCII diagram in the doc comment explaining the regex column by
+column. A function call is an identifier *terminated by* an open paren, so
+`SUM(` lexes as one token rather than a name followed by a paren.
+
+A cell reference allows optional `$` for absolute addressing and optional `n`
+for negative coordinates, on both the column and the row. Numeric literals
+carry no leading sign — a minus sign is always lexed as its own operator token
+and resolved later by the parser.
+
+```rust ! lexer.rs
 /// Function call consisting of a letter or underscore followed by any letters,
 /// digits, and/or underscores terminated with a `(`.
 const FUNCTION_CALL_PATTERN: &str = r#"[A-Za-z_][A-Za-z_\d]*\("#;
@@ -47,6 +71,7 @@ const FUNCTION_CALL_PATTERN: &str = r#"[A-Za-z_][A-Za-z_\d]*\("#;
 ///    n?         n?          optional `n`s
 ///      [A-Z]+               letters
 ///                 \d+       digits
+// !mark
 const A1_CELL_REFERENCE_PATTERN: &str = r#"\$?n?[A-Z]+\$?n?\d+"#;
 
 /// Floating-point or integer number, without leading sign.
@@ -61,17 +86,21 @@ const A1_CELL_REFERENCE_PATTERN: &str = r#"\$?n?[A-Z]+\$?n?\d+"#;
 ///                         [+-]?           with an optional sign
 ///                              \d+        followed by some digits
 const NUMERIC_LITERAL_PATTERN: &str = r#"(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?"#;
+```
 
-/// Single-quoted string. Note that like Rust strings, this can span multiple
-/// lines.
-const SINGLE_QUOTE_STRING_LITERAL_PATTERN: &str = r#"'([^'\\]|\\[\s\S])*'"#;
-/// Double-quoted string. Note that like Rust strings, this can span multiple
-/// lines.
-const DOUBLE_QUOTE_STRING_LITERAL_PATTERN: &str = r#""([^"\\]|\\[\s\S])*""#;
-/// Unterminated string literal.
-const UNTERMINATED_STRING_LITERAL_PATTERN: &str = r#"["']"#;
+## !!steps Order is the disambiguation rule
 
-/// List of token patterns, arranged roughly from least to most general.
+All the patterns live in one ordered list, and the comment states the invariant:
+"arranged roughly from least to most general". Regex alternation in the `regex`
+crate prefers the leftmost alternative that matches at the earliest position, so
+putting two-character comparisons like `<=` before the catch-all is what stops
+them from being split into two single-character tokens.
+
+The last entry, `[\s\S]`, matches any single character including newlines. It
+guarantees the lexer always makes progress: whatever the input, something
+matches, and the worst case is a one-character `Unknown` token.
+
+```rust ! lexer.rs
 const TOKEN_PATTERNS: &[&str] = &[
     // Comparison operators `==`, `!=`, `<=`, and `>=`.
     r#"[=!<>]="#,
@@ -94,12 +123,33 @@ const TOKEN_PATTERNS: &[&str] = &[
     // Whitespace.
     r#"\s+"#,
     // Any other single Unicode character.
+    // !mark
     r#"[\s\S]"#,
 ];
+```
+
+## !!steps Two flavors of compiled regex
+
+Each pattern gets used two different ways, so it is compiled twice. `TOKEN_REGEX`
+joins the whole list with `|` and is used to *find* the next token anywhere in
+the input. The per-pattern regexes go through `new_fullmatch_regex`, which wraps
+the pattern as `^(...)` so it can be used to *classify* a string the tokenizer
+has already sliced off.
+
+Both sets are `lazy_static`, so the regexes compile once on first use rather
+than on every formula evaluation.
+
+```rust ! lexer.rs
+fn new_fullmatch_regex(s: &str) -> Regex {
+    Regex::new(&("^(".to_owned() + s + ")")).unwrap()
+}
+
+// ...
 
 lazy_static! {
     /// Single regex that matches any token, including comments and strings,
     /// by joining each member of `TOKEN_PATTERNS` with "|".
+    // !mark
     pub static ref TOKEN_REGEX: Regex =
         Regex::new(&TOKEN_PATTERNS.join("|")).unwrap();
 
@@ -126,7 +176,21 @@ lazy_static! {
     pub static ref UNTERMINATED_STRING_LITERAL_REGEX: Regex =
         new_fullmatch_regex(UNTERMINATED_STRING_LITERAL_PATTERN);
 }
+```
 
+## !!steps Tokens that know how to describe themselves
+
+`Token` is a plain `Copy` enum with no payload — the text of a token is
+recovered from its span, not stored on the variant. Every variant carries a
+`strum` `to_string` attribute giving a human phrase like "argument separator
+(comma)", which is what the parser prints in "expected …" errors.
+
+Note the deliberately non-fatal variants: `UnterminatedBlockComment`,
+`UnterminatedStringLiteral`, and `Unknown`. The lexer never fails; malformed
+input still produces tokens, and it is the parser's job to reject them with a
+span pointing at the offending text.
+
+```rust ! lexer.rs
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq)]
 pub enum Token {
     // Grouping
@@ -143,55 +207,7 @@ pub enum Token {
     #[strum(to_string = "right brace")]
     RBrace,
 
-    // Separators
-    #[strum(to_string = "argument separator (comma)")]
-    ArgSep,
-    #[strum(to_string = "array row seperator (semicolon)")]
-    RowSep,
-
-    // Comparison operators
-    #[strum(to_string = "equals comparison")]
-    Eql,
-    #[strum(to_string = "not-equals comparison")]
-    Neq,
-    #[strum(to_string = "less-than comparison")]
-    Lt,
-    #[strum(to_string = "greater-than comparison")]
-    Gt,
-    #[strum(to_string = "less-than-or-equal comparison")]
-    Lte,
-    #[strum(to_string = "greater-than-or-equal comparison")]
-    Gte,
-
-    // Mathematical operators
-    #[strum(to_string = "plus operator")]
-    Plus,
-    #[strum(to_string = "minus operator")]
-    Minus,
-    #[strum(to_string = "multiplication operator")]
-    Mult,
-    #[strum(to_string = "division operator")]
-    Div,
-    #[strum(to_string = "exponentiation operator")]
-    Power, // ^
-
-    // Other operators
-    #[strum(to_string = "concatenation operator")]
-    Concat, // &
-    #[strum(to_string = "numeric range operator")]
-    RangeOp, // ..
-    #[strum(to_string = "percent operator")]
-    Percent, // %
-    #[strum(to_string = "cell range operator")]
-    CellRangeOp, // :
-    #[strum(to_string = "ellipsis")]
-    Ellipsis, // ...
-
-    // Comments
-    #[strum(to_string = "comment")]
-    Comment,
-    #[strum(to_string = "unterminated block comment")]
-    UnterminatedBlockComment,
+    // ...
 
     // Other special tokens
     #[strum(to_string = "function call")]
@@ -209,6 +225,20 @@ pub enum Token {
     #[strum(to_string = "unknown symbol")]
     Unknown,
 }
+```
+
+## !!steps Classifying the matched text
+
+`consume_from_input` starts with `TOKEN_REGEX.find_at`, which searches from
+`start` and returns `None` at end of input — that `?` is what terminates the
+iterator. The match text is then classified by an ordinary `match`, beginning
+with the fixed symbols.
+
+Two aliasing decisions show up here: both `=` and `==` produce `Eql`, and both
+`<>` (the spreadsheet spelling) and `!=` produce `Neq`. Note also that `end` is
+declared `mut` — the block comment arm below rewrites it.
+
+```rust ! lexer.rs
 impl Token {
     /// Consumes a token from a given starting index and returns the index of
     /// the next character after the token.
@@ -216,6 +246,7 @@ impl Token {
         // Find next token.
         let m = TOKEN_REGEX.find_at(input_str, start)?;
 
+        // !mark
         let mut end = m.end();
 
         let token = match m.as_str() {
@@ -227,6 +258,7 @@ impl Token {
             "}" => Self::RBrace,
             "," => Self::ArgSep,
             ";" => Self::RowSep,
+            // !mark(1:2)
             "=" | "==" => Self::Eql,
             "<>" | "!=" => Self::Neq,
             "<" => Self::Lt,
@@ -244,6 +276,23 @@ impl Token {
             ":" => Self::CellRangeOp,
             "..." => Self::Ellipsis,
 
+            // ...
+```
+
+## !!steps Block comments nest, so regex alone cannot do it
+
+`TOKEN_PATTERNS` only matches the opening `/*`; the rest is hand-scanned here,
+because nesting is not a regular language. A second regex finds every `/*` and
+`*/` boundary in the remaining input and a depth counter walks them, incrementing
+on open and decrementing on close, stopping as soon as depth returns to zero.
+
+If depth comes back to zero the token is a normal `Comment` and `end` is
+rewritten to the real closing position; otherwise the input ran out and the
+token is `UnterminatedBlockComment`, which keeps the span running to the end of
+the file. The tests at the bottom of the file pin this behavior down, including
+the delightful `/* nested /*/ oh my! ***/*/`.
+
+```rust ! lexer.rs
             // Match a line comment.
             s if s.starts_with("//") => Self::Comment,
 
@@ -257,6 +306,7 @@ impl Token {
                 for m in COMMENT_BOUNDARY_PATTERN.find_iter(&input_str[start..]) {
                     comment_len = m.end();
                     match m.as_str() {
+                        // !mark(1:2)
                         "/*" => depth += 1,
                         "*/" => depth -= 1,
                         _ => (), // should be impossible
@@ -272,7 +322,23 @@ impl Token {
                     Self::UnterminatedBlockComment
                 }
             }
+```
 
+## !!steps Fallbacks, a range fixup, and what the parser ignores
+
+Everything else is classified by re-matching the slice against the anchored
+regexes, again ordered specific-to-general and ending with `Unknown`. Then comes
+a genuine ambiguity fix: `1..5` would otherwise lex as the numeric literal `1.`
+followed by `.5`, so when a numeric literal ends in `.` and the next character
+is also `.`, the token gives the dot back by decrementing `end`. The comment is
+honest that this still fails on `1...5`, which is ambiguous between `1 .. .5`
+and `1. .. 5`.
+
+Finally, `is_skip` marks comments and whitespace as the tokens the parser steps
+over by default — the reason the lexer can keep them without complicating every
+syntax rule.
+
+```rust ! lexer.rs
             // Match anything else.
             s if FUNCTION_CALL_REGEX.is_match(s) => Self::FunctionCall,
             s if STRING_LITERAL_REGEX.is_match(s) => Self::StringLiteral,
@@ -293,6 +359,7 @@ impl Token {
             && m.as_str().ends_with('.')
             && rest_of_input.starts_with('.')
         {
+            // !mark
             end -= 1;
         }
 
@@ -305,43 +372,18 @@ impl Token {
         matches!(self, Self::Comment | Self::Whitespace)
     }
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use itertools::Itertools;
+</Scrollycoding>
 
-    use super::*;
-
-    #[test]
-    fn test_lex_block_comment() {
-        test_block_comment(true, "/* basic */");
-        test_block_comment(true, "/* line1 \n line2 */");
-        test_block_comment(true, "/* */");
-        test_block_comment(true, "/**/");
-        test_block_comment(true, "/***/");
-        test_block_comment(true, "/****/");
-        test_block_comment(true, "/** spooky * scary\n ** block *** comments **/");
-        test_block_comment(true, "/* nested /*/ oh my! ***/*/");
-
-        test_block_comment(false, "/* /*");
-        test_block_comment(false, "/*/");
-    }
-    fn test_block_comment(expected_to_end: bool, s: &str) {
-        let tokens = tokenize(s).collect_vec();
-        if expected_to_end {
-            assert_eq!(1, tokens.len(), "Too many tokens: {:?}", tokens);
-        }
-        let expected = if expected_to_end {
-            Token::Comment
-        } else {
-            Token::UnterminatedBlockComment
-        };
-        assert_eq!(
-            expected,
-            tokens[0].inner,
-            "Token is: {:?}",
-            tokens[0].span.of_str(s),
-        );
-    }
-}
-````
+The token stream feeds straight into
+[parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs), whose
+`Parser` holds a `&[Spanned<Token>]` slice and uses `is_skip` to move past
+trivia; the individual rules in
+[parser/rules/atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs)
+match on `Token::StringLiteral`, `Token::NumericLiteral`, and `Token::CellRef`
+and re-read the original text through the span. The `Span` and `Spanned` types
+themselves live in [span.rs](/docs/quadratic-core/src/formulas/span.rs). The
+block-comment tests are at the bottom of this file; the end-to-end pipeline is
+exercised from [tests.rs](/docs/quadratic-core/src/formulas/tests.rs), and the
+module wiring is in [formulas/mod.rs](/docs/quadratic-core/src/formulas/mod.rs).

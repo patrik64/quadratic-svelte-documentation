@@ -1,15 +1,38 @@
 ---
 title: "tests.rs"
-description: "Rust module tests.rs of the quadratic-core formula engine."
+description: "The formula engine's test harness: two fake grids, an eval helper, and the tests that pin down references and arrays."
 source: "quadratic-core/src/formulas/tests.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`formulas/mod.rs` declares this module as `#[cfg(test)] mod tests;`, so it
+exists only when the crate is compiled by `cargo test`. It plays two roles at
+once: it is the shared **test harness** — a pair of fake grids plus an `eval`
+helper that every function module pulls in with `use crate::formulas::tests::*`
+(logic, string, lookup, statistics, and eight others) — and it is the home of the
+engine-level tests that no single built-in function owns: reference resolution,
+circular references, array broadcasting, and parser regressions.
 
-````rust tests.rs -n
+Reading it is the fastest way to learn what the engine actually promises. Each
+test states a formula source string and the value it must produce.
+
+<Scrollycoding>
+
+## !!steps A grid that panics when read
+
+`NoGrid` implements [GridProxy](/docs/quadratic-core/src/formulas/grid_proxy.rs)
+by panicking. It is not a stub for convenience — it is an assertion: a test that
+evaluates against `NoGrid` claims the formula never touches the spreadsheet at
+all, and the panic message fires if that claim is wrong.
+
+`eval` is the whole pipeline in three lines: parse the source at the origin, run
+it at the origin, and drop the span from the result.
+`eval_blocking` exists because [GridProxy::get](/docs/quadratic-core/src/formulas/grid_proxy.rs)
+is `async` (the browser fetches cells from JS), so
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) wraps the future in
+`pollster::block_on` for synchronous callers like these tests.
+
+```rust ! tests.rs
 use async_trait::async_trait;
 use smallvec::smallvec;
 use std::fmt;
@@ -22,6 +45,7 @@ pub(crate) struct NoGrid;
 #[async_trait(?Send)]
 impl GridProxy for NoGrid {
     async fn get(&mut self, _pos: Pos) -> Option<String> {
+        // !mark
         panic!("no cell should be accessed")
     }
 }
@@ -34,7 +58,21 @@ pub(crate) fn eval(grid: &mut dyn GridProxy, s: &str) -> FormulaResult {
         .eval_blocking(grid, Pos::ORIGIN)
         .map(|value| value.inner)
 }
+```
 
+## !!steps A grid backed by a closure
+
+The other fake grid wraps any `FnMut(Pos) -> Option<String>`, which lets a test
+define its spreadsheet inline — usually as a `match` on `(pos.x, pos.y)`, or as
+an arithmetic formula over the coordinates. Returning `None` means "empty cell".
+
+Two details are worth noting. The `where` bound is repeated on the tuple struct
+itself, with a comment explaining why: it helps type inference when a test
+writes `FnGrid(|pos| ...)` without naming the closure type. And `Debug` is
+implemented by hand with `finish_non_exhaustive`, because a closure has no
+`Debug` of its own yet the surrounding assertion machinery wants one.
+
+```rust ! tests.rs
 /// `GridProxy` implementation that calls a function for grid access.
 #[derive(Copy, Clone)]
 pub(crate) struct FnGrid<F>(pub F)
@@ -55,10 +93,28 @@ where
     F: FnMut(Pos) -> Option<String>,
 {
     async fn get(&mut self, pos: Pos) -> Option<String> {
+        // !mark
         self.0(pos)
     }
 }
+```
 
+## !!steps References resolve against the evaluating cell
+
+This is the engine's most load-bearing behavior, and the test is deliberately
+awkward: the formula is *parsed* at `D4` but *evaluated* at `B2`. A `$` freezes
+a coordinate, so `$D$4` stays at `D4`; everything else stores an offset from the
+parse position and is re-resolved from the evaluation position — the comments in
+the closure spell out each landing spot, and the powers of ten make the sum
+`11111` prove that all five arrived where expected.
+
+The same formula evaluated at `D4` returns `FormulaErrorMsg::CircularReference`,
+because `$D$4` then resolves onto the cell doing the evaluating. A companion
+test, `test_formula_circular_array_ref`, checks the range case: `$B$0:$C$4`
+evaluated at `B2` errors the same way, and its `FnGrid` panics if `B2` is ever
+fetched — so the circularity is caught before any read happens.
+
+```rust ! tests.rs
 #[test]
 fn test_formula_cell_ref() {
     let form = parse_formula("SUM($D$4, $B0, E$n6, B0, nB2)", pos![D4]).unwrap();
@@ -77,6 +133,7 @@ fn test_formula_cell_ref() {
     });
 
     // Evaluate at D4, causing a circular reference.
+    // !mark(1:4)
     assert_eq!(
         FormulaErrorMsg::CircularReference,
         form.eval_blocking(&mut g, pos![D4]).unwrap_err().msg,
@@ -88,42 +145,21 @@ fn test_formula_cell_ref() {
         form.eval_blocking(&mut g, pos![B2]).unwrap().to_string(),
     );
 }
+```
 
-#[test]
-fn test_formula_circular_array_ref() {
-    let form = parse_formula("$B$0:$C$4", pos![A0]).unwrap();
+## !!steps Arrays broadcast across operators
 
-    let mut g = FnGrid(|pos| {
-        if pos == pos![B2] {
-            panic!("cell {pos} shouldn't be accessed")
-        } else {
-            None
-        }
-    });
+Here the fake grid is a formula itself — cell `(x, y)` contains `x * 10 + y` —
+so every expected product can be written out longhand and checked against the
+address it came from. The four assertions cover the whole broadcasting matrix:
+scalar times scalar, array times scalar, scalar times array, and array times
+array elementwise.
 
-    assert_eq!(
-        FormulaErrorMsg::CircularReference,
-        form.eval_blocking(&mut g, pos![B2]).unwrap_err().msg,
-    )
-}
+The final assertion pins the failure mode: two arrays of different shapes do not
+silently pad or truncate, they produce the message
+`Array size mismatch: expected (4, 2), got (5, 2)`.
 
-#[test]
-fn test_formula_range_operator() {
-    let expected = "{1; 2; 3; 4; 5}";
-    let all_a = ["1", "1.0", ".9"];
-    let all_ops = ["..", " ..", " .. ", ".. "];
-    let all_b = ["5", "5.0", "5."];
-    for (a, op, b) in itertools::iproduct!(all_a, all_ops, all_b) {
-        let actual = eval_to_string(&mut NoGrid, &format!("{a}{op}{b}"));
-        assert_eq!(expected, actual);
-    }
-
-    assert_eq!(
-        FormulaErrorMsg::Unexpected("ellipsis".into()),
-        parse_formula("1...5", Pos::ORIGIN).unwrap_err().msg,
-    );
-}
-
+```rust ! tests.rs
 #[test]
 fn test_formula_array_op() {
     let mut g = FnGrid(|pos| Some((pos.x * 10 + pos.y).to_string()));
@@ -140,30 +176,30 @@ fn test_formula_array_op() {
         ]),
         eval(&mut g, "B1:C4 * D1").unwrap(),
     );
-    assert_eq!(
-        Value::Array(vec![
-            smallvec![f(11 * 31), f(11 * 41)],
-            smallvec![f(11 * 32), f(11 * 42)],
-            smallvec![f(11 * 33), f(11 * 43)],
-            smallvec![f(11 * 34), f(11 * 44)],
-        ]),
-        eval(&mut g, "B1 * D1:E4").unwrap(),
-    );
-    assert_eq!(
-        Value::Array(vec![
-            smallvec![f(11 * 31), f(21 * 41)],
-            smallvec![f(12 * 32), f(22 * 42)],
-            smallvec![f(13 * 33), f(23 * 43)],
-            smallvec![f(14 * 34), f(24 * 44)],
-        ]),
-        eval(&mut g, "B1:C4 * D1:E4").unwrap(),
-    );
+    // ...
+    // !mark(1:4)
     assert_eq!(
         "Array size mismatch: expected (4, 2), got (5, 2)",
         eval(&mut g, "B1:C4 * D1:E5").unwrap_err().msg.to_string(),
     );
 }
+```
 
+## !!steps Array literal syntax
+
+Arrays can also be written directly: commas separate columns, semicolons
+separate rows. The second assertion is a round trip through `Display` — messy
+input spacing normalizes to `{11, 12; 21, 22; 31, 32}`, which is the form the
+app shows in a cell.
+
+The rest of the test fences off what is *not* allowed: rows of unequal length
+give `NonRectangularArray`, and an empty array or an empty row is an error
+rather than an empty value. Related, `test_formula_range_operator` checks the
+`..` operator: every spacing variant of `1 .. 5` (and forms like `.9` and `5.`)
+evaluates to the column array `{1; 2; 3; 4; 5}`, while `1...5` is rejected with
+`Unexpected("ellipsis")`.
+
+```rust ! tests.rs
 #[test]
 fn test_array_parsing() {
     let f = |x| Value::Number(x as f64);
@@ -181,14 +217,9 @@ fn test_array_parsing() {
         "{11, 12; 21, 22; 31, 32}",
         eval_to_string(&mut NoGrid, "{11,   12 ;21, 22;31,32}"),
     );
-
-    // Single row
-    assert_eq!("{11, 12, 13}", eval_to_string(&mut NoGrid, "{11, 12, 13}"),);
-
-    // Single column
-    assert_eq!("{11; 12; 13}", eval_to_string(&mut NoGrid, "{11; 12; 13}"),);
-
+    // ...
     // Mismatched rows
+    // !mark(1:4)
     assert_eq!(
         FormulaErrorMsg::NonRectangularArray,
         eval(&mut NoGrid, "{1; 3, 4}").unwrap_err().msg,
@@ -201,7 +232,21 @@ fn test_array_parsing() {
     // Empty row
     assert!(eval(&mut NoGrid, "{ ; }").is_err());
 }
+```
 
+## !!steps Regressions from the issue tracker
+
+Three small tests, each guarding a spreadsheet habit that a naive parser gets
+wrong. A user typing `=3+4` expects the leading `=` to be a marker, not an
+operator — that is handled in `Parser::new`, which consumes a leading `=` and
+rewinds if it is not there.
+
+`Z1-5` must lex as a reference minus five, not as the reference `Z1-5`; the
+spaced and unspaced forms both have to give `25`. And `"$10" + 20` must coerce
+the currency-formatted string to `10`, giving `30`, rather than choking on the
+dollar sign that also introduces absolute references.
+
+```rust ! tests.rs
 #[test]
 fn test_leading_equals() {
     assert_eq!("7", eval_to_string(&mut NoGrid, "=3+4"));
@@ -213,15 +258,41 @@ fn test_leading_equals() {
 fn test_hyphen_after_cell_ref() {
     let mut g = FnGrid(|_| Some("30".to_string()));
     assert_eq!("25", eval_to_string(&mut g, "Z1 - 5"));
+    // !mark
     assert_eq!("25", eval_to_string(&mut g, "Z1-5"));
 }
+// ...
+/// Regression test for quadratic#410
+#[test]
+fn test_currency_string() {
+    assert_eq!("30", eval_to_string(&mut NoGrid, "\"$10\" + 20"));
+}
+```
 
+## !!steps Finding cell references without evaluating
+
+`find_cell_references` is the engine's second public entry point. The wasm layer
+in [lib.rs](/docs/quadratic-core/src/lib.rs) returns its output to JavaScript
+next to any parse error, and `relocate_formula` uses it to rewrite a formula's
+references when a cell is copied — so it has to survive half-written input.
+The source string here is deliberately broken:
+`:D$n6` and `A0:` are dangling range halves, and the scan still recovers the
+complete references around them.
+
+The assertions read the results as `CellRefCoord` values, which is where the
+`$` distinction becomes visible: `Absolute(col![A])` stores the column
+literally, while `Relative(7 - base.y)` stores an offset from the base position
+`D4`. The test ends by asserting the iterator is exhausted, so nothing extra was
+matched.
+
+```rust ! tests.rs
 #[test]
 fn test_find_cell_references() {
     use CellRefCoord::{Absolute, Relative};
 
     // Evaluate at D4.
     let base = pos![D4];
+    // !mark
     let refs = find_cell_references("SUM($C$4, $A0 : nQ7, :D$n6, A0:, ZB2)", base);
     let mut iter = refs.iter().map(|r| r.inner);
 
@@ -245,40 +316,24 @@ fn test_find_cell_references() {
             },
         )),
     );
-
-    // D$n6
-    assert_eq!(
-        iter.next(),
-        Some(RangeRef::Cell(CellRef {
-            x: Relative(col![D] - base.x),
-            y: Absolute(-6),
-        })),
-    );
-
-    // A0
-    assert_eq!(
-        iter.next(),
-        Some(RangeRef::Cell(CellRef {
-            x: Relative(col![A] - base.x),
-            y: Relative(0 - base.y),
-        })),
-    );
-
-    // ZB2
-    assert_eq!(
-        iter.next(),
-        Some(RangeRef::Cell(CellRef {
-            x: Relative(col![ZB] - base.x),
-            y: Relative(2 - base.y),
-        })),
-    );
-
+    // ...
     assert_eq!(iter.next(), None);
 }
+```
 
-/// Regression test for quadratic#410
-#[test]
-fn test_currency_string() {
-    assert_eq!("30", eval_to_string(&mut NoGrid, "\"$10\" + 20"));
-}
-````
+</Scrollycoding>
+
+The behaviors tested here live in
+[parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs) (the leading
+`=`, and `find_cell_references`),
+[cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs) (absolute vs.
+relative coordinates and the `pos!`/`col!` helpers from
+[util.rs](/docs/quadratic-core/src/util.rs)),
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) (the circular-reference
+check), [value.rs](/docs/quadratic-core/src/formulas/value.rs) (arrays and their
+stringification), and
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs) (every
+`FormulaErrorMsg` variant asserted above). Per-function tests live next to their
+implementations under
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), all of
+them importing the two fake grids defined on this page.

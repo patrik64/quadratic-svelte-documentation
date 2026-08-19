@@ -1,17 +1,23 @@
 ---
 title: "expression.rs"
-description: "Operator precedence table."
+description: "The operator-precedence core of the formula grammar — precedence levels, binary and unary folding, function calls and array literals."
 source: "quadratic-core/src/formulas/parser/rules/expression.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This is the heart of the formula grammar. `parse_formula` in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs) starts by asking for exactly one `Expression`, and everything a user can write between the `=` and the end of the formula is described here: comparisons, concatenation, arithmetic, ranges, unary signs, percent suffixes, function calls, parentheses and array literals.
 
-````rust expression.rs -n
-use super::*;
+Rather than one grammar rule per precedence level, the file has a single parameterised rule, `ExpressionWithPrecedence`, plus an `OpPrecedence` ladder it walks. Each level parses the level above it and then folds any operators of its own around the results — the classic recursive-descent precedence climb, expressed as one rule that recurses into itself with a higher parameter.
 
+<Scrollycoding>
+
+## !!steps The precedence ladder
+
+`OpPrecedence` lists the levels from loosest-binding to tightest, and derives `Ord` so levels can be compared directly. `Comparison` is the lowest — `=`, `<`, `>` and friends bind least tightly — and `Atom` is the top, where literals and parenthesised expressions live.
+
+`next()` is the only way to climb, hand-written as a match rather than derived. It deliberately panics at `Atom`: reaching that call would mean the atom level tried to recurse into something above itself. `Default` returns `lowest()`, which is what makes `ExpressionWithPrecedence::default()` mean "a full expression".
+
+```rust ! expression.rs
 /// Operator precedence table.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpPrecedence {
@@ -38,6 +44,7 @@ impl OpPrecedence {
     }
     /// Returns the next-highest precedence level. Panics if given
     /// `OpPrecedence::Atom`.
+    // !mark
     pub fn next(self) -> Self {
         match self {
             Self::Comparison => Self::Concat,
@@ -52,7 +59,15 @@ impl OpPrecedence {
             Self::Atom => panic!("tried to get operator precedence level beyond {:?}", self),
         }
     }
+```
 
+## !!steps Which operators live where
+
+Three lookup methods map a level to the tokens it accepts, and the empty slices are as meaningful as the full ones — they are what the dispatcher later switches on.
+
+Reading down the binary table gives the whole precedence story: comparisons loosest, then `&` for concatenation, then `+` and `-`, then `*` and `/`, then `^`, then `..` and finally `:` for cell ranges. `Prefix` and `Suffix` have no binary operators at all; instead `Prefix` claims `+` and `-` as unary signs, and `Suffix` claims `%`. Note that `+` and `-` appear in two tables — as binary operators at `AddSub` and as unary ones much tighter down at `Prefix`.
+
+```rust ! expression.rs
     /// Returns a list of binary operators at this precedence level.
     pub fn binary_ops(self) -> &'static [Token] {
         use Token::*;
@@ -87,17 +102,15 @@ impl OpPrecedence {
             _ => &[],
         }
     }
+```
 
-    /// Returns whether the binary operators at this precedence level are
-    /// right-associative.
-    pub fn is_right_associative(self) -> bool {
-        match self {
-            OpPrecedence::Pow => true,
-            _ => false,
-        }
-    }
-}
+## !!steps One public rule, one private one
 
+`Expression` is the only rule other modules use — `parse_formula`, `List` inside `FunctionCall`, `ArrayLiteral` and `ParenExpression` all reference it by name. It carries no precedence of its own and simply forwards both trait methods to `ExpressionWithPrecedence::default()`, i.e. the `Comparison` level.
+
+`ExpressionWithPrecedence` is a private newtype around `OpPrecedence`. Deriving `Default` on it works precisely because `OpPrecedence` has the `Default` impl from the previous step. Both rules display as plain "expression", so error messages never leak the internal precedence level at which parsing failed.
+
+```rust ! expression.rs
 /// Matches an expression.
 #[derive(Debug, Copy, Clone)]
 pub struct Expression;
@@ -109,6 +122,7 @@ impl SyntaxRule for Expression {
         ExpressionWithPrecedence::default().prefix_matches(p)
     }
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
+        // !mark
         p.parse(ExpressionWithPrecedence::default())
     }
 }
@@ -117,6 +131,15 @@ impl SyntaxRule for Expression {
 #[derive(Debug, Default, Copy, Clone)]
 struct ExpressionWithPrecedence(pub OpPrecedence);
 impl_display!(for ExpressionWithPrecedence, "expression");
+```
+
+## !!steps Which tokens can start an expression
+
+`prefix_matches` is a full census of the token set. The comment explains the choice: so many tokens could begin an expression that enumerating all of them, with no wildcard arm, is more reliable than trying to be clever. The practical benefit is that adding a token to [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs) makes this match fail to compile until someone decides which side it belongs on.
+
+The interesting entries are the asymmetries: `Token::LParen` and `Token::LBrace` can open an expression but `Token::LBracket` cannot; closing brackets and separators cannot; comparison operators cannot, but `+` and `-` can, because they double as unary signs. Notice too that `UnterminatedStringLiteral` answers *true* — a half-typed string still looks like an attempt at an expression, so the parser commits and produces a useful error rather than a confusing one.
+
+```rust ! expression.rs
 impl SyntaxRule for ExpressionWithPrecedence {
     type Output = ast::AstNode;
 
@@ -135,17 +158,9 @@ impl SyntaxRule for ExpressionWithPrecedence {
 
                 Token::Eql | Token::Neq | Token::Lt | Token::Gt | Token::Lte | Token::Gte => false,
 
+                // !mark
                 Token::Plus | Token::Minus => true,
-
-                Token::Mult
-                | Token::Div
-                | Token::Power
-                | Token::Concat
-                | Token::RangeOp
-                | Token::Percent
-                | Token::CellRangeOp
-                | Token::Ellipsis => false,
-
+                // ...
                 Token::Comment | Token::UnterminatedBlockComment => false,
 
                 Token::FunctionCall
@@ -161,6 +176,15 @@ impl SyntaxRule for ExpressionWithPrecedence {
             false
         }
     }
+```
+
+## !!steps Dispatch by level
+
+`consume_match` branches on the level this rule instance carries. `Atom` is the base case: an alternation over the six atomic rules, in order, with `Epsilon` last so that "nothing matched" comes back as `Ok(None)` instead of an error. `.transpose()` flips `FormulaResult` and `Option` around so `unwrap_or_else` can turn that `None` into a single clean "expected expression" error instead of the sprawling list `parse_one_of!` would otherwise produce.
+
+Every other level is chosen by *guard*, asking the lookup tables from earlier which kind of operator lives here: non-empty `binary_ops` means fold binary operators, non-empty `prefix_ops` or `suffix_ops` means fold unary ones. The final arm is `internal_error!` — with the current tables no level reaches it, but a new level added without operators would land there instead of silently misparsing.
+
+```rust ! expression.rs
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
         // Consume an expression at the given precedence level, which may
         // consist of expressions with higher precedence.
@@ -174,6 +198,7 @@ impl SyntaxRule for ExpressionWithPrecedence {
                     ArrayLiteral.map(Some),
                     CellReference.map(Some),
                     ParenExpression.map(Some),
+                    // !mark
                     Epsilon.map(|_| None),
                 ],
             )
@@ -187,13 +212,22 @@ impl SyntaxRule for ExpressionWithPrecedence {
         }
     }
 }
+```
 
+## !!steps Binary operators, flattened first
+
+The binary case does not build a tree while scanning. It first parses one operand at the *next* level up — that single line is where the precedence climb happens — and then loops as long as the upcoming token is one of this level's operators, pushing each operator and each following operand onto two parallel vectors.
+
+The operator is stored as a `Spanned<String>` holding its literal source text, not as a token; that text later becomes a function name. The comment states the invariant that the folding step relies on: `ops.len()` is always `exprs.len() - 1`. `p.peek_next()` looks ahead without moving the real cursor, so a token that is not one of `allowed_ops` is left untouched for a lower level to consume.
+
+```rust ! expression.rs
 /// Parses an expression with any number of binary operators at a specific
 /// precedence level.
 fn parse_binary_ops_expr(
     p: &mut Parser<'_>,
     precedence: OpPrecedence,
 ) -> FormulaResult<ast::AstNode> {
+    // !mark
     let recursive_expression = ExpressionWithPrecedence(precedence.next());
 
     let allowed_ops = precedence.binary_ops();
@@ -215,7 +249,15 @@ fn parse_binary_ops_expr(
             break;
         }
     }
+```
 
+## !!steps Folding left or right
+
+Only now does associativity matter, and it is a single branch over `is_right_associative()` — which returns true for exactly one level, `Pow`, so `2^3^2` groups as `2^(3^2)` while `10-3-2` groups as `(10-3)-2`.
+
+Both branches build the same shape from opposite ends: take the extreme operand as the seed, then repeatedly wrap it in an `AstNodeContents::FunctionCall` whose `func` is the operator's source text and whose `args` are the two operands, in source order. That is the key design decision of this parser — there is no dedicated binary-operator AST node; `+` is simply a call to a function named `+`, resolved later against the table in [operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs). Each new node's span is the merge of its two children, so a nested expression's span always covers its full source text.
+
+```rust ! expression.rs
     let mut ret: ast::AstNode;
     if precedence.is_right_associative() {
         // Take out the last/rightmost expression; that's the deepest AST node.
@@ -223,6 +265,7 @@ fn parse_binary_ops_expr(
         // Pair up the remaining operators and expressions, and make a new AST
         // node using the previous iteration as the right-hand side of the
         // expression.
+        // !mark
         for (lhs, op) in exprs.into_iter().zip(ops).rev() {
             ret = AstNode {
                 span: Span::merge(lhs.span, ret.span),
@@ -239,6 +282,7 @@ fn parse_binary_ops_expr(
         // Pair up the remaining operators and expressions, and make a new AST
         // node using the previous iteration as the left-hand side of the
         // expression.
+        // !mark
         for (op, rhs) in ops.into_iter().zip(exprs_iter) {
             ret = AstNode {
                 span: Span::merge(ret.span, rhs.span),
@@ -251,26 +295,19 @@ fn parse_binary_ops_expr(
     }
     Ok(ret)
 }
+```
 
+## !!steps Unary signs and the percent suffix
+
+The two unary helpers mirror each other. `parse_prefix_ops` collects every leading `+` or `-` into a vector before parsing the operand, then wraps the operand once per operator; since it iterates the vector in source order and each iteration wraps the previous result, the operator written last ends up outermost. With `+` and `-` as the only prefix operators, the levels here still bind tighter than `^`, which is why the `Prefix` level sits above `Pow` in the ladder.
+
+`parse_suffix_ops` needs no vector: it parses the operand first, then repeatedly consumes a trailing `%` and wraps what it has, which naturally yields left-to-right application. Both produce the same one-argument `FunctionCall` node shape as the binary case, so `-` as a unary operator and `-` as a binary one differ only in argument count.
+
+```rust ! expression.rs
 /// Parses an expression with any number of prefix operators.
 fn parse_prefix_ops(p: &mut Parser<'_>, precedence: OpPrecedence) -> FormulaResult<ast::AstNode> {
     let allowed_ops = precedence.prefix_ops();
-
-    // Build a list of operators in the order that they appear in the source
-    // code.
-    let mut ops: Vec<Spanned<String>> = vec![];
-    while let Some(tok) = p.peek_next() {
-        if allowed_ops.contains(&tok) {
-            p.next();
-            ops.push(Spanned {
-                span: p.span(),
-                inner: p.token_str().to_string(),
-            });
-            continue;
-        } else {
-            break;
-        }
-    }
+    // ...
     let mut ret = p.parse(ExpressionWithPrecedence(precedence.next()))?;
     // Now pop the operators off the list from right to left.
     for op in ops {
@@ -300,20 +337,22 @@ fn parse_suffix_ops(p: &mut Parser<'_>, precedence: OpPrecedence) -> FormulaResu
                 span: p.span(),
                 inner: p.token_str().to_string(),
             };
-            ret = AstNode {
-                span: Span::merge(ret.span, op.span),
-                inner: ast::AstNodeContents::FunctionCall {
-                    func: op,
-                    args: vec![ret],
-                },
-            }
+            // ...
         } else {
             break;
         }
     }
     Ok(ret)
 }
+```
 
+## !!steps Function calls and the rewind trick
+
+The lexer emits a function name together with its opening paren as one `FunctionCall` token, which forces an unusual dance here. The rule consumes that token, strips the trailing `(` to recover the name, and then calls `p.prev()` to step *back* onto the very same token — because the `List` combinator it is about to invoke expects to consume its own `start` delimiter, and that delimiter is this token.
+
+The `List` is configured with `Token::ArgSep` as separator and `Token::RParen` as terminator, with `sep_name` set to "comma" purely for error messages. The result is again an `AstNodeContents::FunctionCall`, identical in shape to what an operator produces — by the time [ast.rs](/docs/quadratic-core/src/formulas/ast.rs) evaluates the tree, `SUM(A1, B1)` and `A1 + B1` are the same kind of node.
+
+```rust ! expression.rs
 /// Matches a function call.
 #[derive(Debug, Copy, Clone)]
 pub struct FunctionCall;
@@ -333,6 +372,7 @@ impl SyntaxRule for FunctionCall {
             span: p.span(),
             inner: func_str.to_string(),
         };
+        // !mark
         p.prev();
 
         let spanned_args = p.parse(List {
@@ -350,7 +390,15 @@ impl SyntaxRule for FunctionCall {
         })
     }
 }
+```
 
+## !!steps Parentheses and array literals
+
+`ParenExpression` is three lines of real logic: hand `Surround::paren` an `Expression` mapped into `AstNodeContents::Paren`, and let the combinator from [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs) do the bracket matching and span merging. Parentheses are kept as an explicit AST node rather than dissolved, so the tree still knows where the user wrote them. Its `impl_display!` even delegates its error text to `Surround::paren(Expression)`.
+
+`ArrayLiteral` parses the brace form the display string spells out — the doubled braces there are format-string escaping. The loop reads one expression at a time and branches on the separator that follows: a comma moves to the next cell in the row, a semicolon starts a new row, a closing brace ends the literal, and anything else produces an error naming all three. A trailing row separator leaves an empty final row, which is popped, and a final `all_equal` check over the row lengths rejects ragged input with `NonRectangularArray`.
+
+```rust ! expression.rs
 /// Matches a pair of parentheses containing an expression.
 #[derive(Debug, Copy, Clone)]
 pub struct ParenExpression;
@@ -368,54 +416,30 @@ impl SyntaxRule for ParenExpression {
     }
 }
 
+// ...
 /// Matches an array literal.
 #[derive(Debug, Copy, Clone)]
 pub struct ArrayLiteral;
 impl_display!(for ArrayLiteral, "array literal, such as '{{1, 2; 3, 4}}'");
-impl SyntaxRule for ArrayLiteral {
-    type Output = AstNode;
-
-    fn prefix_matches(&self, mut p: Parser<'_>) -> bool {
-        p.next() == Some(Token::LBrace)
-    }
-
-    fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
-        let start_span = p.peek_next_span();
-
+// ...
         let mut rows = vec![vec![]];
         p.parse(Token::LBrace)?;
         loop {
             rows.last_mut().unwrap().push(p.parse(Expression)?);
+            // !mark(1:4)
             match p.next() {
                 Some(Token::ArgSep) => (),                // next cell within row
                 Some(Token::RowSep) => rows.push(vec![]), // start a new row
                 Some(Token::RBrace) => break,             // end of array
-                _ => {
-                    return Err(p.expected_err(crate::util::join_with_conjunction(
-                        "or",
-                        &[
-                            Token::ArgSep.to_string(),
-                            Token::RowSep.to_string(),
-                            Token::RBrace.to_string(),
-                        ],
-                    )))
-                }
+                // ...
             }
         }
-        if rows.last().unwrap().is_empty() && rows.len() > 1 {
-            rows.pop();
-        }
-
-        let end_span = p.span();
-
+        // ...
         if !rows.iter().map(|row| row.len()).all_equal() {
             return Err(FormulaErrorMsg::NonRectangularArray.with_span(end_span));
         }
+```
 
-        Ok(Spanned {
-            span: Span::merge(start_span, end_span),
-            inner: ast::AstNodeContents::Array(rows),
-        })
-    }
-}
-````
+</Scrollycoding>
+
+This file sits at the top of the rule hierarchy: it leans on the leaf rules in [atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs), the `List`, `Surround` and `Epsilon` combinators in [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs), the `SyntaxRule` trait in [rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs), and the `parse_one_of!` macro in [macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs). It is entered from `parse_formula` in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs), consumes the tokens from [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs), and emits the nodes defined in [ast.rs](/docs/quadratic-core/src/formulas/ast.rs) — where every operator it folds is eventually looked up among the built-ins in [operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs).

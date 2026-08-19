@@ -1,23 +1,37 @@
 ---
 title: "cell_ref.rs"
-description: "Rust module cell_ref.rs of the quadratic-core formula engine."
+description: "A1-style cell and range references, stored as relative or absolute coordinates and resolved against the cell being evaluated."
 source: "quadratic-core/src/formulas/cell_ref.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+When a formula says `A1`, it does not mean a fixed place on the grid — it means
+an offset from the cell the formula lives in, so that copying the formula
+elsewhere moves what it points at. Writing `$A$1` instead pins it. This file is
+where that distinction lives: references are stored as `Relative` or `Absolute`
+per axis, and only turned into concrete grid coordinates at evaluation time,
+against the position of the cell doing the evaluating.
 
-````rust cell_ref.rs -n
-use lazy_static::lazy_static;
-use regex::Regex;
-use serde::{Deserialize, Serialize};
-use std::fmt;
-use std::str::FromStr;
+It is the Rust counterpart to the app's own A1 helpers in
+[a1.ts](/docs/src/lib/core/a1.ts), and shares their conventions: an infinite
+grid centred on the origin, with negative columns and rows written with a
+lowercase `n` prefix. What it adds on top is Excel's `$` anchoring.
 
-use super::Pos;
+<Scrollycoding>
 
+## !!steps Four shapes of a reference
+
+A formula can name a single cell (`A1`), a rectangle (`A1:C5`), a span of whole
+rows, or a span of whole columns — so `RangeRef` has one variant for each. The
+row and column ranges hold bare `CellRefCoord` values because only one axis is
+constrained; the other is unbounded.
+
+`Display` here is the *internal* form, not what a user types: an `R` or `C`
+tag in front of each coordinate, with the coordinate itself printed by
+`CellRefCoord`, whose own `Display` appears further down. The next step covers
+A1 rendering.
+
+```rust ! cell_ref.rs
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum RangeRef {
     RowRange(CellRefCoord, CellRefCoord),
@@ -35,6 +49,19 @@ impl fmt::Display for RangeRef {
         }
     }
 }
+```
+
+## !!steps Rendering back to A1
+
+`a1_string` is the inverse of parsing, and it needs a `base` — the cell the
+reference is written *in* — because a relative coordinate has no meaning on its
+own. Feeding it a different base than the one it was parsed with is exactly how
+references get rewritten: [lib.rs](/docs/quadratic-core/src/lib.rs) calls
+`adjusted.a1_string(new_base)` in `adjust_formula` and `relocate_formula` to
+splice updated text back into the formula string when rows/columns are inserted
+or a formula is copied.
+
+```rust ! cell_ref.rs
 impl RangeRef {
     /// Returns the human-friendly string representing this range reference in
     /// A1-style notation.
@@ -47,13 +74,29 @@ impl RangeRef {
                 format!("{}:{}", start.col_string(base.x), end.col_string(base.x))
             }
             RangeRef::CellRange(start, end) => {
+                // !mark
                 format!("{}:{}", start.a1_string(base), end.a1_string(base))
             }
             RangeRef::Cell(cell) => cell.a1_string(base),
         }
     }
 }
+```
 
+## !!steps A cell is two independent coordinates
+
+`CellRef` is just an x and a y, each of which carries its own relative/absolute
+flag — which is what makes mixed references like `$A1` representable.
+`absolute` builds a reference pinned to a known `Pos`, for the cases where
+coordinates arrive as numbers rather than as source text — it is how
+`array_mapped_get_cell` in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) turns evaluated x and y
+arguments into a reference.
+
+`resolve_from` is the whole point of the type: hand it the evaluating cell's
+position and each axis resolves independently to a plain `Pos`.
+
+```rust ! cell_ref.rs
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct CellRef {
     pub x: CellRefCoord,
@@ -78,18 +121,28 @@ impl CellRef {
     /// coordinate where evaluation is taking place.
     pub fn resolve_from(self, base: Pos) -> Pos {
         Pos {
+            // !mark(1:2)
             x: self.x.resolve_from(base.x),
             y: self.y.resolve_from(base.y),
         }
     }
-    /// Returns the human-friendly string representing this cell reference in
-    /// A1-style notation.
-    pub fn a1_string(self, base: Pos) -> String {
-        let col = self.x.col_string(base.x);
-        let row = self.y.row_string(base.y);
-        format!("{col}{row}")
-    }
+```
 
+## !!steps The A1 regex, annotated in place
+
+The regex is built once behind `lazy_static!`, and the source keeps an ASCII
+diagram of what each group captures. Five groups: a `$` before the column, the
+column name, a `$` before the row, an `n` marking a negative row, and the row
+digits. Note that the column's own negative marker lives *inside* group 2
+(`n?[A-Z]+`) — `column_from_name` in
+[util.rs](/docs/quadratic-core/src/util.rs) strips it there.
+
+Column letters must be uppercase, so this parser is stricter than the app-side
+regex in [a1.ts](/docs/src/lib/core/a1.ts); by the time it runs, the
+[lexer](/docs/quadratic-core/src/formulas/lexer.rs) has already isolated the
+token.
+
+```rust ! cell_ref.rs
     /// Parses an A1-style cell reference relative to a given location.
     pub fn parse_a1(s: &str, base: Pos) -> Option<CellRef> {
         lazy_static! {
@@ -100,6 +153,7 @@ impl CellRef {
             ///                 (\$?)               group 3: optional `$`
             ///                      (n?)           group 4: optional `n`
             ///                          (\d+)      group 5: row number
+            // !mark
             pub static ref A1_CELL_REFERENCE_REGEX: Regex =
                 Regex::new(r#"^(\$?)(n?[A-Z]+)(\$?)(n?)(\d+)$"#).unwrap();
         }
@@ -111,7 +165,22 @@ impl CellRef {
         let row_is_absolute = !captures[3].is_empty();
         let row_is_negative = !captures[4].is_empty();
         let row_number = &captures[5];
+```
 
+## !!steps Absolute keeps the number, relative keeps the offset
+
+This is the conversion that makes `$` meaningful. Both branches start from the
+same resolved column and row, but an absolute coordinate stores the number
+itself, while a relative one stores the *delta* from the base. Copy the formula
+one row down and the relative delta still points one row down; the absolute
+number does not move.
+
+Everything is fallible and returns `Option`: an out-of-range column name or a
+row number that overflows `i64` yields `None`, which the parser reports as
+`BadCellReference` from
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).
+
+```rust ! cell_ref.rs
         let col = crate::util::column_from_name(column_name)?;
         let mut row = row_number.parse::<i64>().ok()?;
         if row_is_negative {
@@ -121,6 +190,7 @@ impl CellRef {
         let col_ref = if column_is_absolute {
             CellRefCoord::Absolute(col)
         } else {
+            // !mark
             CellRefCoord::Relative(col - base.x)
         };
         let row_ref = if row_is_absolute {
@@ -135,7 +205,23 @@ impl CellRef {
         })
     }
 }
+```
 
+## !!steps One coordinate, two flavours
+
+`CellRefCoord` is the two-variant enum everything above is built from, and both
+variants hold an `i64` — a relative delta or an absolute position. The default
+is `Relative(0)`, i.e. "this same row/column", matching the unanchored A1 style
+users write most often.
+
+`Display` and `FromStr` use a bracket notation for relative values: `[3]` means
+three away, a bare number means absolute. `from_str` tries the bracket form
+first with an immediately-invoked closure standing in for a `try` block, then
+falls back to a plain integer parse. Note the asymmetry — `Display` writes
+negative absolutes with an `n` prefix, while `from_str` goes through
+`i64::from_str`, which expects a leading `-`.
+
+```rust ! cell_ref.rs
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum CellRefCoord {
     Relative(i64),
@@ -165,6 +251,7 @@ impl FromStr for CellRefCoord {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         // IIFE to mimic try_block
+        // !mark
         let maybe_relative = (|| s.strip_prefix('[')?.strip_suffix(']')?.parse().ok())();
         if let Some(rel) = maybe_relative {
             Ok(Self::Relative(rel))
@@ -175,11 +262,26 @@ impl FromStr for CellRefCoord {
         }
     }
 }
+```
+
+## !!steps Resolving and printing a single axis
+
+Four small methods finish the type. `resolve_from` is the one line that defines
+relative-versus-absolute: add the delta, or ignore the base entirely.
+`prefix` re-emits the `$` when rendering. `col_string` and `row_string` differ
+only in that columns go through `column_name` in
+[util.rs](/docs/quadratic-core/src/util.rs) to become letters, while rows print
+as numbers — and both resolve to an absolute value first, which is why passing
+a *new* base to `a1_string` rewrites relative references while leaving absolute
+ones untouched.
+
+```rust ! cell_ref.rs
 impl CellRefCoord {
     /// Resolves the reference to an absolute coordinate, given the cell
     /// coordinate where evaluation is taking place.
     pub fn resolve_from(self, base: i64) -> i64 {
         match self {
+            // !mark(1:2)
             CellRefCoord::Relative(delta) => base + delta,
             CellRefCoord::Absolute(coord) => coord,
         }
@@ -205,4 +307,20 @@ impl CellRefCoord {
         format!("{}{row}", self.prefix())
     }
 }
-````
+```
+
+</Scrollycoding>
+
+References enter the engine through the
+[parser](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs), which calls
+`CellRef::parse_a1` on the token the
+[lexer](/docs/quadratic-core/src/formulas/lexer.rs) produced, and are stored in
+the [AST](/docs/quadratic-core/src/formulas/ast.rs). At evaluation time
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) resolves them against the
+current cell and asks the
+[GridProxy](/docs/quadratic-core/src/formulas/grid_proxy.rs) for contents.
+[lib.rs](/docs/quadratic-core/src/lib.rs) exports them to the app both as
+locations (`JsCellRefSpan`) and as rewritten formula text via `adjust_formula`
+and `relocate_formula`, which
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) wraps for
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).

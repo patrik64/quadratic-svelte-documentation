@@ -1,15 +1,38 @@
 ---
 title: "util.rs"
-description: "Constructs a pure formula function that maps a pure function over arguments that may be arrays. This function leaks memory, so it should only be called durin…"
+description: "The shared toolbox behind every function category: eval constructors, flattening coercion iterators, and the wildcard matcher"
 source: "quadratic-core/src/formulas/functions/util.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module defines no spreadsheet functions of its own. Instead it holds the
+handful of Rust helpers that every category module reaches for: the three
+constructors that turn an ordinary Rust closure into the boxed, async
+`FormulaFn` shape that [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs)
+requires, the flattening iterators that turn a mixed bag of scalars and arrays
+into a stream of numbers, booleans, or strings, and the glob-pattern matcher
+shared by the lookup and statistics categories.
 
-````rust util.rs -n
+It is declared in the parent as `#[macro_use] mod util;` and pulled in with
+`use super::*;`, so every helper here sees the same `Value`, `Spanned`,
+`FormulaResult`, and `Ctx` types the rest of the engine uses.
+
+<Scrollycoding>
+
+## !!steps Mapping a scalar function over arrays
+
+`array_mapped` is the workhorse: given a plain function over exactly `N`
+arguments, it produces a `FormulaFn` that hands the work to
+`ctx.array_map` ([ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs)), which
+checks the argument count, requires any array arguments to agree in size, and
+then evaluates the inner function once per element — broadcasting scalars.
+
+The `Box::leak` is deliberate and documented: the returned closure must build
+a future that borrows `f`, and the only lifetime long enough is `'static`.
+Since these constructors run once while the global function registry is being
+built, leaking one closure per function is a bounded, one-time cost.
+
+```rust ! util.rs
 use super::*;
 
 /// Constructs a pure formula function that maps a pure function over arguments
@@ -22,11 +45,27 @@ pub fn array_mapped<const N: usize>(
 ) -> FormulaFn {
     // Leak `f` so that the future returned from the closure can access `f`
     // forever.
+    // !mark
     let f = &*Box::leak(Box::new(f));
 
+    // !mark
     Box::new(move |ctx, args| ctx.array_map(args, |_ctx, args| f(args)).boxed_local())
 }
+```
 
+## !!steps Variadic functions see the raw argument list
+
+`pure_fn` is the escape hatch for anything that is not a fixed-arity scalar
+operation: variadic aggregators like `SUM`, functions with optional trailing
+arguments, and functions that want to inspect arrays rather than be mapped
+over them. The closure receives the whole `Spanned<Vec<Spanned<Value>>>` — the
+argument list plus the span of the call itself, which is what error
+constructors attach when the argument count is wrong.
+
+The `ctx` parameter is ignored (`_ctx`), which is what makes these functions
+"pure": they cannot read cells, so they never await anything.
+
+```rust ! util.rs
 /// Constructs a pure formula function.
 ///
 /// This function leaks memory, so it should only be called during
@@ -38,26 +77,59 @@ pub fn pure_fn(
     // forever.
     let f = &*Box::leak(Box::new(f));
 
+    // !mark
     Box::new(move |_ctx, args| async { f(args) }.boxed_local())
 }
+```
 
+## !!steps Constants still have to reject arguments
+
+`constant_fn` is the thinnest wrapper of all — it is `pure_fn` with a fixed
+result — but it still performs one check: a call with any arguments at all is
+a `BadArgumentCount` error spanned to the call. That is what makes `TRUE(5)`
+fail instead of quietly returning `TRUE`.
+
+In this file's callers it backs the zero-argument constants: `TRUE` and
+`FALSE` in [logic.rs](/docs/quadratic-core/src/formulas/functions/logic.rs),
+and `PI` and `TAU` in
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs).
+
+```rust ! util.rs
 /// Constructs a formula function that takes no inputs and returns a constant value.
 ///
 /// This function leaks memory, so it should only be called during
 /// initialization.
 pub fn constant_fn(v: Value) -> FormulaFn {
     pure_fn(move |args| {
+        // !mark(1:3)
         if !args.inner.is_empty() {
             return Err(FormulaErrorMsg::BadArgumentCount.with_span(args.span));
         }
         Ok(v.clone())
     })
 }
+```
 
+## !!steps Three aggregations, reused by several categories
+
+These are the arithmetic cores of `SUM`, `PRODUCT`, and `COUNT`; `AVERAGE` in
+[statistics.rs](/docs/quadratic-core/src/formulas/functions/statistics.rs)
+divides `sum` by `count_numeric`. All three flatten arrays first, so a range
+argument contributes every one of its cells.
+
+The comment on `sum` records a real compiler-behavior fix: folding from an
+explicit `+0.0` avoids `Iterator::sum` returning `-0.0` for an empty
+list on rustc 1.86 and later, which would otherwise display as `-0` in a
+cell. Counting is delegated to `Value::count_numeric` in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), which treats an empty
+string as not numeric.
+
+```rust ! util.rs
 /// Returns the sum of a list of values, which may be arrays. This is
 /// essentially the `SUM` function.
 pub fn sum(args: &[Spanned<Value>]) -> f64 {
     // fold from +0.0: rustc 1.86+ returns -0.0 for an empty `Iterator::sum`
+    // !mark
     flat_iter_numbers(args).fold(0.0, |a, b| a + b)
 }
 /// Returns the product of a list of values, which may be arrays. This is
@@ -70,15 +142,34 @@ pub fn product(args: &[Spanned<Value>]) -> f64 {
 pub fn count_numeric(args: &[Spanned<Value>]) -> usize {
     args.iter().map(|v| v.inner.count_numeric()).sum()
 }
+```
 
-/// Matches `pattern` (with `*` = any run, `?` = any one char, `~` escaping
-/// the next character) against `text`. Case handling is the caller's job.
+## !!steps Wildcards in two passes
+
+`wildcard_match` implements the spreadsheet glob dialect: `*` matches any run
+of characters, `?` matches exactly one, and `~` escapes whatever follows it.
+The first pass resolves escapes into tokens so the matcher never has to look
+backwards: `None` is a star, `Some('\0')` is a single-character wildcard, and
+any other `Some(c)` is a literal. A trailing lone `~` is dropped, because
+`chars.next()` yields nothing to escape.
+
+The second pass is a classic dynamic program over `dp[i][j]` — "the first `i`
+tokens match the first `j` characters". Only leading stars can match the empty
+text, which is what the initialization loop encodes. Case folding is
+explicitly *not* done here; both callers lowercase pattern and text before
+calling, in `MATCH`
+([lookup.rs](/docs/quadratic-core/src/formulas/functions/lookup.rs)) and in the
+criteria matcher shared by the `*IF` and `*IFS` family
+([statistics.rs](/docs/quadratic-core/src/formulas/functions/statistics.rs)).
+
+```rust ! util.rs
 pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     // resolve ~ escapes into literal-vs-wildcard tokens first
     let mut tokens: Vec<Option<char>> = vec![]; // None = '*', Some('\0') = '?', Some(c) = literal
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {
         match c {
+            // !mark(1:5)
             '~' => {
                 if let Some(next) = chars.next() {
                     tokens.push(Some(next));
@@ -109,9 +200,26 @@ pub fn wildcard_match(pattern: &str, text: &str) -> bool {
     }
     dp[tokens.len()][t.len()]
 }
+```
 
+## !!steps Flatten and coerce, silently
+
+The three `flat_iter_*` helpers are what variadic functions iterate over. Each
+one flattens arrays and applies a coercion, and the coercion is *lossy on
+purpose*: `to_numbers`, `to_bools`, and `to_strings` in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs) keep only the values
+that convert and drop the rest instead of raising an error.
+
+Two consequences are worth knowing. A blank cell — modelled as an empty string
+— contributes nothing to any of these iterators, even though on its own an
+empty value coerces to the number `0`. And because `Value::to_bool` accepts
+only booleans and the case-insensitive text `TRUE` and `FALSE`, numbers are
+dropped by `flat_iter_bools` rather than treated as truthy or falsey.
+
+```rust ! util.rs
 /// Iterates over arguments converted to numbers, with any arrays flattened.
 pub fn flat_iter_numbers(args: &[Spanned<Value>]) -> impl '_ + Iterator<Item = f64> {
+    // !mark
     args.iter().flat_map(|v| v.to_numbers())
 }
 /// Iterates over arguments converted to booleans, with any arrays flattened.
@@ -122,4 +230,35 @@ pub fn flat_iter_bools(args: &[Spanned<Value>]) -> impl '_ + Iterator<Item = boo
 pub fn flat_iter_strings(args: &[Spanned<Value>]) -> impl '_ + Iterator<Item = String> {
     args.iter().flat_map(|v| v.to_strings())
 }
-````
+```
+
+</Scrollycoding>
+
+## Implemented functions
+
+This module exposes Rust helpers, not spreadsheet-callable names — no entry
+here can be typed into a cell.
+
+| Name | Purpose |
+| --- | --- |
+| array_mapped | Wraps a fixed-arity pure function so it maps elementwise over array arguments |
+| pure_fn | Wraps a variadic function that receives the whole spanned argument list and ignores the context |
+| constant_fn | Builds a zero-argument function returning a fixed value, erroring on any argument |
+| sum | Sum of all numeric values in a list of possibly-array arguments |
+| product | Product of all numeric values in a list of possibly-array arguments |
+| count_numeric | Count of numeric values in a list of possibly-array arguments |
+| wildcard_match | Glob match with star, question mark, and tilde escapes; caller handles case |
+| flat_iter_numbers | Iterator over arguments coerced to numbers, arrays flattened, non-numbers dropped |
+| flat_iter_bools | Iterator over arguments coerced to booleans, arrays flattened, non-booleans dropped |
+| flat_iter_strings | Iterator over arguments coerced to strings, arrays flattened |
+
+The `FormulaFn` and `FormulaFunction` types these constructors produce are
+defined in [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs);
+`array_map` and the array size-matching rules live in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs); and the coercion behavior
+every helper depends on is in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs). For examples of each
+constructor in use, see
+[operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs),
+[logic.rs](/docs/quadratic-core/src/formulas/functions/logic.rs), and
+[datetime.rs](/docs/quadratic-core/src/formulas/functions/datetime.rs).

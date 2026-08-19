@@ -1,20 +1,43 @@
 ---
 title: "util.rs"
-description: "Recursively evaluates an expression, mimicking JavaScript syntax. Assumes that `?` can throw an error of type `JsValue`."
+description: "Crate-wide helpers: the jsexpr macro that writes JavaScript-shaped code in Rust, A1 column name conversion, and small formatting utilities"
 source: "quadratic-core/src/util.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`util` is the first module [lib.rs](/docs/quadratic-core/src/lib.rs) declares,
+and it declares it with `#[macro_use]` — so everything defined here with
+`macro_rules!` is visible to every later module in the crate without an
+import. That is the whole reason the module exists: it holds the macros
+(`jsexpr!`, `col!`, `pos!`, `impl_display!`) plus two functions that convert
+between column numbers and column names.
 
-````rust util.rs -n
-use itertools::Itertools;
-use std::fmt;
+Roughly two thirds of the file is a test module that round-trips the column
+name conversion, from `A` up to `column_name(i64::MAX)`. This page walks the
+code above it.
 
+<Scrollycoding>
+
+## !!steps Writing JavaScript in Rust
+
+`jsexpr!` exists because talking to JavaScript through `wasm-bindgen` is
+verbose: every property read is a `js_sys::Reflect::get` that returns a
+`Result`, every call needs a bound receiver. The macro takes an expression
+written in JavaScript-ish syntax and expands it into that plumbing, using `?`
+on each fallible step — so, as the doc comment says, it may only be used
+where `?` can propagate a `JsValue` error.
+
+It is a token-muncher: each arm peels the leftmost piece off the input and
+recurses on `$($rest:tt)*`. The two base cases end the recursion, and the
+`&` / `*` arms simply pass Rust's own referencing operators through. Macro
+bodies are only checked when they expand, and the parenthesis arm's `let inner
+= ...` has no terminating semicolon — neither of the crate's two `jsexpr!` call
+sites starts with a parenthesised group, so that arm never expands.
+
+```rust ! util.rs
 /// Recursively evaluates an expression, mimicking JavaScript syntax. Assumes
 /// that `?` can throw an error of type `JsValue`.
+// !mark
 macro_rules! jsexpr {
     // Recursive base cases
     ($value:ident) => { $value };
@@ -29,7 +52,23 @@ macro_rules! jsexpr {
         let inner = jsexpr!($($inner)*)
         jsexpr!(inner $($rest)*)
     }};
+    // ...
+}
+```
 
+## !!steps Awaiting and reading properties
+
+`.await` on a JS value means "this is a `Promise`": the arm converts it into a
+`js_sys::Promise`, wraps that in a `JsFuture`, awaits it, and keeps munching
+with the resolved value bound to `result`.
+
+Dot syntax is sugar rather than a separate mechanism — `recv.foo` is rewritten
+into the bracket form `recv["foo"]` by stringifying the identifier, and the
+bracket arm is what actually performs the read via `js_sys::Reflect::get`.
+Because both arms rebind the result to a fresh `ident`, the next recursion
+matches `$recv:ident` again and the chain can continue for as long as it needs.
+
+```rust ! util.rs
     // Await
     ($recv:ident.await $($rest:tt)*) => {{
         let result = ::wasm_bindgen_futures::JsFuture::from(::js_sys::Promise::from($recv)).await?;
@@ -39,9 +78,33 @@ macro_rules! jsexpr {
     // Dot syntax
     ($recv:ident.$property_name:ident $($rest:tt)*) => {{
         let property_name = ::wasm_bindgen::JsValue::from(stringify!($property_name));
+        // !mark
         jsexpr!($recv[property_name] $($rest)*)
     }};
 
+    // ...
+
+    // Property access
+    ($recv:ident[$($property_name_tok:tt)*] $($rest:tt)*) => {{
+        let property_name = jsexpr!($($property_name_tok)*);
+        let result = ::js_sys::Reflect::get(&$recv, &property_name)?;
+        jsexpr!(result $($rest)*)
+    }};
+```
+
+## !!steps Calls, one argument at a time
+
+A bare call converts the callee to a `js_sys::Function` and invokes it with
+`undefined` as the receiver; a method call first reads the property, then
+invokes it with the object as the receiver. Both hand off to the same private
+`@ call_internal` arms.
+
+Those arms exist because `js_sys::Function` has no variadic call. So the macro
+recurses down the argument list, `bind1`-ing one argument at a time onto the
+function until none are left, and finally invokes the fully bound function with
+`call0`. Three arguments become three binds and a zero-argument call.
+
+```rust ! util.rs
     // Function call
     ($func:ident($($args_tok:tt)*) $($rest:tt)*) => {{
         let func = ::js_sys::Function::from($func);
@@ -63,14 +126,10 @@ macro_rules! jsexpr {
         jsexpr!(result $($rest)*)
     }};
 
-    // Property access
-    ($recv:ident[$($property_name_tok:tt)*] $($rest:tt)*) => {{
-        let property_name = jsexpr!($($property_name_tok)*);
-        let result = ::js_sys::Reflect::get(&$recv, &property_name)?;
-        jsexpr!(result $($rest)*)
-    }};
+    // ...
 
     // Function call with a specific number of arguments
+    // !mark(1:4)
     (@ call_internal ($recv:expr) $func:ident($arg1:tt $(, $($rest:tt)*)?)) => {{
         let bound_function = $func.bind1(&$recv, &jsexpr!($arg1));
         jsexpr!(@ call_internal ($recv) bound_function($($($rest)*)?))
@@ -78,8 +137,21 @@ macro_rules! jsexpr {
     (@ call_internal ($recv:expr) $func:ident()) => {{
         $func.call0(&$recv)?
     }};
-}
+```
 
+## !!steps Two macros for readable tests
+
+`col!` and `pos!` turn A1 notation into numbers at the call site, so tests can
+say `col![nC]` instead of `-3` and `pos![Cn6]` instead of a `Pos` literal. Both
+work by `stringify!`-ing the identifier and feeding it to a real parser —
+`column_from_name` below for one, `CellRef::parse_a1` for the other — then
+panicking on failure, which is exactly the behaviour you want inside a test.
+
+They carry `#[allow(unused)]` because the non-test builds never expand them.
+[tests.rs](/docs/quadratic-core/src/formulas/tests.rs) and the per-category
+function tests are the heavy users.
+
+```rust ! util.rs
 /// Converts a column name to a number.
 #[allow(unused)]
 macro_rules! col {
@@ -97,7 +169,21 @@ macro_rules! pos {
             .resolve_from(crate::Pos::ORIGIN)
     };
 }
+```
 
+## !!steps Column numbers to column names
+
+The grid is infinite in all four directions, so column indices are signed.
+Negative columns mirror the positive ones through `n = -(n + 1)` — column −1
+becomes 0 and prints as `A`, with a literal lowercase `n` pushed on the end
+(and later reversed to the front) to mark the sign.
+
+The positive half is bijective base 26: digits are pulled off with `n % 26`,
+and the `n -= 1` after each division is what makes the sequence run
+`Z`, `AA`, `AB` rather than `Z`, `BA`. Digits accumulate least-significant
+first, hence the `.rev()` at the end.
+
+```rust ! util.rs
 /// Returns a column's name from its number.
 pub fn column_name(mut n: i64) -> String {
     let negative = n < 0;
@@ -113,6 +199,7 @@ pub fn column_name(mut n: i64) -> String {
         if n <= 0 {
             break;
         }
+        // !mark
         n -= 1;
     }
     if negative {
@@ -122,6 +209,21 @@ pub fn column_name(mut n: i64) -> String {
 
     chars.into_iter().rev().map(|c| c as char).collect()
 }
+```
+
+## !!steps ...and back again
+
+The inverse strips the optional `n` prefix, then accumulates digits
+left-to-right. The inner `digit` helper only accepts uppercase `A` through `Z`,
+so `column_from_name("a")` and `column_from_name("93")` return `None`, and the
+first `chars.next()?` rejects an empty name (a bare `"n"` included).
+
+Every arithmetic step is checked: `checked_add(1)`, `checked_mul(26)`,
+`checked_add(digit)`. That is how a name past the end of the range returns
+`None` instead of wrapping — the tests pin `"CRPXNLSKVLJFHH"` to `i64::MAX` and
+`"CRPXNLSKVLJFHI"` to `None`.
+
+```rust ! util.rs
 /// Returns a column number from a name, or `None` if it is invalid or out of range.
 pub fn column_from_name(mut s: &str) -> Option<i64> {
     let negative = s.starts_with('n');
@@ -136,6 +238,7 @@ pub fn column_from_name(mut s: &str) -> Option<i64> {
     let mut chars = s.chars();
     let mut ret = digit(chars.next()?)?;
     for char in chars {
+        // !mark(1:4)
         ret = ret
             .checked_add(1)?
             .checked_mul(26)?
@@ -148,7 +251,21 @@ pub fn column_from_name(mut s: &str) -> Option<i64> {
 
     Some(ret)
 }
+```
 
+## !!steps Listing things the way a human would
+
+Parse errors read better as "expected a number, a string, or a cell reference"
+than as a debug-printed list, so `join_with_conjunction` slice-patterns its way
+through the cases: nothing, one item, two items joined by the conjunction, and
+the general case where everything but the last is comma-separated and the
+conjunction goes in front of the last.
+
+Its caller is the parser's rule-alternation macro in
+[parser/macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs), which
+builds the "expected ..." message out of every alternative it tried.
+
+```rust ! util.rs
 /// Returns a human-friendly list of things, joined at the end by the given
 /// conjuction.
 pub fn join_with_conjunction(conjunction: &str, items: &[impl fmt::Display]) -> String {
@@ -156,6 +273,7 @@ pub fn join_with_conjunction(conjunction: &str, items: &[impl fmt::Display]) -> 
         [] => "(none)".to_string(),
         [a] => format!("{a}"),
         [a, b] => format!("{a} {conjunction} {b}"),
+        // !mark
         [all_but_last @ .., z] => {
             let mut ret = all_but_last.iter().map(|x| format!("{x}, ")).join("");
             ret.push_str(conjunction);
@@ -164,7 +282,22 @@ pub fn join_with_conjunction(conjunction: &str, items: &[impl fmt::Display]) -> 
         }
     }
 }
+```
 
+## !!steps Display impls and float comparison
+
+`impl_display!` collapses a whole trait `impl` into one line: pass a type and
+the arguments you would give `write!()`. The parser's grammar rules use it to
+name themselves for error messages — `impl_display!(for StringLiteral, "string
+literal")` and friends live in
+[parser/rules/atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs).
+
+`assert_f64_approx_eq` is test-only (`#[cfg(test)]`) and takes the *actual*
+value as a `&str`, because formula results come back as strings: it parses,
+then compares against an epsilon of `0.0001` so trigonometry and statistics
+tests don't fail on the last bit.
+
+```rust ! util.rs
 /// Implements `std::format::Display` for a type using arguments to `write!()`.
 macro_rules! impl_display {
     ( for $typename:ty, $( $fmt_arg:expr ),+ $(,)? ) => {
@@ -178,6 +311,7 @@ macro_rules! impl_display {
 
 #[cfg(test)]
 pub(crate) fn assert_f64_approx_eq(expected: f64, actual: &str) {
+    // !mark
     const EPSILON: f64 = 0.0001;
 
     let actual = actual.parse::<f64>().unwrap();
@@ -186,149 +320,15 @@ pub(crate) fn assert_f64_approx_eq(expected: f64, actual: &str) {
         "expected {expected} but got {actual}",
     );
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+</Scrollycoding>
 
-    #[test]
-    fn test_column_names() {
-        // Test near 0
-        assert_eq!("A", column_name(0));
-        assert_eq!("B", column_name(1));
-        assert_eq!("C", column_name(2));
-        assert_eq!("D", column_name(3));
-        assert_eq!("E", column_name(4));
-        assert_eq!("F", column_name(5));
-
-        assert_eq!("nA", column_name(-1));
-        assert_eq!("nB", column_name(-2));
-        assert_eq!("nC", column_name(-3));
-        assert_eq!("nD", column_name(-4));
-        assert_eq!("nE", column_name(-5));
-        assert_eq!("nF", column_name(-6));
-
-        // Test near ±26
-        assert_eq!("Y", column_name(24));
-        assert_eq!("Z", column_name(25));
-        assert_eq!("AA", column_name(26));
-        assert_eq!("AB", column_name(27));
-        assert_eq!("nY", column_name(-25));
-        assert_eq!("nZ", column_name(-26));
-        assert_eq!("nAA", column_name(-27));
-        assert_eq!("nAB", column_name(-28));
-
-        // Test near ±52
-        assert_eq!("AY", column_name(50));
-        assert_eq!("AZ", column_name(51));
-        assert_eq!("BA", column_name(52));
-        assert_eq!("BB", column_name(53));
-        assert_eq!("nAY", column_name(-51));
-        assert_eq!("nAZ", column_name(-52));
-        assert_eq!("nBA", column_name(-53));
-        assert_eq!("nBB", column_name(-54));
-
-        // Test near ±702
-        assert_eq!("ZY", column_name(700));
-        assert_eq!("ZZ", column_name(701));
-        assert_eq!("AAA", column_name(702));
-        assert_eq!("AAB", column_name(703));
-        assert_eq!("nZY", column_name(-701));
-        assert_eq!("nZZ", column_name(-702));
-        assert_eq!("nAAA", column_name(-703));
-        assert_eq!("nAAB", column_name(-704));
-
-        // Test near the integer limits
-        assert_eq!("CRPXNLSKVLJFHH", column_name(i64::MAX));
-        assert_eq!("nCRPXNLSKVLJFHH", column_name(i64::MIN));
-
-        // Test fun stuff
-        assert_eq!("QUADRATIC", column_name(3719092809668));
-        assert_eq!("nQUADRATIC", column_name(-3719092809669));
-        assert_eq!("QUICKBROWNFOX", column_name(1700658608758053877));
-    }
-
-    #[test]
-    fn test_from_column_names() {
-        // Test near 0
-        assert_eq!(Some(0), column_from_name("A"));
-        assert_eq!(Some(1), column_from_name("B"));
-        assert_eq!(Some(2), column_from_name("C"));
-        assert_eq!(Some(3), column_from_name("D"));
-        assert_eq!(Some(4), column_from_name("E"));
-        assert_eq!(Some(5), column_from_name("F"));
-
-        assert_eq!(Some(-1), column_from_name("nA"));
-        assert_eq!(Some(-2), column_from_name("nB"));
-        assert_eq!(Some(-3), column_from_name("nC"));
-        assert_eq!(Some(-4), column_from_name("nD"));
-        assert_eq!(Some(-5), column_from_name("nE"));
-        assert_eq!(Some(-6), column_from_name("nF"));
-
-        // Test near ±26
-        assert_eq!(Some(24), column_from_name("Y"));
-        assert_eq!(Some(25), column_from_name("Z"));
-        assert_eq!(Some(26), column_from_name("AA"));
-        assert_eq!(Some(27), column_from_name("AB"));
-        assert_eq!(Some(-25), column_from_name("nY"));
-        assert_eq!(Some(-26), column_from_name("nZ"));
-        assert_eq!(Some(-27), column_from_name("nAA"));
-        assert_eq!(Some(-28), column_from_name("nAB"));
-
-        // Test near ±52
-        assert_eq!(Some(50), column_from_name("AY"));
-        assert_eq!(Some(51), column_from_name("AZ"));
-        assert_eq!(Some(52), column_from_name("BA"));
-        assert_eq!(Some(53), column_from_name("BB"));
-        assert_eq!(Some(-51), column_from_name("nAY"));
-        assert_eq!(Some(-52), column_from_name("nAZ"));
-        assert_eq!(Some(-53), column_from_name("nBA"));
-        assert_eq!(Some(-54), column_from_name("nBB"));
-
-        // Test near ±702
-        assert_eq!(Some(700), column_from_name("ZY"));
-        assert_eq!(Some(701), column_from_name("ZZ"));
-        assert_eq!(Some(702), column_from_name("AAA"));
-        assert_eq!(Some(703), column_from_name("AAB"));
-        assert_eq!(Some(-701), column_from_name("nZY"));
-        assert_eq!(Some(-702), column_from_name("nZZ"));
-        assert_eq!(Some(-703), column_from_name("nAAA"));
-        assert_eq!(Some(-704), column_from_name("nAAB"));
-
-        // Test near the integer limits
-        assert_eq!(Some(i64::MAX), column_from_name("CRPXNLSKVLJFHH"));
-        assert_eq!(Some(i64::MIN), column_from_name("nCRPXNLSKVLJFHH"));
-        assert_eq!(None, column_from_name("CRPXNLSKVLJFHI"));
-        assert_eq!(None, column_from_name("XXXXXXXXXXXXXX"));
-        assert_eq!(None, column_from_name("nCRPXNLSKVLJFHI"));
-        assert_eq!(None, column_from_name("nXXXXXXXXXXXXXX"));
-
-        // Test totally invalid columns
-        assert_eq!(None, column_from_name("a"));
-        assert_eq!(None, column_from_name("z"));
-        assert_eq!(None, column_from_name("n"));
-        assert_eq!(None, column_from_name("AnZ"));
-        assert_eq!(None, column_from_name("nnB"));
-        assert_eq!(None, column_from_name("93"));
-
-        // Test fun stuff
-        assert_eq!(Some(3719092809668), column_from_name("QUADRATIC"));
-        assert_eq!(Some(1700658608758053877), column_from_name("QUICKBROWNFOX"));
-    }
-
-    #[test]
-    fn test_a1_notation_macros() {
-        assert_eq!(col![A], 0);
-        assert_eq!(col![C], 2);
-        assert_eq!(col![nC], -3);
-
-        assert_eq!(pos![A0], crate::Pos { x: 0, y: 0 });
-        assert_eq!(pos![A1], crate::Pos { x: 0, y: 1 });
-
-        assert_eq!(pos![C6], crate::Pos { x: 2, y: 6 });
-        assert_eq!(pos![Cn6], crate::Pos { x: 2, y: -6 });
-        assert_eq!(pos![nC6], crate::Pos { x: -3, y: 6 });
-        assert_eq!(pos![nCn6], crate::Pos { x: -3, y: -6 });
-    }
-}
-````
+Both column functions are re-exported to JavaScript from
+[lib.rs](/docs/quadratic-core/src/lib.rs) as `column_name` and
+`column_from_name` (with `f64` at the boundary, since WASM has no `i64`), which
+makes them the Rust twin of the TypeScript
+[a1.ts](/docs/src/lib/core/a1.ts) helpers. `jsexpr!` has exactly two call
+sites: reading a cell out of the JavaScript grid accessor in
+[lib.rs](/docs/quadratic-core/src/lib.rs), and reading the hovered word out of
+a Monaco text model in [lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs).

@@ -1,15 +1,33 @@
 ---
 title: "errors.rs"
-description: "Error reporting functionality for compilation and runtime. Error message and accompanying span."
+description: "FormulaError, the FormulaErrorMsg taxonomy of compile and runtime failures, and the internal error macros behind them."
 source: "quadratic-core/src/formulas/errors.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Every way a formula can fail — a typo the parser chokes on, a division by
+zero at runtime, a bug in the engine itself — funnels through the two types in
+this file. `FormulaError` pairs a message with an optional
+[Span](/docs/quadratic-core/src/formulas/span.rs); `FormulaErrorMsg` is the
+closed enum of things that can go wrong, and it owns the exact wording the user
+sees.
 
-````rust errors.rs -n
+The module is declared `#[macro_use] mod errors;` in
+[mod.rs](/docs/quadratic-core/src/formulas/mod.rs) so its macros are visible to
+the rest of the formulas module, and `FormulaResult<T>` is defined there as
+`Result<T, FormulaError>` — the return type of nearly every function in the
+engine.
+
+<Scrollycoding>
+
+## !!steps A message and a place
+
+`FormulaError` is a message plus an optional location. The span is `Option`
+because not every failure can be blamed on specific characters — an internal
+error, for instance, has no source position. `Display` reflects that: with a
+span it prefixes the byte range, without one it prints the message alone.
+
+```rust ! errors.rs
 //! Error reporting functionality for compilation and runtime.
 
 use std::borrow::Cow;
@@ -29,22 +47,53 @@ pub struct FormulaError {
 impl fmt::Display for FormulaError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.span {
+            // !mark
             Some(span) => write!(f, "column {} to {}: {}", span.start, span.end, self.msg),
             None => write!(f, "{}", self.msg),
         }
     }
 }
+```
+
+## !!steps Blame the innermost location
+
+The empty `impl Error for FormulaError {}` is enough to make the type a
+first-class Rust error, since `Debug` and `Display` are already there.
+
+As an error bubbles up, each enclosing layer knows a wider span than the one
+below it. `with_span` implements first-writer-wins: it only fills in the span
+if none is set yet, so the *innermost* code that noticed the problem keeps the
+blame and outer frames cannot widen the underline. The `impl Into<Span>` bound
+means callers can hand it a `Span`, a `Spanned<T>`, or a `&Spanned<T>` —
+[span.rs](/docs/quadratic-core/src/formulas/span.rs) provides those
+conversions.
+
+```rust ! errors.rs
 impl Error for FormulaError {}
 impl FormulaError {
     /// Attaches a span to this FormulaError, if it does not already have one.
     pub fn with_span(mut self, span: impl Into<Span>) -> Self {
+        // !mark
         if self.span.is_none() {
             self.span = Some(span.into());
         }
         self
     }
 }
+```
 
+## !!steps The taxonomy
+
+The enum is grouped by phase, and the grouping is informative. *Miscellaneous*
+covers engine-level problems. *Compile errors* are what the lexer and parser
+raise — unterminated strings, unexpected tokens, malformed arrays, unknown
+function names. *Runtime errors* are what evaluation raises once the AST is
+sound. Several variants carry payloads: `Cow<'static, str>` lets a message
+hold either a borrowed literal or an owned `String` without always allocating,
+and `ArraySizeMismatch` carries both the expected and the actual
+`(rows, cols)`.
+
+```rust ! errors.rs
 /// Information about the type of error that occurred.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormulaErrorMsg {
@@ -60,6 +109,7 @@ pub enum FormulaErrorMsg {
         got: Option<Cow<'static, str>>,
     },
     Unexpected(Cow<'static, str>),
+    // !mark(1:4)
     ArraySizeMismatch {
         expected: (usize, usize),
         got: (usize, usize),
@@ -79,6 +129,21 @@ pub enum FormulaErrorMsg {
     IndexOutOfBounds,
     ArrayTooBig,
 }
+```
+
+## !!steps The exact words the user reads
+
+The `Display` impl is the single place the user-facing wording lives. Most
+arms are one short sentence; `Expected` varies its phrasing depending on
+whether the parser managed to name what it actually found. `InternalError` is
+the notable one — it tells the reader outright that the fault is Quadratic's,
+not theirs, and asks for a report.
+
+These strings reach the app verbatim: [lib.rs](/docs/quadratic-core/src/lib.rs)
+calls `error.msg.to_string()` when building `error_msg` for
+`JsFormulaResult` and `parse_error_msg` for `JsFormulaParseResult`.
+
+```rust ! errors.rs
 impl fmt::Display for FormulaErrorMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -88,6 +153,7 @@ impl fmt::Display for FormulaErrorMsg {
             Self::UnknownError => {
                 write!(f, "(unknown error)")
             }
+            // !mark
             Self::InternalError(s) => {
                 write!(f, "Internal error: {s}\nThis is a bug in Quadratic, not your formula. Please report this to us!")
             }
@@ -100,54 +166,25 @@ impl fmt::Display for FormulaErrorMsg {
                 None => write!(f, "Expected {expected}"),
             },
             Self::Unexpected(got) => write!(f, "Unexpected {got}"),
-            Self::ArraySizeMismatch { expected, got } => {
-                write!(f, "Array size mismatch: expected {expected:?}, got {got:?}")
-            }
-            Self::NonRectangularArray => {
-                write!(f, "Array must be rectangular")
-            }
-            Self::BadArgumentCount => {
-                // TODO: give a nicer error message that says what the arguments
-                // should be
-                write!(f, "Bad argument count")
-            }
-            Self::BadFunctionName => {
-                write!(f, "There is no function with this name")
-            }
-            Self::UnimplementedExcelFunction(name) => {
-                write!(
-                    f,
-                    "{name} is a valid Excel function, but is not implemented in this version"
-                )
-            }
-            Self::BadCellReference => {
-                write!(f, "Bad cell reference")
-            }
-            Self::BadNumber => {
-                write!(f, "Bad numeric literal")
-            }
-
-            Self::CircularReference => {
-                write!(f, "Circular reference")
-            }
-            Self::Overflow => {
-                write!(f, "Numeric overflow")
-            }
-            Self::DivideByZero => {
-                write!(f, "Divide by zero")
-            }
-            Self::NegativeExponent => {
-                write!(f, "Negative exponent")
-            }
-            Self::IndexOutOfBounds => {
-                write!(f, "Index out of bounds")
-            }
-            Self::ArrayTooBig => {
-                write!(f, "Array is too big")
-            }
+            // ...
         }
     }
 }
+```
+
+## !!steps Turning a message into an error
+
+Two constructors bridge the enum to the struct. `with_span` is the one you see
+everywhere in the engine —
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) writes
+`FormulaErrorMsg::CircularReference.with_span(span)`. `without_span` is
+`const`, so a spanless error can be built in a const context.
+
+The blanket `From` impl then makes `?` do the work: any type that converts
+into a `FormulaErrorMsg` converts into a spanless `FormulaError`, so a bare
+message can be returned from a function whose error type is `FormulaError`.
+
+```rust ! errors.rs
 impl FormulaErrorMsg {
     /// Attaches a span to this error message, returning a FormulaError.
     pub fn with_span(self, span: impl Into<Span>) -> FormulaError {
@@ -167,10 +204,26 @@ impl FormulaErrorMsg {
 
 impl<T: Into<FormulaErrorMsg>> From<T> for FormulaError {
     fn from(msg: T) -> Self {
+        // !mark
         msg.into().without_span()
     }
 }
+```
 
+## !!steps Two behaviours for internal errors
+
+`internal_error_value!` builds an error value for a bug in the engine, and
+does something different depending on the build. In a debug native build it
+`panic!`s, so a developer gets a stack trace at the point of failure. In a
+release build — or in *any* wasm32 build, debug included, which is how the
+browser runs it — it produces an `InternalError` message instead, so the user
+sees the polite text rather than a crashed module.
+
+The doc comment carries a real trap: because the debug branch panics while
+*constructing* the value, `.ok_or(internal_error_value!(...))` would fire
+eagerly. Use `.ok_or_else(...)` so the value is only built on the failing path.
+
+```rust ! errors.rs
 /// Handles internal errors. Panics in debug mode for the stack trace, but
 /// returns a nice error message in release mode or on web.
 ///
@@ -182,6 +235,7 @@ macro_rules! internal_error_value {
     // Don't allocate a new String for &'static str literals.
     ( $msg:expr ) => {{
         // Panic in a debug build (for stack trace).
+        // !mark
         #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
         #[allow(unused)]
         let ret: crate::formulas::FormulaError = panic!("{}", $msg);
@@ -195,22 +249,21 @@ macro_rules! internal_error_value {
         #[allow(unreachable_code)]
         ret
     }};
-    // Automatically format!() arguments.
-    ( $( $args:expr ),+ $(,)? ) => {{
-        // Panic in a debug build (for stack trace).
-        #[cfg(all(debug_assertions, not(target_arch = "wasm32")))]
-        #[allow(unused)]
-        let ret: crate::formulas::FormulaError = panic!($( $args ),+);
-        // Give nice error message for user in release build.
-        #[cfg(not(all(debug_assertions, not(target_arch = "wasm32"))))]
-        #[allow(unused)]
-        let ret: crate::formulas::FormulaError =
-            crate::formulas::FormulaErrorMsg::InternalError(format!($( $args ),+).into()).without_span();
-        #[allow(unreachable_code)]
-        ret
-    }};
+    // ...
 }
+```
 
+## !!steps The macro you actually call
+
+`internal_error!` is the preferred entry point, and it is a *control-flow*
+macro, not an expression: it expands to `return Err(...)`. That is what makes
+it safe by construction — the value it builds is returned immediately, so the
+debug-panic trap described above cannot bite.
+
+The second arm of `internal_error_value!` (elided in the previous step) accepts
+`format!` arguments, which is why both macros take a variadic argument list.
+
+```rust ! errors.rs
 /// Emits an internal error. Panics in debug mode for the stack trace, but
 /// returns a nice error message in release mode or on web.
 ///
@@ -218,7 +271,19 @@ macro_rules! internal_error_value {
 /// just provide the value.
 macro_rules! internal_error {
     ( $( $args:expr ),+ $(,)? ) => {
+        // !mark
         return Err(internal_error_value!($( $args ),+))
     };
 }
-````
+```
+
+</Scrollycoding>
+
+Errors are raised in the lexer and parser
+([lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs),
+[parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs)), during
+evaluation in [ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) and the
+[function library](/docs/quadratic-core/src/formulas/functions/mod.rs), and are
+finally flattened into `error_msg` plus `error_span` by
+[lib.rs](/docs/quadratic-core/src/lib.rs) for
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) to display.

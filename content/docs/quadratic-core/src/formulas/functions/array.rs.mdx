@@ -1,26 +1,41 @@
 ---
 title: "array.rs"
-description: "Array functions, backported from the modern quadratic-core's `array/operations.rs` and adapted to this engine's `Value::Array`. Cell values in this engine ar…"
+description: "TRANSPOSE, SEQUENCE, UNIQUE, SORT, FILTER and SUMPRODUCT over rectangular arrays, with coercion-aware ordering that keeps blanks last"
 source: "quadratic-core/src/formulas/functions/array.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "Array functions" category: the six functions that reshape,
+generate, deduplicate, order, filter, and reduce whole ranges rather than
+single cells. The module header says the code was backported from the modern
+quadratic-core's `array/operations.rs` and adapted to this engine's
+`Value::Array`.
 
-````rust array.rs -n
-//! Array functions, backported from the modern quadratic-core's
-//! `array/operations.rs` and adapted to this engine's `Value::Array`.
-//!
-//! Cell values in this engine are strings, so ordering and equality are
-//! coercion-aware: numeric strings compare as numbers, text compares
-//! case-insensitively, and blanks always sort last.
+Because cell values in this engine are only strings, numbers, and booleans,
+the module cannot lean on typed comparison. Instead it defines its own
+coercion-aware ordering and equality — numeric strings compare as numbers,
+text compares case-insensitively, blanks sort last — and shares them between
+`SORT`, `UNIQUE`, and `FILTER`. Like every sibling in this directory it
+exposes a `CATEGORY` constant that
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) folds
+into the global `ALL_FUNCTIONS` map.
 
-use smallvec::SmallVec;
+<Scrollycoding>
 
-use super::*;
+## !!steps Registering the category
 
+`CATEGORY` is the registration point: a display name, a docs blurb for the
+formula editor, and a `get_functions` pointer that builds the actual
+`FormulaFunction` values. `MAX_ARRAY_CELLS` caps generated results at 100 000
+cells, and `Row` is the same `SmallVec` row type the rest of the engine uses.
+
+`to_rows` is the module's front door. It calls `Value::into_array` from
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), which wraps a scalar
+into a 1×1 array, then rejects ragged input with `NonRectangularArray`. Every
+function here starts by putting its arguments through it, so the rest of the
+code can assume a rectangle.
+
+```rust ! array.rs
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
@@ -38,12 +53,27 @@ fn to_rows(v: Spanned<Value>) -> FormulaResult<Vec<Row>> {
     let span = v.span;
     let rows = v.inner.into_array();
     let width = rows.first().map_or(0, |r| r.len());
+    // !mark(1:3)
     if rows.iter().any(|r| r.len() != width) {
         return Err(FormulaErrorMsg::NonRectangularArray.with_span(span));
     }
     Ok(rows)
 }
+```
 
+## !!steps One ordering for mixed cell values
+
+`classify` reduces any value to one of four keys. A boolean stays a boolean, a
+number stays a number, an all-whitespace string is `Blank`, and anything else
+is retried as a number first — so the string `"12"` classifies as the number
+12 — before falling back to lowercased text.
+
+`compare_values` then compares by key rank first (`numbers < text < booleans`,
+blanks last) and only compares within a rank when both sides agree. Note the
+comment on the `Blank` rank: `compare_values` gives blanks the highest rank,
+but the caller is responsible for keeping them last when sorting descending.
+
+```rust ! array.rs
 /// Sort/equality classification: numbers < text < booleans, blanks last.
 enum Key {
     Number(f64),
@@ -57,6 +87,7 @@ fn classify(v: &Value) -> Key {
         Value::Bool(b) => Key::Bool(*b),
         Value::Number(n) => Key::Number(*n),
         Value::String(s) if s.trim().is_empty() => Key::Blank,
+        // !mark(1:4)
         other => match other.to_number() {
             Ok(n) => Key::Number(n),
             Err(_) => Key::Text(other.to_string().to_lowercase()),
@@ -83,7 +114,21 @@ fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         other => other,
     }
 }
+```
 
+## !!steps Equivalence and truthiness
+
+`values_equivalent` reuses the same classification for equality, which is why
+`UNIQUE` treats `1` and the string `"1"` as one value, and `"a"` and `"A"` as
+one value: both pairs classify identically. Values in different classes are
+never equivalent, so a blank never equals a zero.
+
+`truthy` decodes `FILTER`'s include mask. It first tries `Value::to_bool` —
+which is what a real comparison over a range produces — then treats a blank as
+false and any other value as a number, where non-zero is true. Anything that
+is neither yields a spanned `Expected` error naming the mask.
+
+```rust ! array.rs
 fn values_equivalent(a: &Value, b: &Value) -> bool {
     match (classify(a), classify(b)) {
         (Key::Number(x), Key::Number(y)) => x == y,
@@ -97,6 +142,7 @@ fn values_equivalent(a: &Value, b: &Value) -> bool {
 /// Truthiness for FILTER's include mask: booleans, and numbers where 0 is
 /// false (matching how comparison results and cell data arrive here).
 fn truthy(v: &Spanned<Value>) -> FormulaResult<bool> {
+    // !mark(1:3)
     if let Ok(b) = v.inner.to_bool() {
         return Ok(b);
     }
@@ -112,9 +158,22 @@ fn truthy(v: &Spanned<Value>) -> FormulaResult<bool> {
         },
     }
 }
+```
 
-fn get_functions() -> Vec<FormulaFunction> {
-    vec![
+## !!steps TRANSPOSE and the shape of a declaration
+
+Every entry in `get_functions` has the same shape: name, autocomplete snippet,
+usage strings, examples, docs, and an `eval` closure. These functions all use
+`util::pure_fn`, which hands the closure the raw argument vector instead of
+mapping it element-wise — the point of an array function is precisely that it
+sees the whole array at once. Contrast that with `util::array_mapped`, which
+the scalar functions and operators use.
+
+`TRANSPOSE` is the smallest example. It insists on exactly one argument by
+destructuring the iterator as `(Some(array), None)`, measures the rectangle,
+then writes the output column-major.
+
+```rust ! array.rs
         FormulaFunction {
             name: "TRANSPOSE",
             arg_completion: "${1:array}",
@@ -124,6 +183,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 let mut a = args.inner.into_iter();
+                // !mark
                 let (Some(array), None) = (a.next(), a.next()) else {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
                 };
@@ -141,6 +201,21 @@ fn get_functions() -> Vec<FormulaFunction> {
                 Ok(Value::Array(out))
             }),
         },
+```
+
+## !!steps SEQUENCE and the cell budget
+
+`SEQUENCE` is the only function here that conjures an array out of nothing, so
+it is the only one that has to be told when to stop. Optional arguments are
+pulled one at a time off the same iterator, defaulting `columns` to 1, `start`
+to 1, and `step` to 1; a fifth argument is a `BadArgumentCount` error.
+
+The guard rejects non-positive dimensions and any request larger than
+`MAX_ARRAY_CELLS` with `ArrayTooBig`. Everything after it just walks the
+rectangle row by row, adding `step` at each cell — so `SEQUENCE(3, 3, 0, 10)`
+fills each row before moving down.
+
+```rust ! array.rs
         FormulaFunction {
             name: "SEQUENCE",
             arg_completion: "${1:rows}",
@@ -170,65 +245,28 @@ fn get_functions() -> Vec<FormulaFunction> {
                 if a.next().is_some() {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
                 }
+                // !mark(1:3)
                 if rows < 1 || cols < 1 || rows * cols > MAX_ARRAY_CELLS {
                     return Err(FormulaErrorMsg::ArrayTooBig.with_span(span));
                 }
-                let mut n = start;
-                let mut out: Vec<Row> = Vec::with_capacity(rows as usize);
-                for _ in 0..rows {
-                    let mut row: Row = SmallVec::with_capacity(cols as usize);
-                    for _ in 0..cols {
-                        row.push(Value::Number(n));
-                        n += step;
-                    }
-                    out.push(row);
-                }
-                Ok(Value::Array(out))
-            }),
-        },
-        FormulaFunction {
-            name: "UNIQUE",
-            arg_completion: "${1:array}",
-            usages: &["array"],
-            examples: &["UNIQUE(A0:A20)"],
-            doc: "Removes duplicate rows, keeping first occurrences. Text \
-                  compares case-insensitively and numeric strings compare as \
-                  numbers.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(array), None) = (a.next(), a.next()) else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
-                let rows = to_rows(array)?;
-                let mut out: Vec<Row> = Vec::new();
-                for row in rows {
-                    let duplicate = out.iter().any(|kept| {
-                        kept.len() == row.len()
-                            && kept.iter().zip(&row).all(|(a, b)| values_equivalent(a, b))
-                    });
-                    if !duplicate {
-                        out.push(row);
-                    }
-                }
-                Ok(Value::Array(out))
-            }),
-        },
-        FormulaFunction {
-            name: "SORT",
-            arg_completion: "${1:array}",
-            usages: &["array", "array, sort_index", "array, sort_index, sort_order"],
-            examples: &["SORT(A0:B10)", "SORT(A0:B10, 2, -1)"],
-            doc: "Sorts rows by the 1-based `sort_index` column (default 1); \
-                  `sort_order` 1 is ascending (default), -1 descending. \
-                  Numbers sort before text; blanks always sort last.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(array), index, order, None) = (a.next(), a.next(), a.next(), a.next())
-                else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
+                // ...
+```
+
+## !!steps SORT keeps blanks at the bottom
+
+`SORT` takes an optional 1-based `sort_index` (default 1) and `sort_order`
+(any negative number means descending). The index is validated against the
+array width up front — `width.max(1)` lets a single-column argument still use
+index 1 even when the width came back as 0 — and an out-of-range index is
+`IndexOutOfBounds`.
+
+The comparator is where the blanks rule from `classify` gets enforced. Blank
+versus non-blank is decided before `compare_values` is ever called, and the
+`reverse()` for descending order applies only to the non-blank branch. That is
+why `SORT` on `x`, blank, `5` gives `5, x, blank` ascending and `x, 5, blank`
+descending — the blank stays at the bottom either way.
+
+```rust ! array.rs
                 let mut rows = to_rows(array)?;
                 let width = rows.first().map_or(0, |r| r.len());
                 let sort_index = match index {
@@ -248,6 +286,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                     // blanks last regardless of direction
                     match (matches!(classify(va), Key::Blank), matches!(classify(vb), Key::Blank)) {
                         (true, true) => std::cmp::Ordering::Equal,
+                        // !mark(1:2)
                         (true, false) => std::cmp::Ordering::Greater,
                         (false, true) => std::cmp::Ordering::Less,
                         (false, false) => {
@@ -257,37 +296,24 @@ fn get_functions() -> Vec<FormulaFunction> {
                     }
                 });
                 Ok(Value::Array(rows))
-            }),
-        },
-        FormulaFunction {
-            name: "FILTER",
-            arg_completion: "${1:array}, ${2:include}",
-            usages: &["array, include", "array, include, if_empty"],
-            examples: &["FILTER(A0:B10, C0:C10)", "FILTER(A0:B10, C0:C10, \"none\")"],
-            doc: "Keeps the rows of `array` whose entry in `include` is truthy \
-                  (a matching-height column), or the columns when `include` is \
-                  a matching-width row. Returns `if_empty` when nothing passes.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(array), Some(include), if_empty, None) =
-                    (a.next(), a.next(), a.next(), a.next())
-                else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
-                let include_span = include.span;
-                let rows = to_rows(array)?;
-                let height = rows.len();
-                let width = rows.first().map_or(0, |r| r.len());
-                let mask_rows = to_rows(include)?;
-                let mask_height = mask_rows.len();
-                let mask_width = mask_rows.first().map_or(0, |r| r.len());
+```
 
-                let spanned = |v: &Value| Spanned {
-                    span: include_span,
-                    inner: v.clone(),
-                };
+## !!steps FILTER dispatches on the mask shape
 
+`FILTER` supports two orientations and picks between them purely by the mask's
+dimensions. A mask as tall as the array and at most one column wide keeps
+rows; a single-row mask exactly as wide as the array keeps columns, and any
+row left empty by that pass is dropped. Anything else is an
+`ArraySizeMismatch` reported at the mask's own span, with the column-mask
+shape as the expectation.
+
+Each mask cell is re-wrapped in a `Spanned` carrying the mask's span before
+going through `truthy`, so a bad mask entry points at the mask argument rather
+than the call. If nothing survives, the optional third argument `if_empty` is
+returned as-is; without one, `FILTER` errors instead of producing an empty
+array.
+
+```rust ! array.rs
                 let out: Vec<Row> = if mask_height == height && mask_width <= 1 {
                     // column mask -> keep rows
                     let mut kept = Vec::new();
@@ -298,6 +324,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                         }
                     }
                     kept
+                // !mark
                 } else if mask_height == 1 && mask_width == width {
                     // row mask -> keep columns
                     let mut flags = Vec::with_capacity(width);
@@ -321,27 +348,24 @@ fn get_functions() -> Vec<FormulaFunction> {
                     }
                     .with_span(include_span));
                 };
+```
 
-                if out.is_empty() {
-                    return match if_empty {
-                        Some(v) => Ok(v.inner),
-                        None => Err(FormulaErrorMsg::Expected {
-                            expected: "at least one value to pass the filter".into(),
-                            got: None,
-                        }
-                        .with_span(span)),
-                    };
-                }
-                Ok(Value::Array(out))
-            }),
-        },
-        FormulaFunction {
-            name: "SUMPRODUCT",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["SUMPRODUCT(A0:A5, B0:B5)"],
-            doc: "Multiplies the arrays element-wise and sums the products. \
-                  Non-numeric entries count as 0.",
+## !!steps SUMPRODUCT insists on identical shapes
+
+`SUMPRODUCT` is variadic and reduces to a single number, so it does its own
+shape checking rather than relying on the engine's implicit broadcasting in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs). The first argument's
+`(rows, cols)` becomes the expected shape, and any later argument with a
+different one raises `ArraySizeMismatch`. There is no repeating of scalars
+here: a lone number is a 1×1 array, so mixing it with a taller range is an
+error.
+
+Once flattened, non-numeric entries become 0 via `unwrap_or(0.0)` — blanks and
+text quietly contribute nothing — and the result is the sum over positions of
+the product across arrays. With one argument that product is just the value
+itself, so `SUMPRODUCT` of a single range is its sum.
+
+```rust ! array.rs
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 if args.inner.is_empty() {
@@ -354,6 +378,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                     let dim = (rows.len(), rows.first().map_or(0, |r| r.len()));
                     match dims {
                         None => dims = Some(dim),
+                        // !mark(1:6)
                         Some(expected) if expected != dim => {
                             return Err(FormulaErrorMsg::ArraySizeMismatch {
                                 expected,
@@ -377,62 +402,30 @@ fn get_functions() -> Vec<FormulaFunction> {
                 }
                 Ok(Value::Number(total))
             }),
-        },
-    ]
-}
+```
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+</Scrollycoding>
 
-    fn eval(s: &str) -> String {
-        eval_to_string(&mut NoGrid, s)
-    }
+## Implemented functions
 
-    #[test]
-    fn test_transpose() {
-        assert_eq!("{1, 3; 2, 4}", eval("TRANSPOSE({1, 2; 3, 4})"));
-        assert_eq!("{1; 2; 3}", eval("TRANSPOSE({1, 2, 3})"));
-    }
+| Name | Purpose |
+| --- | --- |
+| TRANSPOSE | Swaps the rows and columns of an array |
+| SEQUENCE | Builds a rows-by-columns array counting from `start` by `step`, filling each row first |
+| UNIQUE | Removes duplicate rows, keeping first occurrences, with case-insensitive and numeric-string-aware comparison |
+| SORT | Sorts rows by a 1-based column index, ascending or descending, with blanks always last |
+| FILTER | Keeps the rows or columns of an array selected by a truthy include mask, or returns `if_empty` |
+| SUMPRODUCT | Multiplies equally shaped arrays element-wise and sums the products, counting non-numeric entries as 0 |
 
-    #[test]
-    fn test_sequence() {
-        assert_eq!("{1; 2; 3}", eval("SEQUENCE(3)"));
-        assert_eq!("{0, 10, 20; 30, 40, 50}", eval("SEQUENCE(2, 3, 0, 10)"));
-    }
-
-    #[test]
-    fn test_unique() {
-        assert_eq!("{1; 2; 3}", eval("UNIQUE({1; 2; 1; 3; 2})"));
-        // case-insensitive text, numeric-string awareness
-        assert_eq!("{a; b}", eval("UNIQUE({'a'; 'A'; 'b'})"));
-        assert_eq!("{1}", eval("UNIQUE({1; '1'})"));
-    }
-
-    #[test]
-    fn test_sort() {
-        assert_eq!("{1; 2; 3}", eval("SORT({3; 1; 2})"));
-        assert_eq!("{3; 2; 1}", eval("SORT({3; 1; 2}, 1, -1)"));
-        // sort rows by second column
-        assert_eq!("{b, 1; a, 2}", eval("SORT({'a', 2; 'b', 1}, 2)"));
-        // numbers before text, blanks last even descending
-        assert_eq!("{5; x; }", eval("SORT({'x'; ''; 5})"));
-        assert_eq!("{x; 5; }", eval("SORT({'x'; ''; 5}, 1, -1)"));
-    }
-
-    #[test]
-    fn test_filter() {
-        // the old parser's array literals only take atoms, so masks are
-        // numeric here; real ranges deliver booleans, which truthy() accepts
-        assert_eq!("{1; 3}", eval("FILTER({1; 2; 3}, {1; 0; 1})"));
-        assert_eq!("{2, 20}", eval("FILTER({1, 10; 2, 20}, {0; 1})"));
-        assert_eq!("none", eval("FILTER({1; 2}, {0; 0}, 'none')"));
-    }
-
-    #[test]
-    fn test_sumproduct() {
-        assert_eq!("32", eval("SUMPRODUCT({1; 2; 3}, {4; 5; 6})"));
-        assert_eq!("6", eval("SUMPRODUCT({1, 2, 3})"));
-    }
-}
-````
+The `CATEGORY` constant is collected by
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), and
+`pure_fn` comes from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs). The
+`Value` and `Value::Array` types these functions build live in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), the element-wise
+`array_map` they deliberately bypass lives in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs), and `NonRectangularArray`,
+`ArrayTooBig`, and `ArraySizeMismatch` are defined in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs). Spilling an array
+result across the grid happens outside the Rust crate, in
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts).

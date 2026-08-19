@@ -1,15 +1,35 @@
 ---
 title: "lookup.rs"
-description: "Rust module lookup.rs of the quadratic-core formula engine."
+description: "The Lookup functions category — INDIRECT, VLOOKUP, HLOOKUP, MATCH, and INDEX, with one shared loose-equality rule"
 source: "quadratic-core/src/formulas/functions/lookup.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "Lookup functions" category: five functions that turn a
+value or a pair of indices into a cell somewhere else. Four of them are pure —
+they only walk the array they were handed — and one, `INDIRECT`, actually
+reaches back into the grid through the evaluation context.
 
-````rust lookup.rs -n
+Like every sibling in this directory, the module exports a `CATEGORY`
+constant whose `get_functions` pointer produces the `FormulaFunction` values;
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) merges
+all categories into the global `ALL_FUNCTIONS` map that the evaluator consults
+by uppercase name.
+
+<Scrollycoding>
+
+## !!steps The category, and the one impure function
+
+`CATEGORY` is the registration point: a display name, empty category-level
+docs, and the `get_functions` producer. `INDIRECT` is the only entry here that
+needs the context, so instead of `util::pure_fn` it builds its `eval` closure
+by hand and hands the arguments straight to `ctx.array_mapped_indirect`, which
+parses each string as A1 notation relative to the calling cell and fetches it
+(see [ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs)). Because it goes
+through the array-mapping machinery, an array of reference strings yields an
+array of cell values.
+
+```rust ! lookup.rs
 use super::*;
 
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
@@ -28,16 +48,30 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &["cellref_string"],
             examples: &["INDIRECT(\"Cn7\")", "INDIRECT(\"F\" & B0)"],
             doc: "Returns the value of the cell at a given location.",
+            // !mark
             eval: Box::new(|ctx, args| ctx.array_mapped_indirect(args).boxed_local()),
         },
+        // ...
+    ]
+}
+```
+
+## !!steps VLOOKUP scans the first column
+
+`VLOOKUP` pulls three required arguments off the iterator with a `let`-`else`
+destructure, then accepts — and deliberately ignores — a fourth: the classic
+`is_sorted` flag. The comment says it plainly, and the behavior follows: there
+is no binary search and no approximate branch, just a linear scan of the first
+cell of every row until `values_loosely_equal` says yes.
+
+A fifth argument is a `BadArgumentCount` error, an `output_col` below 1 is
+`IndexOutOfBounds`, and a scan that finds nothing produces an `Expected` error
+pointing at the search key's span rather than at the whole call.
+
+```rust ! lookup.rs
         FormulaFunction {
             name: "VLOOKUP",
-            arg_completion: "${1:search_key}, ${2:search_range}, ${3:output_col}",
-            usages: &["search_key, search_range, output_col"],
-            examples: &["VLOOKUP(\"apple\", A1:C10, 3)"],
-            doc: "Searches the first column of `search_range` for `search_key` \
-                  (exact match, case-insensitive) and returns the value in the \
-                  1-based `output_col` of the matching row.",
+            // ...
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 let mut a = args.inner.into_iter();
@@ -45,6 +79,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                 else {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
                 };
+                // !mark
                 let _is_sorted = a.next(); // accepted for compatibility; exact match is used
                 if a.next().is_some() {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
@@ -71,14 +106,21 @@ fn get_functions() -> Vec<FormulaFunction> {
                 .with_span(key.span))
             }),
         },
-        FormulaFunction {
-            name: "HLOOKUP",
-            arg_completion: "${1:search_key}, ${2:search_range}, ${3:output_row}",
-            usages: &["search_key, search_range, output_row"],
-            examples: &["HLOOKUP(\"Q2\", A1:F3, 2)"],
-            doc: "Searches the first row of `search_range` for `search_key` \
-                  (exact match, case-insensitive) and returns the value in the \
-                  1-based `output_row` of the matching column.",
+```
+
+## !!steps HLOOKUP is the same scan, transposed
+
+`HLOOKUP` mirrors `VLOOKUP` argument for argument, including the ignored
+sorted flag. The difference is which axis it walks: it takes `rows.first()`
+as the header row, scans it for the key, and remembers the *column* index `i`.
+The result then comes from the requested output row at that column, so the two
+`get` calls are chained the other way around — row first, then element.
+
+An empty table degrades gracefully: `rows.first().cloned().unwrap_or_default()`
+yields an empty header row, the loop body never runs, and the function ends in
+the same no-match error.
+
+```rust ! lookup.rs
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 let mut a = args.inner.into_iter();
@@ -87,14 +129,13 @@ fn get_functions() -> Vec<FormulaFunction> {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
                 };
                 let _is_sorted = a.next(); // accepted for compatibility; exact match is used
-                if a.next().is_some() {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                }
+                // ...
                 let out_row = out_row.to_integer()?;
                 if out_row < 1 {
                     return Err(FormulaErrorMsg::IndexOutOfBounds.with_span(span));
                 }
                 let rows = table.inner.clone().into_array();
+                // !mark
                 let first_row = rows.first().cloned().unwrap_or_default();
                 for (i, v) in first_row.iter().enumerate() {
                     if values_loosely_equal(v, &key.inner) {
@@ -111,28 +152,27 @@ fn get_functions() -> Vec<FormulaFunction> {
                 }
                 .with_span(key.span))
             }),
-        },
-        FormulaFunction {
-            name: "MATCH",
-            arg_completion: "${1:search_key}, ${2:range}",
-            usages: &["search_key, range", "search_key, range, match_mode"],
-            examples: &["MATCH(42, A1:A10, 0)"],
-            doc: "Returns the 1-based position of `search_key` in `range`. \
-                  `match_mode` 0 = exact match (`*`/`?` wildcards allowed); \
-                  1 (default) = largest value ≤ key; -1 = smallest value ≥ key.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(key), Some(range), mode, None) =
-                    (a.next(), a.next(), a.next(), a.next())
-                else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
+```
+
+## !!steps MATCH flattens first, then branches on mode
+
+`MATCH` is the one function here with real match modes. Before any of that it
+normalizes its haystack: an array argument is flattened row-major into a flat
+`Vec<Value>`, and a scalar becomes a one-element vector — so position numbers
+are indices into that flattened sequence, not row or column coordinates.
+
+`match_mode` defaults to `1` when omitted. Mode `0` is the exact branch: for
+every value it accepts either loose equality *or* a wildcard match, with the
+search key used as the pattern. Both sides are lowercased first, because
+`util::wildcard_match` leaves case handling to its caller.
+
+```rust ! lookup.rs
                 let mode = match mode {
                     Some(m) => m.to_number()?,
                     None => 1.0,
                 };
                 let values: Vec<Value> = match range.inner {
+                    // !mark
                     Value::Array(rows) => rows.into_iter().flatten().collect(),
                     v => vec![v],
                 };
@@ -146,6 +186,7 @@ fn get_functions() -> Vec<FormulaFunction> {
                     let pattern = key.inner.to_string().to_lowercase();
                     for (i, v) in values.iter().enumerate() {
                         if values_loosely_equal(v, &key.inner)
+                            // !mark
                             || util::wildcard_match(&pattern, &v.to_string().to_lowercase())
                         {
                             return Ok(Value::Number((i + 1) as f64));
@@ -153,11 +194,29 @@ fn get_functions() -> Vec<FormulaFunction> {
                     }
                     return Err(no_match);
                 }
+```
+
+## !!steps Approximate matching without assuming sorted input
+
+The two approximate modes share one loop. `mode > 0` looks for the largest
+value at most the target; `mode < 0` looks for the smallest value at least the
+target. Rather than trusting the range to be sorted and stopping at the first
+crossing, the loop visits every element and keeps a running `best` pair of
+index and number — so an unsorted range still gives the right answer, and ties
+keep the *earliest* index because `better` requires a strict improvement.
+
+Non-numeric values are skipped by the `let`-`else`, and blank strings are
+skipped explicitly even though they coerce to a number. Only the exact branch
+compares text; these modes are numeric-only, and the key itself goes through
+`to_number` here.
+
+```rust ! lookup.rs
                 // approximate modes compare numbers only
                 let target = key.to_number()?;
                 let mut best: Option<(usize, f64)> = None;
                 for (i, v) in values.iter().enumerate() {
                     let Ok(n) = v.to_number() else { continue };
+                    // !mark
                     if matches!(v, Value::String(s) if s.trim().is_empty()) {
                         continue;
                     }
@@ -182,18 +241,24 @@ fn get_functions() -> Vec<FormulaFunction> {
                     Some((i, _)) => Ok(Value::Number((i + 1) as f64)),
                     None => Err(no_match),
                 }
-            }),
-        },
-        FormulaFunction {
-            name: "INDEX",
-            arg_completion: "${1:range}, ${2:row}",
-            usages: &["range, row", "range, row, column"],
-            examples: &["INDEX(A1:C10, 2, 3)"],
-            doc: "Returns the value at the 1-based `row` and `column` \
-                  (default 1) of `range`.",
+```
+
+## !!steps INDEX is pure indexing
+
+`INDEX` does no searching at all. It takes a range and a 1-based row, with an
+optional column defaulting to `1`, and reads straight through
+`into_array`. Note the trailing `None` in the destructuring tuple: it is how
+the pattern rejects a fourth argument in the same `let`-`else` that binds the
+first three.
+
+Both indices must be at least 1, and the `and_then` chain converts any
+out-of-range coordinate into `IndexOutOfBounds` instead of panicking.
+
+```rust ! lookup.rs
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 let mut a = args.inner.into_iter();
+                // !mark
                 let (Some(range), Some(row), col, None) =
                     (a.next(), a.next(), a.next(), a.next())
                 else {
@@ -215,14 +280,28 @@ fn get_functions() -> Vec<FormulaFunction> {
                     .cloned()
                     .ok_or(FormulaErrorMsg::IndexOutOfBounds.with_span(span))
             }),
-        },
-    ]
-}
+```
 
+## !!steps One equality rule for the whole module
+
+Every scan above funnels through `values_loosely_equal`, the module's private
+notion of "same value" — documented as matching the equality the `=` operator
+uses. If both sides coerce to numbers it compares numbers, so the text `"42"`
+finds the number `42`. Otherwise it falls back to an ASCII case-insensitive
+string comparison, which is where the "case-insensitive" promise in the
+`VLOOKUP` and `HLOOKUP` docs comes from.
+
+The guard in the middle is the subtle part. Numeric comparison is skipped
+exactly when `a` is a blank-or-whitespace string and `b` is not, pushing that
+pair down to the string comparison instead of letting a blank cell coerce to
+zero and match a numeric key.
+
+```rust ! lookup.rs
 /// Case-insensitive equality with numeric coercion, matching the equality
 /// used by the `=` operator.
 fn values_loosely_equal(a: &Value, b: &Value) -> bool {
     if let (Ok(x), Ok(y)) = (a.to_number(), b.to_number()) {
+        // !mark(1:3)
         if !matches!(a, Value::String(s) if s.trim().is_empty())
             || matches!(b, Value::String(s) if s.trim().is_empty())
         {
@@ -231,26 +310,31 @@ fn values_loosely_equal(a: &Value, b: &Value) -> bool {
     }
     a.to_string().eq_ignore_ascii_case(&b.to_string())
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+</Scrollycoding>
 
-    #[test]
-    fn test_formula_indirect() {
-        let form = parse_formula("INDIRECT(\"D5\")", pos![B2]).unwrap();
+## Implemented functions
 
-        let mut g = FnGrid(|pos| Some((pos.x * 10 + pos.y).to_string()));
+| Name | Purpose |
+| --- | --- |
+| INDIRECT | Returns the value of the cell named by an A1-notation string |
+| VLOOKUP | Scans the first column of a range for a key and returns another column of that row |
+| HLOOKUP | Scans the first row of a range for a key and returns another row of that column |
+| MATCH | Returns the 1-based position of a key in a range, with exact, largest-below, or smallest-above modes |
+| INDEX | Returns the value at a 1-based row and column of a range |
 
-        assert_eq!(
-            FormulaErrorMsg::CircularReference,
-            form.eval_blocking(&mut g, pos![D5]).unwrap_err().msg,
-        );
-
-        assert_eq!(
-            (3 * 10 + 5).to_string(),
-            eval_to_string(&mut g, "INDIRECT(\"D5\")"),
-        );
-    }
-}
-````
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs);
+`pure_fn` and `wildcard_match` come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), and
+`array_mapped_indirect` plus the A1 parsing behind `INDIRECT` live in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs) and
+[cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs). The `Value`
+coercions used by `values_loosely_equal` are defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), and the error variants
+raised here in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs). For range-shaped
+siblings see
+[array.rs](/docs/quadratic-core/src/formulas/functions/array.rs) and
+[database.rs](/docs/quadratic-core/src/formulas/functions/database.rs).

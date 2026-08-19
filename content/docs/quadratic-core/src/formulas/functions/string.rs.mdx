@@ -1,17 +1,38 @@
 ---
 title: "string.rs"
-description: "Rust module string.rs of the quadratic-core formula engine."
+description: "The String functions category: concatenation, substrings, case conversion, search and join, all counting characters rather than bytes"
 source: "quadratic-core/src/formulas/functions/string.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This module is the "String functions" category of the formula engine: thirteen
+text functions built on Rust's `String` and `char` iterators. Because every
+value in this engine already knows how to stringify itself, most of the work
+here is argument juggling — how many arguments, which are optional, and where
+counting starts.
 
-````rust string.rs -n
-use super::*;
+Like every sibling in this directory, the module exports a `CATEGORY` constant
+whose `get_functions` pointer produces the actual `FormulaFunction` values;
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) collects
+all categories into the global `ALL_FUNCTIONS` map that the evaluator looks up
+by uppercase name.
 
+<Scrollycoding>
+
+## !!steps One category, thirteen functions
+
+The `CATEGORY` constant is the registration point: a display name, category
+docs for the formula editor (empty here — the per-function docs carry the
+weight), and a `get_functions` pointer returning `Vec<FormulaFunction>`. Each
+entry bundles a name, an autocomplete snippet, usage strings, examples, docs,
+and an `eval` closure.
+
+`CONCAT` shows the simplest shape. `util::pure_fn` wraps a closure over the
+raw argument list, and `util::flat_iter_strings` flattens every argument —
+including whole cell ranges — into a stream of strings before joining them.
+`CONCATENATE` is a byte-for-byte duplicate registered under the second name.
+
+```rust ! string.rs
 pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     include_in_docs: true,
     include_in_completions: true,
@@ -20,10 +41,7 @@ pub const CATEGORY: FormulaFunctionCategory = FormulaFunctionCategory {
     get_functions,
 };
 
-/// Character index (1-based, from an f64 argument) clamped to usize.
-fn to_count(n: f64) -> usize {
-    n.max(0.0).round() as usize
-}
+// ...
 
 fn get_functions() -> Vec<FormulaFunction> {
     vec![
@@ -33,188 +51,36 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &["a, b, ..."],
             examples: &["CONCAT(\"Hello, \", C0, \"!\")"],
             doc: "[Concatenates](https://en.wikipedia.org/wiki/Concatenation) all values as strings.",
+            // !mark
             eval: util::pure_fn(|args| {
                 Ok(Value::String(util::flat_iter_strings(&args.inner).join("")))
             }),
         },
-        FormulaFunction {
-            name: "CONCATENATE",
-            arg_completion: "${1:a, b, ...}",
-            usages: &["a, b, ..."],
-            examples: &["CONCATENATE(A0, \" \", B0)"],
-            doc: "Same as `CONCAT`. Concatenates all values as strings.",
-            eval: util::pure_fn(|args| {
-                Ok(Value::String(util::flat_iter_strings(&args.inner).join("")))
-            }),
-        },
-        FormulaFunction {
-            name: "LEFT",
-            arg_completion: "${1:string}",
-            usages: &["string", "string, count"],
-            examples: &["LEFT(\"spreadsheet\", 6)"],
-            doc: "Returns the first `count` characters of a string (default 1).",
-            eval: util::pure_fn(|args| {
-                let (s, count) = string_and_optional_count(args)?;
-                Ok(Value::String(s.chars().take(count).collect()))
-            }),
-        },
-        FormulaFunction {
-            name: "RIGHT",
-            arg_completion: "${1:string}",
-            usages: &["string", "string, count"],
-            examples: &["RIGHT(\"spreadsheet\", 5)"],
-            doc: "Returns the last `count` characters of a string (default 1).",
-            eval: util::pure_fn(|args| {
-                let (s, count) = string_and_optional_count(args)?;
-                let chars: Vec<char> = s.chars().collect();
-                let skip = chars.len().saturating_sub(count);
-                Ok(Value::String(chars[skip..].iter().collect()))
-            }),
-        },
-        FormulaFunction {
-            name: "MID",
-            arg_completion: "${1:string}, ${2:start}, ${3:count}",
-            usages: &["string, start, count"],
-            examples: &["MID(\"spreadsheet\", 7, 5)"],
-            doc: "Returns `count` characters starting at 1-based position `start`.",
-            eval: util::array_mapped(|[string, start, count]| {
-                let s = string.to_string();
-                let start = to_count(start.to_number()?).max(1) - 1;
-                let count = to_count(count.to_number()?);
-                Ok(Value::String(s.chars().skip(start).take(count).collect()))
-            }),
-        },
-        FormulaFunction {
-            name: "LEN",
-            arg_completion: "${1:string}",
-            usages: &["string"],
-            examples: &["LEN(\"hello\")"],
-            doc: "Returns the number of characters in a string.",
-            eval: util::array_mapped(|[string]| {
-                Ok(Value::Number(string.to_string().chars().count() as f64))
-            }),
-        },
-        FormulaFunction {
-            name: "LOWER",
-            arg_completion: "${1:string}",
-            usages: &["string"],
-            examples: &["LOWER(\"WORLD\")"],
-            doc: "Converts a string to lowercase.",
-            eval: util::array_mapped(|[string]| {
-                Ok(Value::String(string.to_string().to_lowercase()))
-            }),
-        },
-        FormulaFunction {
-            name: "UPPER",
-            arg_completion: "${1:string}",
-            usages: &["string"],
-            examples: &["UPPER(\"hello\")"],
-            doc: "Converts a string to uppercase.",
-            eval: util::array_mapped(|[string]| {
-                Ok(Value::String(string.to_string().to_uppercase()))
-            }),
-        },
-        FormulaFunction {
-            name: "TRIM",
-            arg_completion: "${1:string}",
-            usages: &["string"],
-            examples: &["TRIM(\"  hi  \")"],
-            doc: "Removes leading and trailing spaces and collapses runs of \
-                  spaces into one.",
-            eval: util::array_mapped(|[string]| {
-                let s = string.to_string();
-                let mut out = String::with_capacity(s.len());
-                let mut last_space = true; // strips leading spaces
-                for c in s.chars() {
-                    if c == ' ' {
-                        if !last_space {
-                            out.push(' ');
-                        }
-                        last_space = true;
-                    } else {
-                        out.push(c);
-                        last_space = false;
-                    }
-                }
-                if out.ends_with(' ') {
-                    out.pop();
-                }
-                Ok(Value::String(out))
-            }),
-        },
-        FormulaFunction {
-            name: "SUBSTITUTE",
-            arg_completion: "${1:string}, ${2:search}, ${3:replace}",
-            usages: &["string, search, replace"],
-            examples: &["SUBSTITUTE(\"a-b-c\", \"-\", \"+\")"],
-            doc: "Replaces every occurrence of `search` with `replace`.",
-            eval: util::array_mapped(|[string, search, replace]| {
-                let s = string.to_string();
-                let search = search.to_string();
-                if search.is_empty() {
-                    return Ok(Value::String(s));
-                }
-                Ok(Value::String(s.replace(&search, &replace.to_string())))
-            }),
-        },
-        FormulaFunction {
-            name: "FIND",
-            arg_completion: "${1:search}, ${2:string}",
-            usages: &["search, string"],
-            examples: &["FIND(\"sheet\", \"spreadsheet\")"],
-            doc: "Returns the 1-based position of `search` within `string`, or an error \
-                  if it is not found. Case-sensitive.",
-            eval: util::array_mapped(|[search, string]| {
-                let haystack = string.to_string();
-                let needle = search.to_string();
-                match haystack.find(&needle) {
-                    Some(byte_idx) => {
-                        let char_idx = haystack[..byte_idx].chars().count();
-                        Ok(Value::Number((char_idx + 1) as f64))
-                    }
-                    None => Err(FormulaErrorMsg::Expected {
-                        expected: format!("substring {needle:?}").into(),
-                        got: None,
-                    }
-                    .with_span(search.span)),
-                }
-            }),
-        },
-        FormulaFunction {
-            name: "REPT",
-            arg_completion: "${1:string}, ${2:count}",
-            usages: &["string, count"],
-            examples: &["REPT(\"ab\", 3)"],
-            doc: "Repeats a string `count` times.",
-            eval: util::array_mapped(|[string, count]| {
-                let n = to_count(count.to_number()?).min(10_000);
-                Ok(Value::String(string.to_string().repeat(n)))
-            }),
-        },
-        FormulaFunction {
-            name: "TEXTJOIN",
-            arg_completion: "${1:delimiter}, ${2:ignore_empty}, ${3:a, b, ...}",
-            usages: &["delimiter, ignore_empty, a, b, ..."],
-            examples: &["TEXTJOIN(\", \", TRUE, A0:A5)"],
-            doc: "Joins all values as strings with `delimiter` between them. \
-                  If `ignore_empty` is TRUE, empty values are skipped.",
-            eval: util::pure_fn(|args| {
-                let span = args.span;
-                let mut a = args.inner.into_iter();
-                let (Some(delimiter), Some(ignore_empty)) = (a.next(), a.next()) else {
-                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
-                };
-                let delimiter = delimiter.to_string();
-                let ignore_empty = ignore_empty.to_bool()?;
-                let parts: Vec<String> = a
-                    .flat_map(|v| v.to_strings())
-                    .filter(|s| !(ignore_empty && s.is_empty()))
-                    .collect();
-                Ok(Value::String(parts.join(&delimiter)))
-            }),
-        },
+        // ...
     ]
 }
+```
+
+## !!steps Turning a number into a character count
+
+Spreadsheet users type counts as ordinary numbers, so every count argument
+arrives as an `f64` that could be negative, fractional, or huge. `to_count`
+normalizes it in one line: clamp at zero, round to the nearest integer, cast
+to `usize`. A negative count therefore means "none" rather than an error.
+
+`string_and_optional_count` is the shared front end for `LEFT` and `RIGHT`,
+both of which accept `(string)` or `(string, count)`. It pulls arguments off
+an iterator, rejects a missing first argument or a third one with
+`BadArgumentCount`, and defaults the count to 1.
+
+```rust ! string.rs
+/// Character index (1-based, from an f64 argument) clamped to usize.
+fn to_count(n: f64) -> usize {
+    // !mark
+    n.max(0.0).round() as usize
+}
+
+// ...
 
 /// Helper for LEFT/RIGHT: `(string)` or `(string, count)`, count defaults to 1.
 fn string_and_optional_count(
@@ -234,17 +100,227 @@ fn string_and_optional_count(
     };
     Ok((string.to_string(), count))
 }
+```
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+## !!steps LEFT and RIGHT, counted in characters
 
-    #[test]
-    fn test_formula_concat() {
-        assert_eq!(
-            "Hello, 14000605 worlds!".to_string(),
-            eval_to_string(&mut NoGrid, "'Hello, ' & 14000605 & ' worlds!'"),
-        );
-    }
-}
-````
+`LEFT` is a plain `chars().take(count)`, which is already safe for
+multi-byte text: taking six `char`s never lands in the middle of a UTF-8
+sequence the way slicing bytes would.
+
+`RIGHT` cannot iterate backwards from a `Chars` iterator, so it materializes
+the characters into a `Vec<char>` and skips the front. The `saturating_sub`
+is what makes an over-long count harmless: asking for the last 50 characters
+of a 5-character string yields the whole string instead of underflowing.
+
+```rust ! string.rs
+        FormulaFunction {
+            name: "LEFT",
+            arg_completion: "${1:string}",
+            usages: &["string", "string, count"],
+            examples: &["LEFT(\"spreadsheet\", 6)"],
+            doc: "Returns the first `count` characters of a string (default 1).",
+            eval: util::pure_fn(|args| {
+                let (s, count) = string_and_optional_count(args)?;
+                // !mark
+                Ok(Value::String(s.chars().take(count).collect()))
+            }),
+        },
+        FormulaFunction {
+            name: "RIGHT",
+            arg_completion: "${1:string}",
+            usages: &["string", "string, count"],
+            examples: &["RIGHT(\"spreadsheet\", 5)"],
+            doc: "Returns the last `count` characters of a string (default 1).",
+            eval: util::pure_fn(|args| {
+                let (s, count) = string_and_optional_count(args)?;
+                let chars: Vec<char> = s.chars().collect();
+                // !mark
+                let skip = chars.len().saturating_sub(count);
+                Ok(Value::String(chars[skip..].iter().collect()))
+            }),
+        },
+```
+
+## !!steps MID counts from one, Rust counts from zero
+
+Spreadsheet positions are 1-based; `skip` is 0-based. The conversion is the
+`.max(1) - 1` on the start argument: it first floors the position at 1 (so
+position 0 or a negative position behaves like position 1) and only then
+subtracts, which keeps the `usize` subtraction from underflowing.
+
+`LEN` makes the same character-versus-byte choice as `LEFT`: it counts
+`chars`, not `String::len`, so an accented letter or an emoji counts as one.
+Both functions use `util::array_mapped` instead of `pure_fn`, which fixes the
+argument count at compile time and broadcasts the function element-wise when
+an argument is a range.
+
+```rust ! string.rs
+        FormulaFunction {
+            name: "MID",
+            arg_completion: "${1:string}, ${2:start}, ${3:count}",
+            usages: &["string, start, count"],
+            examples: &["MID(\"spreadsheet\", 7, 5)"],
+            doc: "Returns `count` characters starting at 1-based position `start`.",
+            eval: util::array_mapped(|[string, start, count]| {
+                let s = string.to_string();
+                // !mark
+                let start = to_count(start.to_number()?).max(1) - 1;
+                let count = to_count(count.to_number()?);
+                Ok(Value::String(s.chars().skip(start).take(count).collect()))
+            }),
+        },
+        FormulaFunction {
+            name: "LEN",
+            arg_completion: "${1:string}",
+            usages: &["string"],
+            examples: &["LEN(\"hello\")"],
+            doc: "Returns the number of characters in a string.",
+            eval: util::array_mapped(|[string]| {
+                // !mark
+                Ok(Value::Number(string.to_string().chars().count() as f64))
+            }),
+        },
+```
+
+## !!steps TRIM squeezes interior spaces too
+
+`TRIM` is more than `str::trim`: it also collapses runs of spaces inside the
+text. The implementation is a single pass with one flag. `last_space` starts
+as `true`, which is the trick that strips leading spaces — the very first
+space is treated as a continuation of a run that has already been emitted, so
+nothing is pushed.
+
+Interior runs emit exactly one space, and any single trailing space that
+survives is popped at the end. Note the literal `' '` test: only the ASCII
+space is collapsed, so tabs and newlines pass through untouched.
+
+```rust ! string.rs
+            doc: "Removes leading and trailing spaces and collapses runs of \
+                  spaces into one.",
+            eval: util::array_mapped(|[string]| {
+                let s = string.to_string();
+                let mut out = String::with_capacity(s.len());
+                // !mark
+                let mut last_space = true; // strips leading spaces
+                for c in s.chars() {
+                    if c == ' ' {
+                        if !last_space {
+                            out.push(' ');
+                        }
+                        last_space = true;
+                    } else {
+                        out.push(c);
+                        last_space = false;
+                    }
+                }
+                if out.ends_with(' ') {
+                    out.pop();
+                }
+                Ok(Value::String(out))
+            }),
+```
+
+## !!steps FIND translates byte offsets into character positions
+
+`str::find` returns a *byte* offset, which is not what a spreadsheet user
+means by "position". The fix is to count the characters in the prefix that
+precedes the match and add one for the 1-based convention — so `FIND` returns
+5 for a needle after four characters regardless of how many bytes those
+characters occupy.
+
+A miss is an error, not a zero: the function returns
+`FormulaErrorMsg::Expected` describing the substring it looked for, spanned to
+the search argument so the editor can underline it. Matching is
+case-sensitive, since `str::find` compares literally.
+
+```rust ! string.rs
+            doc: "Returns the 1-based position of `search` within `string`, or an error \
+                  if it is not found. Case-sensitive.",
+            eval: util::array_mapped(|[search, string]| {
+                let haystack = string.to_string();
+                let needle = search.to_string();
+                match haystack.find(&needle) {
+                    Some(byte_idx) => {
+                        // !mark(1:2)
+                        let char_idx = haystack[..byte_idx].chars().count();
+                        Ok(Value::Number((char_idx + 1) as f64))
+                    }
+                    None => Err(FormulaErrorMsg::Expected {
+                        expected: format!("substring {needle:?}").into(),
+                        got: None,
+                    }
+                    .with_span(search.span)),
+                }
+            }),
+```
+
+## !!steps Bounded repetition and a variadic join
+
+`REPT` caps the repeat count at 10,000 before calling `String::repeat`, so a
+stray large number in a cell cannot make one formula allocate unbounded
+memory.
+
+`TEXTJOIN` is the only variadic function here that treats its leading
+arguments specially: it takes the first two off the iterator as the delimiter
+and the `ignore_empty` flag, then flattens *everything remaining* — ranges
+included — with `to_strings`. Empty strings are dropped only when the flag is
+true, which is why `TEXTJOIN(", ", FALSE, A0:A5)` can produce consecutive
+delimiters.
+
+```rust ! string.rs
+            doc: "Repeats a string `count` times.",
+            eval: util::array_mapped(|[string, count]| {
+                // !mark
+                let n = to_count(count.to_number()?).min(10_000);
+                Ok(Value::String(string.to_string().repeat(n)))
+            }),
+        },
+        // ...
+            eval: util::pure_fn(|args| {
+                let span = args.span;
+                let mut a = args.inner.into_iter();
+                let (Some(delimiter), Some(ignore_empty)) = (a.next(), a.next()) else {
+                    return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
+                };
+                let delimiter = delimiter.to_string();
+                let ignore_empty = ignore_empty.to_bool()?;
+                let parts: Vec<String> = a
+                    .flat_map(|v| v.to_strings())
+                    // !mark
+                    .filter(|s| !(ignore_empty && s.is_empty()))
+                    .collect();
+                Ok(Value::String(parts.join(&delimiter)))
+            }),
+```
+
+</Scrollycoding>
+
+## Implemented functions
+
+| Name | Purpose |
+| --- | --- |
+| CONCAT | Concatenates all values, including ranges, as strings |
+| CONCATENATE | Same as `CONCAT` |
+| LEFT | First `count` characters of a string, default 1 |
+| RIGHT | Last `count` characters of a string, default 1 |
+| MID | `count` characters starting at 1-based position `start` |
+| LEN | Number of characters in a string |
+| LOWER | Converts a string to lowercase |
+| UPPER | Converts a string to uppercase |
+| TRIM | Strips leading and trailing spaces and collapses interior runs |
+| SUBSTITUTE | Replaces every occurrence of `search` with `replace`; an empty search returns the string unchanged |
+| FIND | 1-based, case-sensitive position of a substring, or an error if absent |
+| REPT | Repeats a string up to 10,000 times |
+| TEXTJOIN | Joins all values with a delimiter, optionally skipping empty ones |
+
+The registry that consumes `CATEGORY` lives in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs); the
+`pure_fn`, `array_mapped`, and `flat_iter_strings` helpers used above come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), and
+the `to_string`, `to_strings`, and `to_bool` conversions on arguments are
+defined in [value.rs](/docs/quadratic-core/src/formulas/value.rs). The `&`
+operator that also concatenates is implemented in
+[operators.rs](/docs/quadratic-core/src/formulas/functions/operators.rs), and
+the error values raised here are described in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

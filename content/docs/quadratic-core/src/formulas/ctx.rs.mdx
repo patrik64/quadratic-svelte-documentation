@@ -1,15 +1,37 @@
 ---
 title: "ctx.rs"
-description: "Formula execution context."
+description: "The Ctx evaluation context: async cell fetches with circular-reference detection, and array broadcasting over ranges."
 source: "quadratic-core/src/formulas/ctx.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`Ctx` is the environment a formula evaluates in. It answers two questions the
+AST cannot answer by itself: *where am I* (needed to resolve relative
+references) and *what is in that other cell* (needed to read the grid). Every
+built-in function receives a `&mut Ctx` when it runs.
 
-````rust ctx.rs -n
+The other half of this file is array broadcasting. Spreadsheet functions are
+written for scalars, but their arguments may be ranges, so `array_map` takes a
+function of N scalars and applies it cell-by-cell across N arguments — the
+mechanism behind `A1:A10 * 2` producing ten results instead of an error.
+
+<Scrollycoding>
+
+## !!steps Two fields is all it takes
+
+`grid` is a trait object rather than a concrete type, so the engine never knows
+what is really behind it — in the browser it is `JsGridProxy` in
+[lib.rs](/docs/quadratic-core/src/lib.rs), which calls back into JavaScript;
+in tests it is a fixture. The trait itself
+([grid_proxy.rs](/docs/quadratic-core/src/formulas/grid_proxy.rs)) has a single
+async method returning `Option<String>`.
+
+`pos` is the cell currently being evaluated. It is the base that every
+`CellRef` from [cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs)
+resolves against. A `Ctx` is built per evaluation in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs).
+
+```rust ! ctx.rs
 use futures::{future::LocalBoxFuture, FutureExt};
 use smallvec::SmallVec;
 
@@ -17,6 +39,7 @@ use super::*;
 
 /// Formula execution context.
 pub struct Ctx<'ctx> {
+    // !mark(1:2)
     pub grid: &'ctx mut dyn GridProxy,
     pub pos: Pos,
 }
@@ -24,7 +47,29 @@ impl Ctx<'_> {
     /// Fetches the contents of the cell at `ref_pos` evaluated at `base_pos`,
     /// or returns an error in the case of a circular reference.
     pub async fn get_cell(&mut self, ref_pos: CellRef, span: Span) -> FormulaResult {
+        // ...
+```
+
+## !!steps Reading a cell, and refusing to read yourself
+
+`get_cell` does three things in six lines. It resolves the reference against
+`self.pos`. It rejects the case where the reference resolves to the evaluating
+cell itself, raising `CircularReference` from
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs) with the span of the
+reference, so the editor can underline exactly which reference is the culprit.
+Then it fetches, and treats an absent cell as the empty string via
+`unwrap_or_default`.
+
+Note what it does *not* do: the result is always `Value::String`, so numeric
+interpretation happens later, wherever a function asks for a number.
+
+```rust ! ctx.rs
+impl Ctx<'_> {
+    /// Fetches the contents of the cell at `ref_pos` evaluated at `base_pos`,
+    /// or returns an error in the case of a circular reference.
+    pub async fn get_cell(&mut self, ref_pos: CellRef, span: Span) -> FormulaResult {
         let ref_pos = ref_pos.resolve_from(self.pos);
+        // !mark(1:3)
         if ref_pos == self.pos {
             return Err(FormulaErrorMsg::CircularReference.with_span(span));
         }
@@ -32,13 +77,30 @@ impl Ctx<'_> {
             self.grid.get(ref_pos).await.unwrap_or_default(),
         ))
     }
+```
 
+## !!steps Two ways to name a cell at runtime
+
+Both of these wrap `get_cell` in the array machinery, so either can be handed a
+range and produce a range.
+
+`array_mapped_indirect` backs the `INDIRECT` function
+([lookup.rs](/docs/quadratic-core/src/formulas/functions/lookup.rs)): it takes a
+*string* argument and parses it as A1 at evaluation time, failing with
+`BadCellReference` if it does not parse. `base_pos` is copied out of `self`
+before the closure, because the closure receives its own `&mut Ctx`.
+`array_mapped_get_cell` is the numeric form — two integer arguments, no
+parsing — and blames errors on `Span::merge(x, y)`, the hull covering both
+coordinates.
+
+```rust ! ctx.rs
     /// Fetches the contents of the cell at `(x, y)`, but fetches an array of cells
     /// if either `x` or `y` is an array.
     pub async fn array_mapped_indirect(
         &mut self,
         args: Spanned<Vec<Spanned<Value>>>,
     ) -> FormulaResult {
+        // !mark
         let base_pos = self.pos;
 
         self.array_map_async(args, |ctx, [cellref_string]| {
@@ -71,7 +133,22 @@ impl Ctx<'_> {
         })
         .await
     }
+```
 
+## !!steps The synchronous door
+
+Most built-in functions never touch the grid, so making every one of them
+async would be noise. `array_map` takes an ordinary synchronous closure and
+adapts it by wrapping each call in an immediately-ready future. It is what
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) and
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs) route
+pure functions through.
+
+The `const N: usize` parameter is the arity, and it is inferred from the array
+pattern in the closure — writing `|ctx, [x, y]|` fixes `N` at 2, which is how
+the argument count ends up checked without anyone writing the number down.
+
+```rust ! ctx.rs
     /// Maps a fixed-argument-count function over arguments that may be arrays.
     pub async fn array_map<const N: usize>(
         &mut self,
@@ -79,11 +156,29 @@ impl Ctx<'_> {
         op: impl 'static + Copy + Fn(&mut Ctx<'_>, [Spanned<Value>; N]) -> FormulaResult,
     ) -> FormulaResult {
         self.array_map_async(args, move |ctx, args| {
+            // !mark
             async move { op(ctx, args) }.boxed_local()
         })
         .await
     }
+```
 
+## !!steps Broadcasting
+
+Here is the core. After the size check (next steps), one of two things happens.
+If no argument is an array, the operation runs once on the arguments as given.
+If any argument is an array, the loop walks every `(row, col)` of the common
+size and calls the operation once per position, collecting a `Value::Array`.
+
+Scalars are not special-cased in the loop: `get_array_value` in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs) returns the array
+element for arrays and *the value itself* for anything else, so a scalar
+argument is automatically repeated across every position. The closure is
+`for<'a> Fn` over the context's lifetime, and returns a `LocalBoxFuture` —
+local rather than `Send` because the underlying grid access reaches into
+JavaScript.
+
+```rust ! ctx.rs
     /// Maps a fixed-argument-count function over arguments that may be arrays.
     pub async fn array_map_async<const N: usize>(
         &mut self,
@@ -101,6 +196,7 @@ impl Ctx<'_> {
                     for col in 0..cols {
                         let arg_values = args
                             .iter()
+                            // !mark
                             .map(|arg| arg.get_array_value(row, col))
                             .collect::<FormulaResult<Vec<_>>>()?
                             .try_into()
@@ -118,7 +214,19 @@ impl Ctx<'_> {
         }
     }
 }
+```
 
+## !!steps Arity checking for free
+
+`args_with_common_array_size` returns both halves of what the loop needs: a
+fixed-size array of arguments and, optionally, the shape to broadcast to.
+
+The arity check is the `try_into` on the first line of the body: converting a
+`Vec` into `[Spanned<Value>; N]` succeeds only if the lengths match, so a wrong
+argument count falls out as `BadArgumentCount` blamed on the span of the whole
+argument list. No function has to count its own arguments.
+
+```rust ! ctx.rs
 struct ArrayArgs<const N: usize> {
     args: [Spanned<Value>; N],
     common_size: Option<(usize, usize)>,
@@ -132,9 +240,25 @@ fn args_with_common_array_size<const N: usize>(
     // Check argument count.
     let args: [Spanned<Value>; N] = args
         .inner
+        // !mark(1:2)
         .try_into()
         .map_err(|_| FormulaErrorMsg::BadArgumentCount.with_span(args.span))?;
+```
 
+## !!steps All arrays must agree
+
+The remaining work is finding the one shape everything broadcasts to.
+`filter_map` keeps only the arguments that actually are arrays, pairing each
+size with its span. The first one sets the expected size; every later one must
+match it, and if it does not, `ArraySizeMismatch` is reported on the span of
+the *offending* argument rather than the first — so the underline lands on the
+range the user probably got wrong.
+
+If no argument is an array, `common_size` stays `None` and the caller takes the
+single-shot branch. Arrays are `(rows, cols)` throughout, matching
+`Value::array_size`.
+
+```rust ! ctx.rs
     let mut array_sizes_iter = args
         .iter()
         .filter_map(|arg| Some((arg.span, arg.inner.array_size()?)));
@@ -148,6 +272,7 @@ fn args_with_common_array_size<const N: usize>(
                     expected: array_size,
                     got: other_array_size,
                 }
+                // !mark
                 .with_span(error_span));
             }
         }
@@ -159,4 +284,18 @@ fn args_with_common_array_size<const N: usize>(
 
     Ok(ArrayArgs { args, common_size })
 }
-````
+```
+
+</Scrollycoding>
+
+`Ctx` is constructed by [ast.rs](/docs/quadratic-core/src/formulas/ast.rs),
+which threads it through evaluation; the functions that consume it are
+registered in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs). Cell
+access goes out through
+[grid_proxy.rs](/docs/quadratic-core/src/formulas/grid_proxy.rs) to the
+JavaScript implementation in [lib.rs](/docs/quadratic-core/src/lib.rs), which
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) supplies. Values and
+their array shapes live in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), and every span used
+here comes from [span.rs](/docs/quadratic-core/src/formulas/span.rs).

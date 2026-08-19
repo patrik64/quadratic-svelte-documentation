@@ -1,15 +1,36 @@
 ---
 title: "cell.rs"
-description: "Contents of a single spreadsheet cell."
+description: "The crate's cell types: the Cell enum, the serde-friendly JsCell record, and the wasm-exported CellTypes enum."
 source: "quadratic-core/src/cell.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A 54-line module holding quadratic-core's vocabulary for cell contents. It
+declares three types — `Cell` for a value the engine holds in memory, `JsCell`
+for the shape a cell takes when it crosses the wasm boundary as JSON, and
+`CellTypes` for the kind of code that produced it.
 
-````rust cell.rs -n
+All three are re-exported from the crate root in
+[lib.rs](/docs/quadratic-core/src/lib.rs). The formula evaluator itself never
+reads them: it asks the
+[GridProxy](/docs/quadratic-core/src/formulas/grid_proxy.rs) for a plain
+`Option<String>` and works in terms of
+[Value](/docs/quadratic-core/src/formulas/value.rs) instead.
+
+<Scrollycoding>
+
+## !!steps The Cell enum
+
+A cell is one of exactly three things: nothing at all, an integer, or text.
+`Empty` carries the `#[default]` attribute, so `Cell::default()` is an empty
+cell and any struct containing a `Cell` can derive `Default` too.
+
+The derive list is what makes the type usable everywhere else: `Serialize` and
+`Deserialize` for the JSON that travels to JavaScript, `Clone` because the
+enum owns its `String`, and `PartialEq` for comparisons and tests. Note there
+is no floating-point variant here — `Int(i64)` is the only numeric case.
+
+```rust ! cell.rs
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use wasm_bindgen::prelude::*;
@@ -17,16 +38,33 @@ use wasm_bindgen::prelude::*;
 /// Contents of a single spreadsheet cell.
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 pub enum Cell {
+    // !mark
     #[default]
     Empty,
     Int(i64),
     Text(String),
 }
+```
+
+## !!steps Reading a cell as text
+
+`is_empty` is a one-line `matches!` against the `Empty` variant — cheaper and
+clearer than a full `match`.
+
+`string_value` is the interesting one. Its return type is `Cow<'_, str>`, a
+clone-on-write string tied to the borrow of `self`: `Empty` yields a borrowed
+`""` and `Text` yields a borrow of the string it already owns, so neither
+allocates. Only `Int` has to build something new, and `to_string()` produces
+an owned `String` that the same `Cow` can carry. Callers get one uniform
+string-like value without paying for a copy in the common cases.
+
+```rust ! cell.rs
 impl Cell {
     pub fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
     }
 
+    // !mark
     pub fn string_value(&self) -> Cow<'_, str> {
         match self {
             Cell::Empty => "".into(),
@@ -35,11 +73,31 @@ impl Cell {
         }
     }
 }
+```
 
+## !!steps The serialized JsCell record
+
+Where `Cell` is a compact enum, `JsCell` is the flat record shape used for
+interchange: position, the value as a string, and a run of optional metadata.
+Every optional field serializes to `null` when absent, which is exactly what a
+JavaScript consumer expects.
+
+The metadata fields name what a computed cell carries beyond its value:
+`python_code` and `python_output` for a code cell, `array_cells` for the
+positions an output occupies, `dependent_cells` for the cells related to this
+one, and `last_modified` as a string timestamp. The two position lists are
+`[x, y]` pairs rather than structs, keeping the JSON small. The same field
+names appear on the app's own `Cell` interface in
+[types.ts](/docs/src/lib/core/types.ts). The commented-out
+`r#type` field would have carried the `CellTypes` value in the next step (the
+`r#` prefix escapes `type`, which is a Rust keyword).
+
+```rust ! cell.rs
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 pub struct JsCell {
     pub x: i64,
     pub y: i64,
+    // !mark
     // pub r#type: CellTypes,
     pub value: String,
 
@@ -52,8 +110,23 @@ pub struct JsCell {
 
     pub last_modified: Option<String>,
 }
+```
 
+## !!steps Cell types across the wasm boundary
+
+`CellTypes` enumerates what produced a cell's value: typed text, a formula,
+JavaScript, Python, SQL, or a computed spill. It is a C-style enum with no
+payloads, which is the only enum form `#[wasm_bindgen]` accepts — that
+attribute is what generates a matching TypeScript enum in the `pkg` bundle.
+
+Because there are no payloads it can also derive `Copy`, so the type is passed
+around by value. `Text` is the `#[default]`, matching `Cell::Empty` defaulting
+on the value side. The SvelteKit app keeps its own parallel union,
+`CellType`, in [types.ts](/docs/src/lib/core/types.ts).
+
+```rust ! cell.rs
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq)]
+// !mark
 #[wasm_bindgen]
 pub enum CellTypes {
     #[default]
@@ -64,4 +137,15 @@ pub enum CellTypes {
     Sql,
     Computed,
 }
-````
+```
+
+</Scrollycoding>
+
+The companion module [position.rs](/docs/quadratic-core/src/position.rs)
+supplies the `Pos` type that addresses these cells, and
+[lib.rs](/docs/quadratic-core/src/lib.rs) re-exports both. On the app side,
+the cell model the grid actually stores lives in
+[types.ts](/docs/src/lib/core/types.ts) and
+[Sheet.ts](/docs/src/lib/core/Sheet.ts), while
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts) is what
+tracks dependent cells and spilled array output in practice.

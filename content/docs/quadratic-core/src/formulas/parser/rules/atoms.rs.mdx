@@ -1,15 +1,23 @@
 ---
 title: "atoms.rs"
-description: "Matches a string literal."
+description: "Leaf grammar rules — string literals, numeric literals, cell references and cell ranges, each consuming a single token from the lexer."
 source: "quadratic-core/src/formulas/parser/rules/atoms.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Atoms are the leaves of the formula grammar: the rules that bottom out on a single token instead of recursing into other rules. There are four of them — `StringLiteral`, `NumericLiteral`, `CellReference` and `CellRangeReference` — and each is a zero-sized struct implementing the `SyntaxRule` trait from [rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs).
 
-````rust atoms.rs -n
+Three of these are reached from the `OpPrecedence::Atom` alternatives in [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs). The fourth, `CellRangeReference`, is not part of the expression grammar at all — `find_cell_references` in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs) sweeps it across a formula to collect the cells a formula depends on.
+
+<Scrollycoding>
+
+## !!steps The shape of an atom rule
+
+Every rule in this file follows the same three-part skeleton. The struct itself is a unit struct — a rule carries no state, it *is* the grammar production. `impl_display!` (from [util.rs](/docs/quadratic-core/src/util.rs)) supplies the human-readable name that shows up in "expected ..." errors, satisfying the `fmt::Display` supertrait.
+
+`prefix_matches` takes the parser by value and calls `p.next()` on that copy, so peeking at the upcoming token costs nothing and moves no real cursor. `consume_match` re-checks the same token on the real parser and bails out through `p.expected(self)` if it is not there.
+
+```rust ! atoms.rs
 use super::*;
 
 /// Matches a string literal.
@@ -19,17 +27,32 @@ impl_display!(for StringLiteral, "string literal");
 impl SyntaxRule for StringLiteral {
     type Output = ast::AstNode;
 
+    // !mark
     fn prefix_matches(&self, mut p: Parser<'_>) -> bool {
         p.next() == Some(Token::StringLiteral)
     }
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
+        // !mark
         if p.next() != Some(Token::StringLiteral) {
             return p.expected(self);
         }
+        // ...
+    }
+}
+```
+
+## !!steps Unescaping, inside an IIFE
+
+The lexer hands over the raw token text, quotes included, so the rule has to unescape it itself. The unescaping runs inside an immediately-invoked closure returning `Option`, which the comment calls out as being for error handling: every `?` inside can bail out to `None` without an early `return` from `consume_match`.
+
+The opening quote character is read first and then used as the terminator, so both quoting styles the lexer accepts close on their own character. A backslash consumes whatever follows it verbatim — there are no named escapes like `\n` here, only "the next character is literal".
+
+```rust ! atoms.rs
         // Use IIFE for error handling.
         || -> Option<Self::Output> {
             let mut string_contents = String::new();
             let mut chars = p.token_str().chars().peekable();
+            // !mark
             let quote = chars.next()?;
             // Read characters.
             loop {
@@ -39,7 +62,16 @@ impl SyntaxRule for StringLiteral {
                     c => string_contents.push(c),
                 }
             }
+            // ...
+```
 
+## !!steps A sanity check on the way out
+
+After the closing quote, nothing should remain — the lexer would have ended the token there. The rule asserts that with `chars.next().is_none()` and only then builds the AST node, pairing `p.span()` with `ast::AstNodeContents::String`.
+
+If anything is left over, the closure returns `None` and `ok_or_else` turns it into an *internal* error, not a user-facing syntax error: reaching that branch would mean the lexer and this rule disagree about what a string literal is. `internal_error_value!` comes from [errors.rs](/docs/quadratic-core/src/formulas/errors.rs).
+
+```rust ! atoms.rs
             if chars.next().is_none() {
                 // End of token, as expected.
                 Some(Spanned {
@@ -51,10 +83,19 @@ impl SyntaxRule for StringLiteral {
                 None
             }
         }()
+        // !mark
         .ok_or_else(|| internal_error_value!("error in string literal parsing"))
     }
 }
+```
 
+## !!steps Numbers are handed to Rust
+
+`NumericLiteral` does almost no work of its own: the lexer already decided where the number ends, so the rule just runs `parse::<f64>()` over the token text. Every formula number is therefore a 64-bit float, and the `Display` string advertises the range the lexer accepts, including scientific notation such as `6.022e23`.
+
+A parse failure here is a real user error rather than an internal one, so it becomes `FormulaErrorMsg::BadNumber` carrying the token's span — which is what lets the editor underline exactly the offending literal.
+
+```rust ! atoms.rs
 /// Matches an numeric literal.
 #[derive(Debug, Copy, Clone)]
 pub struct NumericLiteral;
@@ -68,6 +109,7 @@ impl SyntaxRule for NumericLiteral {
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
         match p.next() {
             Some(Token::NumericLiteral) => {
+                // !mark
                 let Ok(n) = p.token_str().parse::<f64>() else {
                     return Err(FormulaErrorMsg::BadNumber.with_span(p.span()));
                 };
@@ -80,7 +122,15 @@ impl SyntaxRule for NumericLiteral {
         }
     }
 }
+```
 
+## !!steps A single cell reference
+
+`CellReference` delegates the actual A1 decoding to `CellRef::parse_a1` in [cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs), passing `p.pos` — the coordinates of the cell the formula was typed into. That second argument is what makes *relative* references work: a reference like `A1` is stored as an offset from the formula's own position, so copying the formula elsewhere shifts it.
+
+The `Display` string mentions `$ZB$3`, the absolute form. When `parse_a1` returns `None` the rule reports `FormulaErrorMsg::BadCellReference` over the token's span.
+
+```rust ! atoms.rs
 /// Matches a cell reference.
 #[derive(Debug, Copy, Clone)]
 pub struct CellReference;
@@ -93,6 +143,7 @@ impl SyntaxRule for CellReference {
     }
     fn consume_match(&self, p: &mut Parser<'_>) -> FormulaResult<Self::Output> {
         p.next();
+        // !mark
         let Some(cell_ref) = CellRef::parse_a1(p.token_str(), p.pos) else {
             return Err(FormulaErrorMsg::BadCellReference.with_span(p.span()));
         };
@@ -102,7 +153,15 @@ impl SyntaxRule for CellReference {
         })
     }
 }
+```
 
+## !!steps Ranges, standing alone
+
+`CellRangeReference` is the odd one out: its `Output` is `Spanned<RangeRef>` rather than an `AstNode`, because it is not used to build expressions. Inside an expression, `A1:B2` is handled by the `CellRange` precedence level in [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs) as an ordinary binary operator.
+
+This rule exists for `find_cell_references`, which walks a formula token by token asking "is there a reference here?" so the app can highlight or track dependencies. It starts exactly like `CellReference` — one `CellRef` token, decoded through `parse_a1` — and remembers that first span.
+
+```rust ! atoms.rs
 /// Matches a cell range reference on its own, not as part of an expression.
 #[derive(Debug, Copy, Clone)]
 pub struct CellRangeReference;
@@ -119,7 +178,18 @@ impl SyntaxRule for CellRangeReference {
             return Err(FormulaErrorMsg::BadCellReference.with_span(p.span()));
         };
         let span = p.span();
+        // ...
+    }
+}
+```
 
+## !!steps Two steps forward, two steps back
+
+Having one reference in hand, the rule speculatively looks for `:` followed by a second reference. If both are there it returns `RangeRef::CellRange` spanning from the first token to the last, merged with `Span::merge`.
+
+If the colon was there but what follows it does not decode as a reference, the rule *manually rewinds* with two `p.prev()` calls — one for the second token, one for the colon — and falls through to returning a plain `RangeRef::Cell`. It has to do this by hand because, per the `SyntaxRule` contract, `consume_match` is not required to restore the parser; only `Parser::try_parse` snapshots and restores, and here the failure is a `None` from `parse_a1` rather than a rule mismatch.
+
+```rust ! atoms.rs
         // Check for a range reference.
         if p.try_parse(Token::CellRangeOp).is_some() {
             p.next();
@@ -129,6 +199,7 @@ impl SyntaxRule for CellRangeReference {
                     inner: RangeRef::CellRange(cell_ref, cell_ref2),
                 });
             }
+            // !mark(1:2)
             p.prev();
             p.prev();
         }
@@ -139,4 +210,8 @@ impl SyntaxRule for CellRangeReference {
         })
     }
 }
-````
+```
+
+</Scrollycoding>
+
+These atoms sit at the bottom of the grammar defined by [expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs), are driven by the `Parser` in [parser/mod.rs](/docs/quadratic-core/src/formulas/parser/mod.rs), and implement the trait in [rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs). The tokens they match are produced by [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs), the nodes they build are defined in [ast.rs](/docs/quadratic-core/src/formulas/ast.rs), and the spans they attach come from [span.rs](/docs/quadratic-core/src/formulas/span.rs).

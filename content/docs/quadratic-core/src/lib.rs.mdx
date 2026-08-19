@@ -1,15 +1,39 @@
 ---
 title: "lib.rs"
-description: "Rust module lib.rs of the quadratic-core formula engine."
+description: "The wasm-bindgen surface of quadratic-core: eval_formula, parse_formula, formula_docs, adjust/relocate, and the JsGridProxy cell bridge."
 source: "quadratic-core/src/lib.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`lib.rs` is the crate root of **quadratic-core**, the Rust formula engine that
+ships to the browser as WebAssembly. Everything the SvelteKit app can call
+lives here: each exported function is annotated with `#[wasm_bindgen]`, takes
+plain numbers and strings, and hands back a `JsValue` serialized by
+`serde_wasm_bindgen`.
 
-````rust lib.rs -n
+The file has two halves. One is the exported API — evaluate a formula, parse
+one, list the built-in functions, rewrite A1 references after an edit. The
+other is `JsGridProxy`: the adapter that lets Rust ask JavaScript for a cell
+value while evaluation is in flight, which is what makes the whole thing
+async.
+
+<Scrollycoding>
+
+## !!steps Crate root and the wasm greeting
+
+The module tree is small: `util` is declared with `#[macro_use]` so its
+`jsexpr!`, `col!` and `pos!` macros are visible crate-wide, `formulas` holds
+the lexer, parser, AST and function library, while `cell` and `position` are
+private modules whose types are re-exported. `QUADRANT_SIZE` fixes the grid's
+16-by-16 quadrant blocks that [position.rs](/docs/quadratic-core/src/position.rs)
+uses.
+
+The `extern "C"` block is the one import going the other way: it binds
+JavaScript's `console.log` into Rust under the name `log`. `hello()` is
+exported back out and called once by the app right after the wasm module
+initializes, so a successful load is visible in the browser console.
+
+```rust ! lib.rs
 #![warn(rust_2018_idioms, clippy::semicolon_if_nothing_returned)]
 #![allow(clippy::diverging_sub_expression, clippy::match_like_matches_macro)]
 
@@ -29,6 +53,7 @@ pub use cell::{Cell, CellTypes, JsCell};
 use formulas::{GridProxy, Value};
 pub use position::Pos;
 
+// !mark
 pub const QUADRANT_SIZE: u64 = 16;
 
 #[wasm_bindgen]
@@ -42,19 +67,26 @@ extern "C" {
 #[wasm_bindgen]
 pub fn hello() {
     // say hello, when loaded successfully
+    // !mark
     log("[WASM/Rust] quadratic-core ready");
 }
+```
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct JsFormulaResult {
-    pub cells_accessed: Vec<[i64; 2]>,
-    pub success: bool,
-    pub error_span: Option<[usize; 2]>,
-    pub error_msg: Option<String>,
-    pub output_value: Option<String>,
-    pub array_output: Option<Vec<Vec<String>>>,
-}
+## !!steps Evaluating a formula
 
+`eval_formula` is the engine's main entry point. Its coordinates arrive as
+`f64` because that is what JavaScript numbers are; they are cast to `i64` and
+packed into a `Pos`. The fourth argument is a live JavaScript function —
+`js_sys::Function` — which the app supplies as an async rectangle accessor.
+
+Parsing and evaluation are one expression: parse against `pos` (relative
+references need the formula cell as their base), then `await` the evaluation
+with the proxy passed in mutably. Because the proxy records every cell it was
+asked for, the accessed positions can be drained straight out of it afterwards
+and flattened into `[x, y]` pairs — that list is how the app knows which cells
+this formula depends on.
+
+```rust ! lib.rs
 /// Evaluates a formula and returns a formula result.
 #[wasm_bindgen]
 pub async fn eval_formula(
@@ -68,6 +100,7 @@ pub async fn eval_formula(
     let y = y as i64;
     let pos = Pos { x, y };
 
+    // !mark(1:4)
     let formula_result = match formulas::parse_formula(formula_string, pos) {
         Ok(formula) => formula.eval(&mut grid_proxy, pos).await,
         Err(e) => Err(e),
@@ -78,11 +111,41 @@ pub async fn eval_formula(
         .map(|pos| [pos.x, pos.y])
         .collect_vec();
 
+    // ...
+```
+
+## !!steps Shaping the result for JavaScript
+
+`JsFormulaResult` is a flat, JSON-friendly record: success flag, the accessed
+cells, an optional error, and *two* optional output slots. It is private to
+the crate but its serialized shape is mirrored on the TypeScript side by
+`RunFormulaResult` in [runFormula.ts](/docs/src/lib/formulas/runFormula.ts).
+
+The two output slots exist because a formula can produce either a scalar or a
+spilled range. `Value::Array` is stringified row by row into
+`Vec<Vec<String>>` and lands in `array_output`; anything else is stringified
+once into `output_value`. Exactly one of the two is `Some` on success, so the
+caller can tell a spill from a single value without inspecting types.
+
+```rust ! lib.rs
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct JsFormulaResult {
+    pub cells_accessed: Vec<[i64; 2]>,
+    pub success: bool,
+    pub error_span: Option<[usize; 2]>,
+    pub error_msg: Option<String>,
+    pub output_value: Option<String>,
+    pub array_output: Option<Vec<Vec<String>>>,
+}
+
+// ...
+
     let result = match formula_result {
         Ok(formula_output) => {
             let mut output_value = None;
             let mut array_output = None;
             match formula_output.inner {
+                // !mark
                 Value::Array(a) => {
                     array_output = Some(
                         a.iter()
@@ -101,9 +164,25 @@ pub async fn eval_formula(
                 array_output,
             }
         }
+```
+
+## !!steps When evaluation fails
+
+Errors never cross the wasm boundary as exceptions. A failed parse or a failed
+evaluation becomes the same record with `success: false`, the error message as
+a string, and the error's byte span reduced to a `[start, end]` pair so the
+editor can underline the offending text.
+
+`cells_accessed` is filled in on the error path too: a formula that read three
+cells and then divided by zero still depends on those three cells. The whole
+struct is converted in one call to `serde_wasm_bindgen::to_value`, which is
+what makes the return type a bare `JsValue`.
+
+```rust ! lib.rs
         Err(error) => JsFormulaResult {
             cells_accessed,
             success: false,
+            // !mark
             error_span: error.span.map(|span| [span.start, span.end]),
             error_msg: Some(error.msg.to_string()),
             output_value: None,
@@ -113,87 +192,26 @@ pub async fn eval_formula(
 
     serde_wasm_bindgen::to_value(&result).unwrap()
 }
+```
 
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-pub struct JsFormulaParseResult {
-    pub parse_error_msg: Option<String>,
-    pub parse_error_span: Option<formulas::Span>,
+## !!steps The JsGridProxy bridge
 
-    pub cell_refs: Vec<JsCellRefSpan>,
-}
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-pub struct JsCellRefSpan {
-    pub span: formulas::Span,
-    pub cell_ref: formulas::RangeRef,
-}
-impl From<formulas::Spanned<formulas::RangeRef>> for JsCellRefSpan {
-    fn from(value: formulas::Spanned<formulas::RangeRef>) -> Self {
-        JsCellRefSpan {
-            span: value.span,
-            cell_ref: value.inner,
-        }
-    }
-}
+This is the seam between the two languages. `JsGridProxy` holds the JavaScript
+callback the app handed to `eval_formula`, plus a `HashSet` of every `Pos` it
+has been asked about. Recording happens in `get_cell_jsvalue` *before* the
+call, so a cell counts as a dependency even when it turns out to be empty.
 
-/// Parses a formula and returns a partial result.
-///
-/// Example output:
-/// ```json
-/// {
-///   "parse_error_msg": "Bad argument count",
-///   "parse_error_span": { "start": 12, "end": 46 },
-///   "cell_refs": [
-///     {
-///       "span": { "start": 1, "end": 4 },
-///       "cell_ref": {
-///         "Cell": {
-///           "x": { "Relative": 0 },
-///           "y": { "Absolute": 1 }
-///         }
-///       }
-///     },
-///     {
-///       "span": { "start": 15, "end": 25 },
-///       "cell_ref": {
-///         "CellRange": [
-///           {
-///             "x": { "Absolute": 0 },
-///             "y": { "Relative": -2 }
-///           },
-///           {
-///             "x": { "Absolute": 0 },
-///             "y": { "Relative": 2 }
-///           }
-///         ]
-///       }
-///     }
-///   ]
-/// }
-/// ```
-///
-/// `parse_error_msg` may be null, and `parse_error_span` may be null. Even if
-/// `parse_error_span`, `parse_error_msg` may still be present.
-#[wasm_bindgen]
-pub async fn parse_formula(formula_string: &str, x: f64, y: f64) -> JsValue {
-    let x = x as i64;
-    let y = y as i64;
-    let pos = Pos { x, y };
+The call itself is written with the crate's `jsexpr!` macro from
+[util.rs](/docs/quadratic-core/src/util.rs), which mimics JavaScript syntax:
+invoke the function with four coordinates, `await` the returned promise, take
+element `0`, read its `value` property. The engine only ever needs one cell,
+so it asks for the degenerate rectangle from `(x, y)` to `(x, y)`.
+Implementing [GridProxy](/docs/quadratic-core/src/formulas/grid_proxy.rs)
+requires `#[async_trait(?Send)]` because `JsValue` cannot move between
+threads; `get` simply drops both failure modes — a rejected promise and a
+non-string value — into `None`, which the evaluator reads as an empty cell.
 
-    let parse_error = formulas::parse_formula(formula_string, pos).err();
-
-    let result = JsFormulaParseResult {
-        parse_error_msg: parse_error.as_ref().map(|e| e.msg.to_string()),
-        parse_error_span: parse_error.and_then(|e| e.span),
-
-        cell_refs: formulas::find_cell_references(formula_string, pos)
-            .into_iter()
-            .map(|r| r.into())
-            .collect(),
-    };
-
-    serde_wasm_bindgen::to_value(&result).unwrap()
-}
-
+```rust ! lib.rs
 #[derive(Debug, Clone)]
 struct JsGridProxy {
     grid_accessor_fn: js_sys::Function,
@@ -209,12 +227,14 @@ impl JsGridProxy {
 
     async fn get_cell_jsvalue(&mut self, pos: Pos) -> Result<JsValue, JsValue> {
         // Record that we accessed this cell.
+        // !mark
         self.cells_accessed.insert(pos);
 
         let grid_accessor_fn = self.grid_accessor_fn.clone();
         let x: JsValue = pos.x.into();
         let y: JsValue = pos.y.into();
         // Access a rectangle of one cell, ranging from (x, y) to (x, y).
+        // !mark
         Ok(jsexpr!(grid_accessor_fn(x, y, x, y).await[0].value))
     }
 }
@@ -224,7 +244,77 @@ impl GridProxy for JsGridProxy {
         self.get_cell_jsvalue(pos).await.ok()?.as_string()
     }
 }
+```
 
+## !!steps Parsing without evaluating
+
+`parse_formula` runs the front end only — no grid access, so it needs no
+callback and returns instantly. It reports two independent things: whether
+parsing failed (message plus span) and where every cell reference sits in the
+source text.
+
+`find_cell_references` returns `Spanned<RangeRef>` values, which the `From`
+impl above flattens into `JsCellRefSpan`. The doc comment on the function
+carries a full JSON example of the output; it is generated by the
+`example_parse_formula_output` test at the bottom of the file rather than
+written by hand. Note the two error fields are independent: a message can be
+present with no span.
+
+```rust ! lib.rs
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct JsFormulaParseResult {
+    pub parse_error_msg: Option<String>,
+    pub parse_error_span: Option<formulas::Span>,
+
+    pub cell_refs: Vec<JsCellRefSpan>,
+}
+#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+pub struct JsCellRefSpan {
+    pub span: formulas::Span,
+    pub cell_ref: formulas::RangeRef,
+}
+
+// ...
+
+#[wasm_bindgen]
+pub async fn parse_formula(formula_string: &str, x: f64, y: f64) -> JsValue {
+    let x = x as i64;
+    let y = y as i64;
+    let pos = Pos { x, y };
+
+    let parse_error = formulas::parse_formula(formula_string, pos).err();
+
+    let result = JsFormulaParseResult {
+        parse_error_msg: parse_error.as_ref().map(|e| e.msg.to_string()),
+        parse_error_span: parse_error.and_then(|e| e.span),
+
+        // !mark(1:4)
+        cell_refs: formulas::find_cell_references(formula_string, pos)
+            .into_iter()
+            .map(|r| r.into())
+            .collect(),
+    };
+
+    serde_wasm_bindgen::to_value(&result).unwrap()
+}
+```
+
+## !!steps Function documentation for the app
+
+`formula_docs` walks `formulas::functions::CATEGORIES`, skips any category
+whose `include_in_docs` flag is false, sorts each category's functions by
+name, and flattens everything into one `Vec<JsFunctionDoc>`. The category name
+is repeated on every entry, so the JavaScript side can group without a nested
+structure.
+
+Each entry carries the signature strings, the examples, and the markdown doc
+string that the function library declares. The app caches the result once and
+renders it in
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte); the same
+data also feeds the offline reference produced by
+[docgen.rs](/docs/quadratic-core/src/bin/docgen.rs).
+
+```rust ! lib.rs
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct JsFunctionDoc {
     pub category: String,
@@ -240,6 +330,7 @@ pub struct JsFunctionDoc {
 pub fn formula_docs() -> JsValue {
     let mut out: Vec<JsFunctionDoc> = vec![];
     for category in formulas::functions::CATEGORIES {
+        // !mark
         if !category.include_in_docs {
             continue;
         }
@@ -257,13 +348,25 @@ pub fn formula_docs() -> JsValue {
     }
     serde_wasm_bindgen::to_value(&out).unwrap()
 }
+```
 
-/// Rewrites the A1 cell references in a formula after rows or columns are
-/// inserted or deleted, preserving `$` absolute markers and `n` negatives.
-///
-/// `(cell_x, cell_y)` is the formula cell's position BEFORE the shift;
-/// coordinates at or beyond `at` on the given axis move by `delta`.
-/// References into a deleted band are left unchanged.
+## !!steps Adjusting references after an insert or delete
+
+When a row or column is inserted or deleted, every formula on the sheet has to
+be rewritten. `adjust_formula` takes the formula cell's position *before* the
+edit, a flag for which axis moved, the coordinate `at` where the change
+happened, and the signed `delta`. The `shift` closure is the whole rule:
+coordinates at or past `at` move by `delta`, everything before it stays.
+
+The formula cell itself moves too, which is why `new_base` is computed
+alongside. That matters for relative references, which are stored as offsets
+from the base: `adjust_coord` resolves the reference to an absolute target,
+shifts that target, and then re-expresses it in the same flavour it had —
+relative offsets are re-derived against `new_base`, absolute coordinates keep
+their shifted value. `adjust_cell` (just below) applies this to whichever axis
+moved and leaves the other one untouched.
+
+```rust ! lib.rs
 #[wasm_bindgen]
 pub fn adjust_formula(
     formula_string: &str,
@@ -281,6 +384,7 @@ pub fn adjust_formula(
     };
     let at = at as i64;
     let delta = delta as i64;
+    // !mark
     let shift = |v: i64| if v >= at { v + delta } else { v };
     let new_base = Pos {
         x: if is_column { shift(old_base.x) } else { old_base.x },
@@ -295,45 +399,27 @@ pub fn adjust_formula(
             CellRefCoord::Absolute(_) => CellRefCoord::Absolute(target),
         }
     };
-    let adjust_cell = |c: CellRef| {
-        if is_column {
-            CellRef {
-                x: adjust_coord(c.x, old_base.x, new_base.x),
-                y: c.y,
-            }
-        } else {
-            CellRef {
-                x: c.x,
-                y: adjust_coord(c.y, old_base.y, new_base.y),
-            }
-        }
-    };
 
-    let mut refs = formulas::find_cell_references(formula_string, old_base);
-    refs.sort_by_key(|r| r.span.start);
+    // ...
+```
 
-    let mut result = formula_string.to_string();
-    // splice right-to-left so earlier spans stay valid
-    for r in refs.iter().rev() {
-        let adjusted = match r.inner {
-            RangeRef::Cell(c) => RangeRef::Cell(adjust_cell(c)),
-            RangeRef::CellRange(a, b) => RangeRef::CellRange(adjust_cell(a), adjust_cell(b)),
-            RangeRef::RowRange(a, b) if !is_column => {
-                RangeRef::RowRange(adjust_coord(a, old_base.y, new_base.y), adjust_coord(b, old_base.y, new_base.y))
-            }
-            RangeRef::ColRange(a, b) if is_column => {
-                RangeRef::ColRange(adjust_coord(a, old_base.x, new_base.x), adjust_coord(b, old_base.x, new_base.x))
-            }
-            other => other,
-        };
-        result.replace_range(
-            r.span.start as usize..r.span.end as usize,
-            &adjusted.a1_string(new_base),
-        );
-    }
-    result
-}
+## !!steps Relocating a formula on copy
 
+`relocate_formula` handles fill and paste, and it is strikingly short because
+the reference representation already does the work. Relative coordinates are
+stored as offsets from the base cell, absolute ones as fixed values, so simply
+re-rendering an untouched `RangeRef` against `new_base` moves the relative
+parts by the copy distance while `$` references print unchanged.
+
+Both rewriting functions share the same splicing discipline: find the
+references, sort them by span start, then walk the list **in reverse** and
+`replace_range` each span. Editing right to left keeps every earlier span
+valid even when the replacement text changes length, and any text that is not
+a cell reference — string literals, function names, operators — is never
+touched. `adjust_formula` ends with the same loop, plus a `match` that maps
+each `RangeRef` variant through `adjust_cell`.
+
+```rust ! lib.rs
 /// Rewrites a formula's A1 references for a copy from one cell to another
 /// (fill/paste semantics): relative references follow the copy offset,
 /// `$` absolute references stay put.
@@ -360,6 +446,7 @@ pub fn relocate_formula(
     let mut result = formula_string.to_string();
     // relative coords are stored as offsets, so re-rendering the same
     // RangeRef against the new base moves them; absolute coords ignore base
+    // !mark(1:6)
     for r in refs.iter().rev() {
         result.replace_range(
             r.span.start as usize..r.span.end as usize,
@@ -368,7 +455,22 @@ pub fn relocate_formula(
     }
     result
 }
+```
 
+## !!steps Column names and the unit tests
+
+Two thin wrappers finish the exported surface. They forward to the real
+implementations in [util.rs](/docs/quadratic-core/src/util.rs) and only adapt
+types at the boundary: `f64` in, floored to `i64`; `Option<i64>` out, widened
+to `Option<f64>` so wasm-bindgen can render it as `null`.
+
+The test module exercises the two rewriting functions directly against string
+literals, which doubles as the clearest specification of their behaviour: a
+fill down by one row moves `SUM(B2:C2)` to `SUM(B3:C3)` while `$B$0` stays
+put. The `test_adjust_formula` cases cover the mirror-image scenarios for
+inserts and deletes on both axes.
+
+```rust ! lib.rs
 /// Returns a column's name from its number.
 #[wasm_bindgen]
 pub fn column_name(n: f64) -> String {
@@ -380,13 +482,12 @@ pub fn column_from_name(s: &str) -> Option<f64> {
     Some(util::column_from_name(s)? as f64)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ...
 
     #[test]
     fn test_relocate_formula() {
         // fill down by one row: relative refs follow, absolute stays
+        // !mark(1:4)
         assert_eq!(
             "SUM(B3:C3) + $B$0",
             relocate_formula("SUM(B2:C2) + $B$0", 5.0, 2.0, 5.0, 3.0)
@@ -402,75 +503,19 @@ mod tests {
             relocate_formula("$B1", 0.0, 1.0, 4.0, 3.0)
         );
     }
+```
 
-    #[test]
-    fn test_adjust_formula() {
-        // insert a row at y=3: cell (5,3) and its refs move down together
-        assert_eq!(
-            "SUM(B4:C4)",
-            adjust_formula("SUM(B3:C3)", 5.0, 3.0, false, 3.0, 1.0)
-        );
-        // refs above the insertion point stay put
-        assert_eq!(
-            "SUM(B2:C2)",
-            adjust_formula("SUM(B2:C2)", 5.0, 5.0, false, 3.0, 1.0)
-        );
-        // insert a column at x=1: absolute and relative refs both shift
-        assert_eq!(
-            "$C$3 + C3",
-            adjust_formula("$B$3 + B3", 5.0, 3.0, true, 1.0, 1.0)
-        );
-        // delete two columns before the refs
-        assert_eq!(
-            "SUM(C0:C9)",
-            adjust_formula("SUM(E0:E9)", 7.0, 0.0, true, 2.0, -2.0)
-        );
-        // formula cell moves but target does not: relative offset re-derived
-        assert_eq!(
-            "A0",
-            adjust_formula("A0", 0.0, 5.0, false, 3.0, 1.0)
-        );
-        // untouched text (strings, functions) survives splicing
-        assert_eq!(
-            "IF(D3 > 0, \"up\", CONCAT(D3, \"!\"))",
-            adjust_formula("IF(C3 > 0, \"up\", CONCAT(C3, \"!\"))", 0.0, 0.0, true, 2.0, 1.0)
-        );
-    }
+</Scrollycoding>
 
-    /// Run this test with `--nocapture` to generate the example for the
-    /// `parse_formula()` docs.
-    #[test]
-    fn example_parse_formula_output() {
-        use crate::formulas::{CellRef, CellRefCoord, RangeRef, Span};
-
-        let example_result = JsFormulaParseResult {
-            parse_error_msg: Some("Bad argument count".to_string()),
-            parse_error_span: Some(Span { start: 12, end: 46 }),
-            cell_refs: vec![
-                JsCellRefSpan {
-                    span: Span { start: 1, end: 4 },
-                    cell_ref: RangeRef::Cell(CellRef {
-                        x: CellRefCoord::Relative(0),
-                        y: CellRefCoord::Absolute(1),
-                    }),
-                },
-                JsCellRefSpan {
-                    span: Span { start: 15, end: 25 },
-                    cell_ref: RangeRef::CellRange(
-                        CellRef {
-                            x: CellRefCoord::Absolute(0),
-                            y: CellRefCoord::Relative(-2),
-                        },
-                        CellRef {
-                            x: CellRefCoord::Absolute(0),
-                            y: CellRefCoord::Relative(2),
-                        },
-                    ),
-                },
-            ],
-        };
-
-        println!("{}", serde_json::to_string_pretty(&example_result).unwrap());
-    }
-}
-````
+On the JavaScript side, every export here is imported by
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts), which also supplies the
+rectangle accessor that `JsGridProxy` calls back into. The parsing and
+evaluation machinery lives under
+[formulas/mod.rs](/docs/quadratic-core/src/formulas/mod.rs) —
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) for evaluation,
+[cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs) for the A1
+reference types this file rewrites, and
+[lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs) for the separately
+exported completion provider. The two small types re-exported at the top get
+their own pages: [cell.rs](/docs/quadratic-core/src/cell.rs) and
+[position.rs](/docs/quadratic-core/src/position.rs).

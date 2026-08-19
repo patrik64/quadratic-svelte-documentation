@@ -1,15 +1,40 @@
 ---
 title: "mod.rs"
-description: "Parser that turns a flat list of tokens directly into an AST."
+description: "The parser entry point: a Copy cursor over lexer tokens that applies syntax rules and backtracks when they fail."
 source: "quadratic-core/src/formulas/parser/mod.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The module doc line says it plainly: *"Parser that turns a flat list of tokens
+directly into an AST."* There is no intermediate parse tree and no generated
+grammar. [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs) produces a
+lossless token list, this file wraps that list in a cursor, and the
+`SyntaxRule` implementations under
+[rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs) pull
+[AST](/docs/quadratic-core/src/formulas/ast.rs) nodes off it.
 
-````rust mod.rs -n
+So the file is really two things: the public entry points that the rest of the
+crate calls, and the `Parser` type — cursor movement, span bookkeeping,
+backtracking, and error construction — that every grammar rule is written
+against.
+
+<Scrollycoding>
+
+## !!steps Two ways in
+
+`parse_formula` is the entry point used for evaluation: it parses one
+`Expression` and wraps it in a `Formula`. `parse_exactly_one` is the shared
+plumbing — tokenize, build a `Parser`, apply the rule, then `ok_if_not_eof`, so
+trailing junk after a complete expression is an error rather than silently
+ignored.
+
+Note the two module declarations. `#[macro_use] mod macros;` makes
+[macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs) available to the
+grammar below it, and `pub mod rules;` exposes the rule set. `use super::*`
+pulls in `Pos`, `Span`, `Spanned`, `FormulaResult` and friends from
+[formulas/mod.rs](/docs/quadratic-core/src/formulas/mod.rs).
+
+```rust ! mod.rs
 //! Parser that turns a flat list of tokens directly into an AST.
 
 use itertools::Itertools;
@@ -31,13 +56,31 @@ pub fn parse_formula(source: &str, pos: Pos) -> FormulaResult<ast::Formula> {
 fn parse_exactly_one<R: SyntaxRule>(source: &str, pos: Pos, rule: R) -> FormulaResult<R::Output> {
     let tokens = lexer::tokenize(source).collect_vec();
     let mut p = Parser::new(source, &tokens, pos);
+    // !mark
     p.parse(rule).and_then(|output| p.ok_if_not_eof(output))
 }
+```
 
+## !!steps Scanning for cell references
+
+The second entry point does not build an AST at all. It sweeps the token list
+looking for anything that parses as a `CellRangeReference`, keeping the
+`Spanned` results so callers know where in the source each reference sits.
+
+Two details make it robust on formulas that are still being typed. Skip tokens
+are filtered out up front, so a reference written as `$A0 : nQ7` still matches
+across the spaces. And when a match fails, `try_parse` has already rewound the
+cursor, so the `else` branch just steps forward one token and tries again —
+malformed fragments are stepped over instead of aborting the scan.
+[lib.rs](/docs/quadratic-core/src/lib.rs) exposes this to JavaScript for
+reference highlighting and for rewriting references when a formula is copied.
+
+```rust ! mod.rs
 pub fn find_cell_references(source: &str, pos: Pos) -> Vec<Spanned<RangeRef>> {
     let mut ret = vec![];
 
     let tokens = lexer::tokenize(source)
+        // !mark
         .filter(|t| !t.inner.is_skip())
         .collect_vec();
     let mut p = Parser::new(source, &tokens, pos);
@@ -52,7 +95,23 @@ pub fn find_cell_references(source: &str, pos: Pos) -> Vec<Spanned<RangeRef>> {
 
     ret
 }
+```
 
+## !!steps A cursor that remembers where the formula lives
+
+`Parser` is four fields and, importantly, `Copy` — which is what makes cheap
+backtracking and lookahead possible later on. The cursor is an
+`Option<usize>`: `None` means *before the start*, which is a distinct state from
+"at token 0" and is the position a fresh parser normally rests in.
+
+`pos` is the cell the formula was typed into. Relative references are stored as
+offsets from it, so the parser has to carry it all the way down to
+[cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs). The constructor
+also handles the spreadsheet habit of starting a formula with `=`: it steps to
+the first meaningful token and, if that token is not `=`, rewinds the cursor to
+`None` so nothing has been consumed.
+
+```rust ! mod.rs
 /// Token parser used to assemble an AST.
 #[derive(Debug, Copy, Clone)]
 pub struct Parser<'a> {
@@ -78,6 +137,7 @@ impl<'a> Parser<'a> {
         };
 
         // Skip leading `=`
+        // !mark(1:5)
         ret.next();
         if ret.token_str() != "=" {
             // Oops, no leading `=` so go back
@@ -85,7 +145,22 @@ impl<'a> Parser<'a> {
         }
         ret
     }
+```
 
+## !!steps Every token knows its slice of the source
+
+Because the lexer keeps tokens as `Spanned<Token>`, the parser never has to
+carry around owned strings: `token_str` asks for the current span and slices the
+original source. That is how a rule reads the literal text of a number, a string
+literal, or a cell reference.
+
+`span()` is careful about the two off-the-end states, and both matter for error
+messages. Before the start it returns an empty span at offset 0; past the last
+token it returns an empty span at the end of the source. So an error raised at
+EOF still gets a caret position the editor can point at, rather than a panic or
+a zero span at the wrong end.
+
+```rust ! mod.rs
     /// Returns the token at the cursor.
     pub fn current(self) -> Option<Token> {
         Some(self.tokens.get(self.cursor?)?.inner)
@@ -100,6 +175,7 @@ impl<'a> Parser<'a> {
             } else {
                 // This is the end of the region; return an empty span at the
                 // end of the region.
+                // !mark
                 Span::empty(self.source_str.len())
             }
         } else {
@@ -114,7 +190,23 @@ impl<'a> Parser<'a> {
         let Span { start, end } = self.span();
         &self.source_str[start..end]
     }
+```
 
+## !!steps Whitespace is skipped by moving twice
+
+The token list is lossless — it contains whitespace and comments — so the parser
+provides two layers of movement. The `_noskip` pair moves exactly one token and
+is where the `None` cursor is handled (`unwrap_or(0)` for the first step forward,
+`checked_sub` so stepping back before the start is a no-op that lands on `None`).
+
+`next` and `prev` then loop over the raw movement until `is_skip` is false, and
+that is what the grammar rules actually call. Two more helpers round this out:
+`is_done` reports that the cursor has moved past the last token (it is
+deliberately false for the before-the-start state), and `peek_next` /
+`peek_next_span` copy the parser, advance the copy, and read from it — lookahead
+with no rollback needed, because `Parser` is `Copy`.
+
+```rust ! mod.rs
     /// Moves the cursor forward without skipping whitespace/comments and then
     /// returns the token at the cursor.
     pub fn next_noskip(&mut self) -> Option<Token> {
@@ -122,13 +214,7 @@ impl<'a> Parser<'a> {
         self.cursor = Some(self.cursor.map(|idx| idx + 1).unwrap_or(0));
         self.current()
     }
-    /// Moves the cursor back without skipping whitespace/comments and then
-    /// returns the token at the cursor.
-    pub fn prev_noskip(&mut self) -> Option<Token> {
-        // Subtract 1 if possible.
-        self.cursor = self.cursor.and_then(|idx| idx.checked_sub(1));
-        self.current()
-    }
+    // ...
     /// Returns whether the current token would normally be skipped.
     pub fn is_skip(self) -> bool {
         if let Some(t) = self.current() {
@@ -137,45 +223,38 @@ impl<'a> Parser<'a> {
             false
         }
     }
-    /// Returns whether the end of the input has been reached.
-    pub fn is_done(self) -> bool {
-        self.cursor.is_some() && self.current().is_none()
-    }
-
+    // ...
     /// Moves the cursor forward and then returns the token at the cursor.
     pub fn next(&mut self) -> Option<Token> {
         loop {
             self.next_noskip();
+            // !mark
             if !self.is_skip() {
                 return self.current();
             }
         }
     }
-    /// Moves the cursor back and then returns the token at the cursor.
-    pub fn prev(&mut self) -> Option<Token> {
-        loop {
-            self.prev_noskip();
-            if !self.is_skip() {
-                return self.current();
-            }
-        }
-    }
+```
 
-    /// Returns the token after the one at the cursor, without mutably moving
-    /// the cursor.
-    pub fn peek_next(self) -> Option<Token> {
-        let mut tmp = self;
-        tmp.next()
-    }
+## !!steps Trying a rule, and undoing it
 
-    /// Returns the span of the token after the one at the cursor, without
-    /// mutably moving the cursor.
-    pub fn peek_next_span(self) -> Span {
-        let mut tmp = self;
-        tmp.next();
-        tmp.span()
-    }
+This pair is the heart of the parser. A `SyntaxRule` answers two questions:
+`prefix_matches` — does the upcoming token look like the start of this
+construct? — and `consume_match`, which does the real work and is explicitly
+allowed to leave the cursor half-advanced when it fails.
 
+`try_parse` reconciles those. If the prefix does not match it returns `None`
+without touching the cursor. If it does, the parser is copied into `old_state`,
+the rule runs, and on `Err` the copy is written back — so a failed attempt
+leaves no trace and the caller can try the next alternative. `parse` is the
+committed version: no alternatives left, so a non-match becomes an error
+immediately. The three-valued return of `try_parse` (`None`, `Some(Ok)`,
+`Some(Err)`) is exactly what
+[macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs) chains together
+with `or_else`. The doc comment still names `might_match()`, the rule method's
+older name.
+
+```rust ! mod.rs
     /// Attempts to apply a syntax rule starting at the cursor, returning an
     /// error if it fails. This should only be used when this syntax rule
     /// represents the only valid parse; if there are other options,
@@ -188,6 +267,7 @@ impl<'a> Parser<'a> {
     /// implementation returned false).
     pub fn try_parse<R: SyntaxRule>(&mut self, rule: R) -> Option<FormulaResult<R::Output>> {
         rule.prefix_matches(*self).then(|| {
+            // !mark(1:6)
             let old_state = *self; // Save state.
             let ret = rule.consume_match(self);
             if ret.is_err() {
@@ -197,7 +277,25 @@ impl<'a> Parser<'a> {
             ret
         })
     }
+```
 
+## !!steps Errors that point at the next token
+
+Three small helpers, all of which lean on the fact that `Parser` is `Copy`:
+each takes `self` by value, advances its own copy, and reads the span from
+there. That is why a message lands on the *offending* token rather than on the
+last token that parsed cleanly — and why calling them does not disturb the real
+cursor.
+
+`expected` is what a rule calls when the input does not match it;
+`ok_if_not_eof` is the trailing-junk check `parse_exactly_one` uses, reporting
+`Unexpected` for whatever came after a complete expression. The `TODO` notes
+that `expected` would return `FormulaResult<!>` if the never type were stable —
+today it is generic over `T` so it can be returned from any rule. The error
+types themselves live in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).
+
+```rust ! mod.rs
     /// Returns an error describing that `expected` was expected.
     pub fn expected<T>(self, expected: impl ToString) -> FormulaResult<T> {
         // TODO: when #[feature(never_type)] stabalizes, use that here and
@@ -206,6 +304,7 @@ impl<'a> Parser<'a> {
     }
     /// Returns an error describing that EOF was expected.
     pub fn ok_if_not_eof<T>(mut self, or_else: T) -> FormulaResult<T> {
+        // !mark(1:2)
         if let Some(tok) = self.next() {
             Err(FormulaErrorMsg::Unexpected(tok.to_string().into()).with_span(self.span()))
         } else {
@@ -222,4 +321,25 @@ impl<'a> Parser<'a> {
         .with_span(self.span())
     }
 }
-````
+```
+
+</Scrollycoding>
+
+The parser is documented as one story across four pages. This file is the
+entry; the grammar productions live in
+[rules/mod.rs](/docs/quadratic-core/src/formulas/parser/rules/mod.rs) (the
+`SyntaxRule` trait itself),
+[rules/atoms.rs](/docs/quadratic-core/src/formulas/parser/rules/atoms.rs)
+(literals and cell references),
+[rules/expression.rs](/docs/quadratic-core/src/formulas/parser/rules/expression.rs)
+(operator precedence) and
+[rules/combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs)
+(lists, delimiters, `map`); the alternation macro they all use is
+[macros.rs](/docs/quadratic-core/src/formulas/parser/macros.rs).
+
+Upstream is [lexer.rs](/docs/quadratic-core/src/formulas/lexer.rs) and
+[span.rs](/docs/quadratic-core/src/formulas/span.rs); downstream is
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs). The behaviors described
+above — the leading `=`, reference resolution, and `find_cell_references` on
+malformed input — are asserted in
+[tests.rs](/docs/quadratic-core/src/formulas/tests.rs).

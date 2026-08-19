@@ -1,21 +1,37 @@
 ---
 title: "value.rs"
-description: "Rust module value.rs of the quadratic-core formula engine."
+description: "The runtime value type — strings, numbers, booleans, and 2D arrays — plus the spreadsheet-style coercions every formula function uses"
 source: "quadratic-core/src/formulas/value.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The end of the pipeline. Once
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) walks the tree, everything it
+produces and consumes is a `Value`. This file defines that type and — more
+importantly — the coercion rules that let a spreadsheet be forgiving: the string
+`"$5"` behaves as the number 5, `"TRUE"` behaves as a boolean, a blank cell
+behaves as zero.
 
-````rust value.rs -n
-use itertools::Itertools;
-use smallvec::{smallvec, SmallVec};
-use std::fmt;
+Every coercion comes in two forms: a bare one on `Value` returning
+`Result<_, FormulaErrorMsg>`, and a wrapper on `Spanned<Value>` that attaches
+the source span to any error. Function implementations use the spanned ones, so
+a type error blames the argument that caused it.
 
-use super::{FormulaErrorMsg, FormulaResult, Spanned};
+<Scrollycoding>
 
+## !!steps Five variants and a default of empty
+
+`Value` is small on purpose: two scalars plus a boolean, an array, and a
+placeholder error. Arrays are rows of values — `Vec<SmallVec<[Value; 1]>>` —
+with each row inline-allocated for the common single-column case, so a range
+that is one cell wide does not heap-allocate per row.
+
+`MissingErr` is flagged with a `TODO` to be removed or replaced by a more
+generic error type. The `Default` impl is worth noting: the default value is the
+*empty string*, not zero, which matches how a blank grid cell arrives — the
+value used everywhere blankness has to be represented.
+
+```rust ! value.rs
 const CURRENCY_PREFIX: &[char] = &['$', '¥', '£', '€'];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,6 +39,7 @@ pub enum Value {
     String(String),
     Number(f64),
     Bool(bool),
+    // !mark
     Array(Vec<SmallVec<[Value; 1]>>),
     // TODO: remove this or replace it with a more generic error type
     MissingErr,
@@ -30,15 +47,31 @@ pub enum Value {
 
 impl Default for Value {
     fn default() -> Self {
+        // !mark
         Value::String(String::new())
     }
 }
+```
 
+## !!steps Rendering a value for the grid
+
+`Display` is what the spreadsheet cell ends up showing. Booleans render in
+spreadsheet style as uppercase `TRUE` and `FALSE`, not Rust's lowercase. Numbers
+use the plain `Display` for `f64`. Arrays use the same brace-and-semicolon
+notation as array literals in the AST: elements joined by `, `, rows joined by
+`; `.
+
+The `From` impls below are the counterpart — they exist so function
+implementations can `.into()` a Rust value back into the formula world without
+naming the variant.
+
+```rust ! value.rs
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::String(s) => write!(f, "{s}"),
             Value::Number(n) => write!(f, "{n}"),
+            // !mark(1:2)
             Value::Bool(true) => write!(f, "TRUE"),
             Value::Bool(false) => write!(f, "FALSE"),
             Value::Array(rows) => {
@@ -58,22 +91,27 @@ impl From<String> for Value {
         Value::String(value)
     }
 }
-impl From<&str> for Value {
-    fn from(value: &str) -> Self {
-        Value::String(value.to_string())
-    }
-}
-impl From<f64> for Value {
-    fn from(value: f64) -> Self {
-        Value::Number(value)
-    }
-}
+// ...
 impl From<bool> for Value {
     fn from(value: bool) -> Self {
         Value::Bool(value)
     }
 }
+```
 
+## !!steps Naming types and counting numbers
+
+`type_name` supplies the human phrase for error messages — the "got" half of the
+"expected number, got boolean" errors raised throughout this file.
+
+`count_numeric` is what statistical functions need in order to divide by the
+right denominator. Its rules are all visible in the match: an empty string
+counts as zero even though it would coerce to `0.0`; an array recurses and sums
+across all its cells; anything else counts as 1 exactly when `to_number`
+succeeds. That last arm means a *string* like `"5"` still counts as numeric,
+because the test is the coercion, not the variant.
+
+```rust ! value.rs
 impl Value {
     /// Returns a human-friendly string describing the type of value.
     pub fn type_name(&self) -> &'static str {
@@ -92,20 +130,37 @@ impl Value {
     /// other values count as zero.
     pub fn count_numeric(&self) -> usize {
         match self {
+            // !mark
             Value::String(s) if s.is_empty() => 0,
             Value::Array(a) => a
                 .iter()
                 .flat_map(|row| row.iter().map(|v| v.count_numeric()))
                 .sum(),
+            // !mark
             _ if self.to_number().is_ok() => 1,
             _ => 0,
         }
     }
+```
 
+## !!steps Shape, and treating a scalar as a 1x1 array
+
+`array_size` reports `(rows, columns)` and returns `None` for scalars. Columns
+are read off the *first* row only — `a.get(0)`, falling back to an empty row —
+so the type carries no guarantee that rows are equal length; that is left to
+whatever built the array.
+
+`into_array` is the normalizing direction: an array passes through untouched,
+and any scalar is wrapped as a single row containing a single value. Functions
+that want to operate uniformly over cells call this instead of matching on the
+variant.
+
+```rust ! value.rs
     /// Returns the size `(rows, columns)` of the array if this is an array
     /// value, or `None` otherwsie.
     pub fn array_size(&self) -> Option<(usize, usize)> {
         match self {
+            // !mark
             Value::Array(a) => Some((a.len(), a.get(0).unwrap_or(&smallvec![]).len())),
             _ => None,
         }
@@ -114,14 +169,31 @@ impl Value {
     pub fn into_array(self) -> Vec<SmallVec<[Value; 1]>> {
         match self {
             Value::Array(a) => a,
+            // !mark
             v => vec![smallvec![v]],
         }
     }
+```
 
+## !!steps The forgiving number coercion
+
+This is the rule that makes formulas feel like a spreadsheet. A string is
+trimmed first; if what remains is empty the result is `0.0`, which is how blank
+cells participate in arithmetic. Then one leading currency character from
+`CURRENCY_PREFIX` — `$`, `¥`, `£`, or `€` — is stripped, so `"$5"` parses as 5.
+Whatever is left goes through Rust's `f64` parsing.
+
+A parse failure reports the *stripped* string back in the error via `{s:?}`, so
+the message quotes what was actually attempted. Booleans map to 1 and 0.
+Everything else — arrays and `MissingErr` — is an error naming its own
+`type_name`.
+
+```rust ! value.rs
     pub fn to_number(&self) -> Result<f64, FormulaErrorMsg> {
         match self {
             Value::String(s) => {
                 let mut s = s.trim();
+                // !mark(1:6)
                 if s.is_empty() {
                     return Ok(0.0);
                 }
@@ -142,9 +214,25 @@ impl Value {
             }),
         }
     }
+```
+
+## !!steps Booleans are strict, and spans get attached
+
+`to_bool` is deliberately much stricter than `to_number`: only an actual
+`Value::Bool`, or a string that is case-insensitively `TRUE` or `FALSE`. Numbers
+do not convert — `1` is not truthy here — and neither does the empty string.
+
+Then comes the `Spanned<Value>` layer. Each wrapper calls the bare coercion and
+maps the error through `with_span`, converting a `FormulaErrorMsg` into a full
+`FormulaError` pointing at the argument's source range. `to_integer` is built on
+top: coerce to `f64`, then `round` before casting, so `2.7` becomes 3 rather
+than being truncated to 2.
+
+```rust ! value.rs
     pub fn to_bool(&self) -> Result<bool, FormulaErrorMsg> {
         match self {
             Value::Bool(b) => Ok(*b),
+            // !mark(1:2)
             Value::String(s) if s.eq_ignore_ascii_case("TRUE") => Ok(true),
             Value::String(s) if s.eq_ignore_ascii_case("FALSE") => Ok(false),
             _ => Err(FormulaErrorMsg::Expected {
@@ -165,7 +253,24 @@ impl Spanned<Value> {
     pub fn to_bool(&self) -> FormulaResult<bool> {
         self.inner.to_bool().map_err(|e| e.with_span(self.span))
     }
+```
 
+## !!steps Flattening a range into a usable list
+
+Variadic functions — `SUM`, `AND`, `CONCAT` — take a mix of scalars and ranges
+and want one flat list of the type they care about. The three public helpers are
+one-liners over a shared generic, differing only in the conversion function they
+pass; `to_strings` uses `Some(x.to_string())`, so it never rejects anything.
+
+The interesting part is the filtering policy. Arrays flatten and use
+`filter_map`, silently dropping every element the conversion rejects — that is
+what makes `SUM` over a range of mixed text and numbers work. Each element is
+re-wrapped in a `Spanned` carrying the *whole argument's* span, since individual
+cells of a range have no span of their own. The leading arm gives a top-level
+empty value its own treatment: it yields nothing at all, even though `to_number`
+on that same value would return `0.0`.
+
+```rust ! value.rs
     /// Returns a flattened array of numbers, ignoring any non-numeric values.
     pub fn to_numbers(&self) -> SmallVec<[f64; 1]> {
         self.to_flat_array_of(|v| v.to_number().ok())
@@ -184,11 +289,13 @@ impl Spanned<Value> {
         match &self.inner {
             // On its own, an empty value will coerce to a number or boolean.
             // But in an array, it won't.
+            // !mark
             Value::String(s) if s.is_empty() => smallvec![],
 
             Value::Array(a) => a
                 .iter()
                 .flatten()
+                // !mark
                 .filter_map(|v| {
                     conv(&Spanned {
                         inner: v.clone(),
@@ -205,7 +312,22 @@ impl Spanned<Value> {
             Value::MissingErr => smallvec![],
         }
     }
+```
 
+## !!steps Indexing without special-casing scalars
+
+`get_array_value` is the array-mapping primitive: given a row and column it
+returns that cell, and for a non-array value it returns a clone of the value
+itself. That is what lets a function be written once against `(row, col)` and
+still work when the caller passed a plain scalar — the scalar broadcasts to
+every position.
+
+An out-of-range index on an actual array is not a user error but a bug in the
+caller, so it produces an `internal_error_value!` rather than a normal formula
+error. The returned `Spanned` inherits the parent's span, keeping error
+reporting anchored to the original argument.
+
+```rust ! value.rs
     /// Returns the value from an array if this is an array value, or the single
     /// value itself otherwise. If the array index is out of bounds, returns an
     /// internal error.
@@ -216,12 +338,29 @@ impl Spanned<Value> {
                 inner: a
                     .get(row)
                     .and_then(|row| row.get(col))
+                    // !mark
                     .ok_or_else(|| internal_error_value!("array value index out of bounds"))?
                     .clone(),
             }),
 
+            // !mark
             _ => Ok(self.clone()),
         }
     }
 }
-````
+```
+
+</Scrollycoding>
+
+Values are produced by the evaluator in
+[ast.rs](/docs/quadratic-core/src/formulas/ast.rs) and by cell reads in
+[ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs), which turns a blank cell
+into the default empty string. The flattening helpers are wrapped once in
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs), which
+maps them across an argument list for variadic functions like those in
+[functions/mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs)
+and [functions/logic.rs](/docs/quadratic-core/src/formulas/functions/logic.rs);
+`get_array_value` powers the array-mapping helpers in `ctx.rs`. `Spanned` and
+`with_span` come from
+[span.rs](/docs/quadratic-core/src/formulas/span.rs), and the error types from
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).

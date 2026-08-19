@@ -1,15 +1,34 @@
 ---
 title: "types.rs"
-description: "Types for Monaco editor LSP API. Monaco seems to use a *slightly different* protocol than standard LSP, and the only place I could find it documented was [th…"
+description: "Rust mirrors of Monaco's completion and hover types, shaped by serde so they serialize exactly like the editor's own JavaScript objects"
 source: "quadratic-core/src/formulas/lsp/types.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This file is pure data description: no logic, only structs and enums whose one
+job is to serialize into the objects the Monaco editor expects back from a
+completion or hover provider. [lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs)
+fills them in from the formula function registry and hands them to
+`serde_wasm_bindgen`.
 
-````rust types.rs -n
+Because the types cross the WASM boundary as plain JavaScript objects, the
+`serde` attributes are load-bearing — a wrong `rename_all` or a missing
+`untagged` would produce a shape the editor silently ignores.
+
+<Scrollycoding>
+
+## !!steps Monaco's own dialect
+
+The module doc is a note to future maintainers: Monaco's protocol is close to,
+but not the same as, standard LSP, and the reference is the Monaco editor docs
+rather than the LSP specification. Adding a type here means reading those docs
+and recreating the shape in Rust.
+
+The two imports say how that is done. `serde` handles the structs and the
+string-like enums; `serde_repr` exists for the enums Monaco transmits as bare
+integers, which plain `serde` would otherwise serialize as variant names.
+
+```rust ! types.rs
 //! Types for Monaco editor LSP API.
 //!
 //! Monaco seems to use a *slightly different* protocol than standard LSP, and
@@ -26,8 +45,23 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
+```
 
+## !!steps Documentation is either a string or Markdown
+
+Monaco accepts documentation as a plain string or as an object with a `value`
+field holding Markdown. `Documentation` models that with a two-variant enum, and
+`untagged` is what makes it work: without it serde would emit a wrapper naming
+the variant, and the editor would see neither shape it knows.
+
+`MarkdownString` is the object half — a single `value` field. It also serves as
+the element type of a hover's `contents` array. The formula engine always picks
+the Markdown variant, since `lsp_full_docs()` produces headed sections and a
+bulleted example list.
+
+```rust ! types.rs
 #[derive(Serialize, Deserialize, Debug, Clone)]
+// !mark
 #[serde(untagged, rename_all = "camelCase")]
 pub enum Documentation {
     String(String),
@@ -39,19 +73,50 @@ pub enum Documentation {
 pub struct MarkdownString {
     pub value: String,
 }
+```
 
+## !!steps One completion item
+
+Four of the six fields are optional, and `rename_all = "camelCase"` turns
+`insert_text` into `insertText` and `insert_text_rules` into `insertTextRules`
+on the wire — the names
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) reads.
+
+The `Default` derive is what lets the builder in
+[lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs) finish each item with
+`..Default::default()` while only naming the fields it cares about. The `TODO`
+records a known simplification: Monaco's `label` may itself be an object with a
+description and detail, and this port keeps it a plain `String`.
+
+```rust ! types.rs
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CompletionItem {
     pub detail: Option<String>,
     pub documentation: Option<Documentation>,
+    // !mark(1:2)
     pub insert_text: Option<String>,
     pub insert_text_rules: Option<CompletionItemInsertTextRule>,
     pub kind: CompletionItemKind,
     pub label: String, // TODO: can be CompletionItemLabel
 }
+```
 
+## !!steps Kinds travel as numbers
+
+This is the enum the module doc warned about. `Serialize_repr` plus
+`#[repr(u8)]` means a variant crosses the boundary as its number, not its name:
+`CompletionItemKind::Function` becomes `1`, which is what Monaco uses to choose
+the icon next to a suggestion.
+
+The discriminants are written out explicitly rather than left implicit, so the
+list stays pinned to Monaco's ordering. `Text` carries `#[default]`, so it is
+the kind `Default::default()` produces for an item that never sets one; the
+formula completions always set `Function`.
+
+```rust ! types.rs
 #[derive(Serialize_repr, Deserialize_repr, Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+// !mark
 #[repr(u8)]
 pub enum CompletionItemKind {
     Method = 0,
@@ -74,18 +139,27 @@ pub enum CompletionItemKind {
     Keyword = 17,
     #[default]
     Text = 18,
-    Color = 19,
-    File = 20,
-    Reference = 21,
-    Customcolor = 22,
-    Folder = 23,
-    TypeParameter = 24,
-    User = 25,
-    Issue = 26,
+    // ...
     Snippet = 27,
 }
+```
 
+## !!steps Insert rules as a newtype
+
+Insert text rules are a flag set rather than a closed list, so modelling them as
+an enum would be wrong. Instead they are a newtype over `u32` with
+`#[serde(transparent)]`, which serializes the struct as the bare number it
+wraps, and the named values are associated constants.
+
+Only three values are defined here: `NONE` is 0, `KEEP_WHITESPACE` is 1, and
+`INSERT_AS_SNIPPET` is 4 — non-overlapping bits, so rules could be combined.
+`INSERT_AS_SNIPPET` is the one the formula completions
+set, telling the editor that placeholders like `${1:array}` in `insertText`
+should be expanded rather than typed out literally.
+
+```rust ! types.rs
 #[derive(Serialize, Deserialize, Debug, Default, Copy, Clone, PartialEq, Eq, Hash)]
+// !mark
 #[serde(transparent)]
 pub struct CompletionItemInsertTextRule(u32);
 impl CompletionItemInsertTextRule {
@@ -93,4 +167,13 @@ impl CompletionItemInsertTextRule {
     pub const KEEP_WHITESPACE: Self = Self(1);
     pub const INSERT_AS_SNIPPET: Self = Self(4);
 }
-````
+```
+
+</Scrollycoding>
+
+Every type here is re-exported by
+[lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs) through its
+`pub use types::*;`, filled from the registry in
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs), and
+consumed on the TypeScript side by the `FormulaCompletion` interface in
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts).

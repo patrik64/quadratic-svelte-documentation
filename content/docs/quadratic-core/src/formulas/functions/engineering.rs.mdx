@@ -1,15 +1,42 @@
 ---
 title: "engineering.rs"
-description: "Engineering functions, backported from the modern quadratic-core: bitwise operations plus the DELTA/GESTEP comparators. The complex-number, Bessel, and CONVE…"
+description: "Bitwise formula functions with Excel's 2^48 operand limit and a shared shift helper, plus the DELTA and GESTEP comparators"
 source: "quadratic-core/src/formulas/functions/engineering.rs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The smallest category in the library: five bitwise functions and two
+comparators. Its module docs are explicit that this is a partial backport from
+the modern quadratic-core — the complex-number, Bessel, and `CONVERT` families
+were left unported — so what is here is exactly what the seven `FormulaFunction`
+entries below declare, and nothing more.
 
-````rust engineering.rs -n
+Registration follows the same convention as every sibling module: a `CATEGORY`
+constant pointing at a `get_functions` builder, which
+[functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs) folds
+into the global `ALL_FUNCTIONS` map. The interesting code is not in the
+functions themselves but in the two shared helpers — `bit_operand`, which
+enforces the operand domain, and `bit_shift`, which both shift functions route
+through.
+
+<Scrollycoding>
+
+## !!steps The operand domain
+
+Excel's bitwise functions are defined only on non-negative integers below
+2^48, and `bit_operand` is where that contract is enforced — once, in one
+place, for all five bitwise functions.
+
+Two details matter. `to_integer` *rounds* rather than truncating or rejecting
+(it is `to_number()?.round() as i64` over in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs)), so a fractional
+argument is quietly snapped to the nearest integer before the range check.
+And the range is half-open — `MAX_BITWISE` itself is out of bounds, so the
+largest accepted operand is 2^48 − 1, the largest value that fits in 48 bits.
+The error carries `v.span`, so the editor underlines the offending argument
+rather than the whole call.
+
+```rust ! engineering.rs
 //! Engineering functions, backported from the modern quadratic-core:
 //! bitwise operations plus the DELTA/GESTEP comparators. The complex-number,
 //! Bessel, and CONVERT families remain unported (stretch goals).
@@ -29,6 +56,7 @@ const MAX_BITWISE: i64 = 1 << 48;
 
 fn bit_operand(v: &Spanned<Value>) -> FormulaResult<i64> {
     let n = v.to_integer()?;
+    // !mark
     if !(0..MAX_BITWISE).contains(&n) {
         return Err(FormulaErrorMsg::Expected {
             expected: "integer between 0 and 2^48".into(),
@@ -38,7 +66,21 @@ fn bit_operand(v: &Spanned<Value>) -> FormulaResult<i64> {
     }
     Ok(n)
 }
+```
 
+## !!steps Three one-line functions
+
+`BITAND`, `BITOR`, and `BITXOR` are the same shape three times over, differing
+only in the Rust operator in the middle. Each is built with
+`util::array_mapped`, which wraps a closure taking a fixed-size array of
+arguments and hands it to `ctx.array_map` — so if either argument is a range,
+the whole function is broadcast element-wise over it and returns an array.
+
+Because both operands go through `bit_operand`, and `?` propagates, an
+out-of-range value anywhere in a broadcast range aborts the whole call with the
+domain error from the previous step.
+
+```rust ! engineering.rs
 fn get_functions() -> Vec<FormulaFunction> {
     vec![
         FormulaFunction {
@@ -47,6 +89,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             usages: &["a, b"],
             examples: &["BITAND(13, 25)"],
             doc: "Returns the bitwise AND of two non-negative integers.",
+            // !mark
             eval: util::array_mapped(|[a, b]| Ok(Value::Number(
                 (bit_operand(&a)? & bit_operand(&b)?) as f64
             ))),
@@ -71,6 +114,20 @@ fn get_functions() -> Vec<FormulaFunction> {
                 (bit_operand(&a)? ^ bit_operand(&b)?) as f64
             ))),
         },
+```
+
+## !!steps Two shifts, one implementation
+
+`BITLSHIFT` and `BITRSHIFT` differ by a single argument to the shared helper:
+a `direction` of `1` or `-1`. That is why a negative shift count reverses each
+function — `BITLSHIFT(16, -2)` shifts right and evaluates to `4`, exactly as
+`BITRSHIFT(16, 2)` does, which the module's own tests assert.
+
+The doc strings advertise the shift range as −53 to 53. That bound is Excel's,
+tied to the 53-bit mantissa of a double rather than to the 48-bit operand
+limit, and it is checked inside `bit_shift` rather than here.
+
+```rust ! engineering.rs
         FormulaFunction {
             name: "BITLSHIFT",
             arg_completion: "${1:number}, ${2:shift}",
@@ -78,6 +135,7 @@ fn get_functions() -> Vec<FormulaFunction> {
             examples: &["BITLSHIFT(4, 2)"],
             doc: "Shifts a number left by `shift` bits (right when negative). \
                   `shift` must be between −53 and 53.",
+            // !mark
             eval: util::array_mapped(|[n, shift]| bit_shift(&n, &shift, 1)),
         },
         FormulaFunction {
@@ -87,8 +145,68 @@ fn get_functions() -> Vec<FormulaFunction> {
             examples: &["BITRSHIFT(16, 2)"],
             doc: "Shifts a number right by `shift` bits (left when negative). \
                   `shift` must be between −53 and 53.",
+            // !mark
             eval: util::array_mapped(|[n, shift]| bit_shift(&n, &shift, -1)),
         },
+```
+
+## !!steps Inside the shift helper
+
+Only the *value* goes through `bit_operand`; the shift count gets its own
+inclusive `-53..=53` check with its own error, spanned to the shift argument.
+That is why `BITLSHIFT(1, 60)` is rejected — the operand is perfectly legal, the
+count is not.
+
+Multiplying by `direction` normalizes both functions to a single signed
+`amount`, after which the sign selects the branch. Because `amount` can never
+exceed 53 once the range check has passed, `checked_shl` — which returns `None`
+only when the count reaches the bit width of `i64` — always succeeds here, and
+`unwrap_or(0)` is a defensive fallback. Note that the check bounds the *count*,
+not the result: a large operand shifted far enough left pushes bits past the top
+of the `i64`, and those bits are discarded. The right-hand branch is safe by
+construction, since `bit_operand` has already guaranteed the value is
+non-negative.
+
+```rust ! engineering.rs
+fn bit_shift(n: &Spanned<Value>, shift: &Spanned<Value>, direction: i64) -> FormulaResult {
+    let value = bit_operand(n)?;
+    let raw_shift = shift.to_integer()?;
+    // !mark
+    if !(-53..=53).contains(&raw_shift) {
+        return Err(FormulaErrorMsg::Expected {
+            expected: "shift between -53 and 53".into(),
+            got: Some(raw_shift.to_string().into()),
+        }
+        .with_span(shift.span));
+    }
+    let amount = raw_shift * direction;
+    let result = if amount >= 0 {
+        // !mark
+        value.checked_shl(amount as u32).unwrap_or(0)
+    } else {
+        value >> ((-amount) as u32)
+    };
+    Ok(Value::Number(result as f64))
+}
+```
+
+## !!steps The comparators and their optional argument
+
+`DELTA` and `GESTEP` break the pattern: they use `util::pure_fn` rather than
+`array_mapped`, so they receive the raw argument list and call `to_number`
+themselves instead of being broadcast over arrays. Both accept one or two
+arguments, expressed as a let-else over three `next()` calls — a third argument
+makes the final slot `Some` and fails the pattern, yielding `BadArgumentCount`.
+The missing second argument defaults through `map_or` to `0.0`.
+
+The two differ only in the final comparison, and `DELTA`'s is the subtle one:
+instead of `x == y` it tests `(x - y).abs() < f64::EPSILON`. That is an
+*absolute* tolerance of about 2.2e-16, so it forgives the tiniest rounding
+residue near zero, while for large magnitudes — where the gap between adjacent
+doubles already exceeds epsilon — it degenerates to exact equality. `GESTEP` is
+a plain `x >= step`.
+
+```rust ! engineering.rs
         FormulaFunction {
             name: "DELTA",
             arg_completion: "${1:a}",
@@ -99,11 +217,13 @@ fn get_functions() -> Vec<FormulaFunction> {
             eval: util::pure_fn(|args| {
                 let span = args.span;
                 let mut a = args.inner.into_iter();
+                // !mark
                 let (Some(first), second, None) = (a.next(), a.next(), a.next()) else {
                     return Err(FormulaErrorMsg::BadArgumentCount.with_span(span));
                 };
                 let x = first.to_number()?;
                 let y = second.map_or(Ok(0.0), |v| v.to_number())?;
+                // !mark
                 Ok(Value::Number(if (x - y).abs() < f64::EPSILON { 1.0 } else { 0.0 }))
             }),
         },
@@ -124,62 +244,28 @@ fn get_functions() -> Vec<FormulaFunction> {
                 Ok(Value::Number(if x >= step { 1.0 } else { 0.0 }))
             }),
         },
-    ]
-}
+```
 
-fn bit_shift(n: &Spanned<Value>, shift: &Spanned<Value>, direction: i64) -> FormulaResult {
-    let value = bit_operand(n)?;
-    let raw_shift = shift.to_integer()?;
-    if !(-53..=53).contains(&raw_shift) {
-        return Err(FormulaErrorMsg::Expected {
-            expected: "shift between -53 and 53".into(),
-            got: Some(raw_shift.to_string().into()),
-        }
-        .with_span(shift.span));
-    }
-    let amount = raw_shift * direction;
-    let result = if amount >= 0 {
-        value.checked_shl(amount as u32).unwrap_or(0)
-    } else {
-        value >> ((-amount) as u32)
-    };
-    Ok(Value::Number(result as f64))
-}
+</Scrollycoding>
 
-#[cfg(test)]
-mod tests {
-    use crate::formulas::tests::*;
+## Implemented functions
 
-    fn eval(s: &str) -> String {
-        eval_to_string(&mut NoGrid, s)
-    }
+| Name | Purpose |
+| --- | --- |
+| BITAND | Bitwise AND of two non-negative integers below 2^48 |
+| BITOR | Bitwise OR of two non-negative integers below 2^48 |
+| BITXOR | Bitwise XOR of two non-negative integers below 2^48 |
+| BITLSHIFT | Shifts a number left by a count of −53 to 53; right when the count is negative |
+| BITRSHIFT | Shifts a number right by a count of −53 to 53; left when the count is negative |
+| DELTA | Returns 1 when two numbers are equal within one epsilon, else 0; the second defaults to 0 |
+| GESTEP | Returns 1 when a number is greater than or equal to a step, else 0; the step defaults to 0 |
 
-    #[test]
-    fn test_bitwise() {
-        assert_eq!("9", eval("BITAND(13, 25)"));
-        assert_eq!("7", eval("BITOR(5, 3)"));
-        assert_eq!("6", eval("BITXOR(5, 3)"));
-        assert_eq!("16", eval("BITLSHIFT(4, 2)"));
-        assert_eq!("4", eval("BITRSHIFT(16, 2)"));
-        assert_eq!("4", eval("BITLSHIFT(16, -2)"));
-    }
-
-    #[test]
-    fn test_bitwise_errors() {
-        assert!(crate::formulas::tests::eval(&mut NoGrid, "BITAND(-1, 3)").is_err());
-        assert!(crate::formulas::tests::eval(&mut NoGrid, "BITLSHIFT(1, 60)").is_err());
-    }
-
-    #[test]
-    fn test_delta_gestep() {
-        assert_eq!("1", eval("DELTA(5, 5)"));
-        assert_eq!("0", eval("DELTA(5, 4)"));
-        assert_eq!("0", eval("DELTA(3)"));
-        assert_eq!("1", eval("DELTA(0)"));
-        assert_eq!("1", eval("GESTEP(5, 4)"));
-        assert_eq!("0", eval("GESTEP(3, 4)"));
-        assert_eq!("0", eval("GESTEP(-1)"));
-        assert_eq!("1", eval("GESTEP(0)"));
-    }
-}
-````
+The `array_mapped` and `pure_fn` wrappers behind every `eval` come from
+[functions/util.rs](/docs/quadratic-core/src/formulas/functions/util.rs); the
+`to_integer` and `to_number` coercions that feed both helpers are defined in
+[value.rs](/docs/quadratic-core/src/formulas/value.rs), and the
+`FormulaErrorMsg` variants raised here in
+[errors.rs](/docs/quadratic-core/src/formulas/errors.rs).
+[mathematics.rs](/docs/quadratic-core/src/formulas/functions/mathematics.rs)
+holds the general numeric functions, and the registry that consumes `CATEGORY`
+is [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs).
