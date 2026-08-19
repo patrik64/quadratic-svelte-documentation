@@ -1,19 +1,39 @@
 ---
 title: "generate-examples.mjs"
-description: "Generates .grid v1.3 example files with pre-computed outputs, so the examples display correctly before anything is re-run."
+description: "Build script that writes .grid example files with results pre-computed, so examples render before anything re-runs"
 source: "scripts/generate-examples.mjs"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Example files ship as finished spreadsheets: open one from the file menu and
+the sums, lookups and spilled tables are already filled in. That only works
+because this script computes every expected result in plain JavaScript and
+bakes it into the file alongside the formula that would produce it.
 
-````js generate-examples.mjs -n
+Run with `pnpm examples`, it writes two of the files in `static/examples/`
+(`formula_tour.grid` and `javascript.grid`) — the other example grids in that
+folder are not produced here. It is a Node script, entirely separate from the
+app bundle: its only import is `node:fs`.
+
+<Scrollycoding>
+
+## !!steps A frozen clock and a cell factory
+
+`NOW` is a hard-coded timestamp rather than `Date.now()`, which makes the
+output **deterministic**: regenerating the examples produces byte-identical
+files instead of a diff full of churned `last_modified` values.
+
+`cell` is the base factory matching the `Cell` shape in
+[types.ts](/docs/src/lib/core/types.ts) — coordinates, a type defaulting to
+`TEXT`, the value stringified, and a trailing spread so richer cell kinds can
+layer extra fields on top.
+
+```js ! generate-examples.mjs
 // Generates .grid v1.3 example files with pre-computed outputs, so the
 // examples display correctly before anything is re-run.
 import { writeFileSync } from 'node:fs';
 
+// !mark
 const NOW = '2026-08-06T12:00:00.000Z';
 
 const cell = (x, y, value, extra = {}) => ({
@@ -22,13 +42,29 @@ const cell = (x, y, value, extra = {}) => ({
 	type: 'TEXT',
 	value: String(value),
 	last_modified: NOW,
+	// !mark
 	...extra
 });
+```
 
+## !!steps A formula and its answer, side by side
+
+This is the heart of the script. A formula cell carries both `formula_code` —
+what the engine would evaluate — and an `evaluation_result` holding the answer
+the script already worked out, marked `success: true`.
+
+The `display` argument is therefore passed twice: once as the cell's visible
+value and once as `output_value`. `cells_accessed` matters just as much: it is
+the dependency list the app uses to know which cells to recompute when an input
+changes, so it has to be supplied by hand here. Getting it wrong wouldn't show
+up until you edited a source cell and watched a formula fail to update.
+
+```js ! generate-examples.mjs
 const formula = (x, y, code, display, accessed) =>
 	cell(x, y, display, {
 		type: 'FORMULA',
 		formula_code: code,
+		// !mark(1:6)
 		evaluation_result: {
 			success: true,
 			output_value: String(display),
@@ -36,19 +72,27 @@ const formula = (x, y, code, display, accessed) =>
 			error_span: null
 		}
 	});
+```
 
-const fmt = (x, y, props) => ({ x, y, ...props });
+## !!steps Date maths that mirrors the Rust core
 
-// range helpers -> cells_accessed lists
-const colRange = (x, y0, y1) => {
-	const out = [];
-	for (let y = y0; y <= y1; y++) out.push([x, y]);
-	return out;
-};
+Because the script must predict what the engine will compute, its date helpers
+have to agree with the Rust implementation in
+[datetime.rs](/docs/quadratic-core/src/formulas/functions/datetime.rs) — hence
+the comment saying they mirror it. Dates become day numbers by dividing epoch
+milliseconds by the length of a day.
 
+`weekdayIso` maps a day number to Monday=1 through Sunday=7 with an offset of
+3, because the Unix epoch fell on a Thursday. `isoWeek` implements the ISO 8601
+rule properly — find the Thursday of the same week, take *its* year, and count
+weeks from that year's start — which is what makes weeks near a year boundary
+come out right.
+
+```js ! generate-examples.mjs
 // ---------- date helpers (mirror the Rust core) ----------
 const day = (iso) => Math.round(Date.parse(iso + 'T00:00:00Z') / 86400000);
 const isoOf = (d) => new Date(d * 86400000).toISOString().slice(0, 10);
+// !mark
 const weekdayIso = (d) => ((d + 3) % 7) + 1; // Mon=1..Sun=7
 const networkdays = (a, b) => {
 	let n = 0;
@@ -57,27 +101,26 @@ const networkdays = (a, b) => {
 };
 const isoWeek = (iso) => {
 	const d = day(iso);
+	// !mark(1:3)
 	const thu = d + 4 - weekdayIso(d);
 	const y = new Date(thu * 86400000).getUTCFullYear();
 	return Math.floor((thu - day(`${y}-01-01`)) / 7) + 1;
 };
+```
 
-// =========================================================== formulas tour
-{
-	const cells = [];
-	const formats = [];
+## !!steps The source data table
 
-	cells.push(cell(0, 0, 'Formula tour'));
-	formats.push(fmt(0, 0, { bold: true, textColor: '#8c1a6a' }));
-	cells.push(cell(0, 1, 'Every result below is computed by the Rust/WASM core. Click a cell to see its formula.'));
-	formats.push(fmt(0, 1, { italic: true, textColor: '#55606b' }));
+Each example is wrapped in a bare block (`{ ... }`) so it gets its own scope —
+`cells`, `formats` and the running `y` cursor are declared fresh per file
+without any naming gymnastics.
 
-	// --- data table ---
-	const head = ['Rep', 'Region', 'Sales', 'Signed'];
-	head.forEach((h, i) => {
-		cells.push(cell(i, 3, h));
-		formats.push(fmt(i, 3, { bold: true, fillColor: '#e7f7ff' }));
-	});
+The sales table is laid out from a plain array of rows: headers on row 3 with a
+bold fill, data beneath, and a number format applied to the sales column.
+Afterwards the script derives the bounds and the column ranges once, so the
+formula strings and their `cells_accessed` lists are both built from the same
+numbers and cannot drift apart.
+
+```js ! generate-examples.mjs
 	const data = [
 		['Ada', 'North', 1200, '2026-01-15'],
 		['Brij', 'South', 950, '2026-02-03'],
@@ -90,14 +133,28 @@ const isoWeek = (iso) => {
 		row.forEach((v, x) => cells.push(cell(x, 4 + i, v)));
 		formats.push(fmt(2, 4 + i, { textFormat: { type: 'NUMBER', decimalPlaces: 0 } }));
 	});
+	// !mark(1:6)
 	const y0 = 4;
 	const y1 = 4 + data.length - 1;
 	const sales = data.map((r) => r[2]);
 	const salesRange = colRange(2, y0, y1);
 	const repRange = colRange(0, y0, y1);
 	const regionRange = colRange(1, y0, y1);
+```
 
-	// --- summary block ---
+## !!steps A cursor that walks down the sheet
+
+The summary block is written with two closures over a mutable `y`. `label`
+writes a muted caption in column 5 without advancing; `section` writes a bold
+heading and moves down one row. Each entry then follows the same rhythm: label,
+push the formula in column 6, `y++`.
+
+Keeping the cursor implicit is what lets rows be inserted or reordered without
+renumbering anything — and because `y0` and `y1` are interpolated into the
+formula text, the generated `SUM(C4:C9)` always points at wherever the data
+actually landed.
+
+```js ! generate-examples.mjs
 	let y = 3;
 	const label = (text) => {
 		cells.push(cell(5, y, text));
@@ -106,111 +163,105 @@ const isoWeek = (iso) => {
 	const section = (title) => {
 		cells.push(cell(5, y, title));
 		formats.push(fmt(5, y, { bold: true }));
+		// !mark
 		y++;
 	};
 
 	section('Aggregates');
 	const total = sales.reduce((a, b) => a + b, 0);
+	// !mark
 	label('SUM'); cells.push(formula(6, y, `SUM(C${y0}:C${y1})`, total, salesRange)); y++;
 	label('ROUND(AVERAGE)');
 	cells.push(formula(6, y, `ROUND(AVERAGE(C${y0}:C${y1}), 2)`, Math.round((total / sales.length) * 100) / 100, salesRange)); y++;
 	label('MAX'); cells.push(formula(6, y, `MAX(C${y0}:C${y1})`, Math.max(...sales), salesRange)); y++;
 	y++;
+```
 
+## !!steps Predicting each answer in JavaScript
+
+Every entry pairs a formula string with a JavaScript expression that reproduces
+it. `SUMIF "North"` filters and sums the same rows the engine would; the
+wildcard `COUNTIF` is mirrored with `toLowerCase().includes('a')`; `INDEX +
+MATCH` becomes a `reduce` picking the highest-selling row.
+
+Two details are easy to miss. `IFERROR(1/0, "safe")` passes an empty
+`cells_accessed` because it touches no cells. And `WEEKDAY` is converted with
+`(weekdayIso(...) % 7) + 1` — the helper returns Monday=1, while the
+spreadsheet function reports Sunday=1, so the two conventions have to be
+reconciled rather than assumed equal.
+
+```js ! generate-examples.mjs
 	section('Criteria (SUMIF / COUNTIF)');
 	const northTotal = data.filter((r) => r[1] === 'North').reduce((a, r) => a + r[2], 0);
 	label('SUMIF "North"');
 	cells.push(formula(6, y, `SUMIF(B${y0}:B${y1}, "North", C${y0}:C${y1})`, northTotal, [...regionRange, ...salesRange])); y++;
 	label('COUNTIF ">1000"');
 	cells.push(formula(6, y, `COUNTIF(C${y0}:C${y1}, ">1000")`, sales.filter((s) => s > 1000).length, salesRange)); y++;
-	label('COUNTIF wildcard "*a*"');
-	cells.push(formula(6, y, `COUNTIF(A${y0}:A${y1}, "*a*")`, data.filter((r) => r[0].toLowerCase().includes('a')).length, repRange)); y++;
-	y++;
-
-	section('Lookup');
-	const best = data.reduce((a, b) => (b[2] > a[2] ? b : a));
-	label('INDEX + MATCH (top rep)');
-	cells.push(formula(6, y, `INDEX(A${y0}:A${y1}, MATCH(MAX(C${y0}:C${y1}), C${y0}:C${y1}, 0))`, best[0], [...repRange, ...salesRange])); y++;
-	label('VLOOKUP "Cleo"');
-	cells.push(formula(6, y, `VLOOKUP("Cleo", A${y0}:B${y1}, 2)`, 'North', [...repRange, ...regionRange])); y++;
+	// ...
 	label('IFERROR');
+	// !mark
 	cells.push(formula(6, y, 'IFERROR(1/0, "safe")', 'safe', [])); y++;
-	label('TEXTJOIN');
-	cells.push(formula(6, y, `TEXTJOIN(", ", TRUE, A${y0}:A${y1})`, data.map((r) => r[0]).join(', '), repRange)); y++;
-	y++;
-
-	section('Dates');
-	const first = data[0][3];
-	const last = data[data.length - 1][3];
-	label('DAYS (first → last)');
-	cells.push(formula(6, y, `DAYS(D${y1}, D${y0})`, day(last) - day(first), [[3, y0], [3, y1]])); y++;
-	label('EDATE (+12 months)');
-	cells.push(formula(6, y, `EDATE(D${y0}, 12)`, '2027-01-15', [[3, y0]])); y++;
-	label('EOMONTH');
-	cells.push(formula(6, y, `EOMONTH(D${y0}, 0)`, '2026-01-31', [[3, y0]])); y++;
+	// ...
 	label('WEEKDAY (Sun=1)');
+	// !mark
 	cells.push(formula(6, y, `WEEKDAY(D${y0})`, (weekdayIso(day(first)) % 7) + 1, [[3, y0]])); y++;
 	label('ISOWEEKNUM');
 	cells.push(formula(6, y, `ISOWEEKNUM(D${y0})`, isoWeek(first), [[3, y0]])); y++;
-	label('NETWORKDAYS (Q1)');
-	cells.push(formula(6, y, 'NETWORKDAYS("2026-01-01", "2026-03-31")', networkdays('2026-01-01', '2026-03-31'), [])); y++;
-	label('DATEDIF years');
-	cells.push(formula(6, y, `DATEDIF(D${y0}, "2029-03-01", "Y")`, 3, [[3, y0]])); y++;
+```
 
-	cells.push(cell(5, y + 1, 'Browse every function: Help → Formula reference'));
-	formats.push(fmt(5, y + 1, { italic: true, textColor: '#8c1a6a' }));
+## !!steps Writing the file envelope
 
+The collected cells and formats are wrapped in the `GridFile` v1.3 envelope —
+one sheet, explicit column widths for the columns holding long labels, and
+`cell_dependency` as the string `'[]'` because the dependency graph is rebuilt
+on import from each cell's `cells_accessed`.
+
+The `id` is a fixed UUID and both timestamps derive from the frozen `NOW`,
+keeping the output stable across runs. `JSON.stringify` with an indent of `1`
+makes the file diffable without inflating it.
+
+The result is loaded by
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) through the file menu, which
+fetches these from `/examples/`.
+
+```js ! generate-examples.mjs
 	writeFileSync(
 		'static/examples/formula_tour.grid',
 		JSON.stringify({
+			// !mark
 			sheets: [{ name: 'Formulas', order: 0, borders: [], cells, formats, columns: [{ id: 5, size: 190 }, { id: 6, size: 190 }, { id: 3, size: 110 }], rows: [], cell_dependency: '[]' }],
 			created: Date.parse(NOW),
 			filename: 'Formula tour (example)',
+			// !mark
 			id: '3f9a1c22-0000-4000-8000-00000000f001',
 			modified: Date.parse(NOW),
 			version: '1.3'
 		}, null, 1)
 	);
 	console.log('formula_tour.grid written');
-}
+```
 
-// =========================================================== javascript
-{
-	const cells = [];
-	const formats = [];
+## !!steps Faking a spilled array
 
-	cells.push(cell(0, 0, 'JavaScript cells'));
-	formats.push(fmt(0, 0, { bold: true, textColor: '#ca8a04' }));
-	cells.push(cell(0, 1, 'Return a value from a JS cell and it lands on the grid. Arrays spill.'));
-	formats.push(fmt(0, 1, { italic: true, textColor: '#55606b' }));
+The JavaScript example has to reproduce how a spilled result is stored, which
+is a two-part representation. The origin cell holds the code, the full
+`array_output`, and `array_cells` — the list of every coordinate the result
+occupies. Its own visible value is only the top-left entry.
 
-	cells.push(cell(0, 3, 'Rows to build'));
-	formats.push(fmt(0, 3, { bold: true }));
-	cells.push(cell(1, 3, 7));
-	formats.push(fmt(1, 3, { fillColor: '#fff3cd' }));
-	cells.push(cell(2, 3, '← edit me, the table below rebuilds'));
-	formats.push(fmt(2, 3, { italic: true, textColor: '#55606b' }));
+Every other cell of the block is then written separately as type `COMPUTED`.
+That is what lets the grid know those cells are owned by the spill rather than
+typed by the user, and it is why the loop skips `dx === 0 && dy === 0`: the
+origin already exists as the `JAVASCRIPT` cell. `std_out` carries the captured
+`console.log`, matching what
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) produces at
+runtime.
 
-	// JS cell spilling a table
-	const n = 7;
-	const table = [['n', 'squared', 'cubed']];
-	for (let i = 1; i <= n; i++) table.push([i, i * i, i * i * i]);
-
-	const jsCode =
-		"const n = q.cells('B3');\n" +
-		"console.log('building', n, 'rows');\n" +
-		"const rows = [['n', 'squared', 'cubed']];\n" +
-		'for (let i = 1; i <= n; i++) rows.push([i, i * i, i * i * i]);\n' +
-		'return rows;';
-
-	const arrayCells = [];
-	table.forEach((row, dy) =>
-		row.forEach((_, dx) => arrayCells.push([dx, 5 + dy]))
-	);
+```js ! generate-examples.mjs
 	cells.push(
 		cell(0, 5, table[0][0], {
 			type: 'JAVASCRIPT',
 			javascript_code: jsCode,
+			// !mark
 			array_cells: arrayCells,
 			evaluation_result: {
 				success: true,
@@ -225,12 +276,26 @@ const isoWeek = (iso) => {
 	// spilled COMPUTED cells (everything except the origin)
 	table.forEach((row, dy) =>
 		row.forEach((v, dx) => {
+			// !mark(1:2)
 			if (dx === 0 && dy === 0) return;
 			cells.push(cell(dx, 5 + dy, v, { type: 'COMPUTED' }));
 		})
 	);
-	[0, 1, 2].forEach((x) => formats.push(fmt(x, 5, { bold: true, fillColor: '#fdf6e3' })));
+```
 
+## !!steps A formula reading the spill
+
+The last piece demonstrates that spilled output is ordinary grid data: a
+`SUM` over the squares column the JavaScript cell produced, with its
+`cells_accessed` listing those spilled coordinates. Edit the row count in `B3`
+and the chain re-runs — the JS cell rebuilds the table, and this formula
+recomputes over the new spill.
+
+The file closes with a scalar JavaScript cell, showing the other shape a JS
+cell can take: no `array_cells`, no `array_output`, just a single returned
+value.
+
+```js ! generate-examples.mjs
 	// a formula reading the spilled output
 	const squares = table.slice(1).map((r) => r[1]);
 	cells.push(cell(4, 5, 'Formula over JS output'));
@@ -238,6 +303,7 @@ const isoWeek = (iso) => {
 	cells.push(cell(4, 6, 'SUM of squares'));
 	formats.push(fmt(4, 6, { textColor: '#55606b' }));
 	cells.push(
+		// !mark
 		formula(5, 6, `SUM(B6:B${5 + n})`, squares.reduce((a, b) => a + b, 0), colRange(1, 6, 5 + n))
 	);
 
@@ -256,21 +322,21 @@ const isoWeek = (iso) => {
 			}
 		})
 	);
+```
 
-	cells.push(cell(4, 10, 'API: q.cells(a1), q.pos(), console.log'));
-	formats.push(fmt(4, 10, { italic: true, textColor: '#ca8a04' }));
+</Scrollycoding>
 
-	writeFileSync(
-		'static/examples/javascript.grid',
-		JSON.stringify({
-			sheets: [{ name: 'JavaScript', order: 0, borders: [], cells, formats, columns: [{ id: 2, size: 210 }, { id: 4, size: 170 }], rows: [], cell_dependency: '[]' }],
-			created: Date.parse(NOW),
-			filename: 'JavaScript (example)',
-			id: '3f9a1c22-0000-4000-8000-00000000f002',
-			modified: Date.parse(NOW),
-			version: '1.3'
-		}, null, 1)
-	);
-	console.log('javascript.grid written');
-}
-````
+Because the results are baked in, these files exercise the *import* path rather
+than the compute path: [gridFile.ts](/docs/src/lib/files/gridFile.ts) reads the
+envelope and [Sheet.ts](/docs/src/lib/core/Sheet.ts) rebuilds the dependency
+graph from each cell's `cells_accessed`. Re-running a cell then hands control to
+the real engines —
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) for formulas and
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) for JS —
+through [updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts),
+which is where a mismatch between a predicted answer and a real one would
+surface.
+
+One consequence worth noting: `isoOf` is defined among the date helpers but
+never called, and the script writes only two of the eight grids in
+`static/examples/`.
