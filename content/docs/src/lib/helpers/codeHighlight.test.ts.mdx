@@ -1,24 +1,57 @@
 ---
 title: "codeHighlight.test.ts"
-description: "Unit tests for codeHighlight.ts."
+description: "Vitest coverage for both tokenizers — the round-trip invariant first, then classification and each awkward literal form"
 source: "src/lib/helpers/codeHighlight.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Twenty tests over the two tokenizers in
+[codeHighlight.ts](/docs/src/lib/helpers/codeHighlight.ts), organized as two
+mirrored suites. The structure reflects what can actually go wrong in a
+hand-written scanner: text getting lost, words classified as the wrong thing,
+and literal forms whose termination rules are fiddly.
 
-````ts codeHighlight.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { tokenizeJs, tokenizePython, type CodeToken } from './codeHighlight';
+Notably the first and last test of each suite guard the same property — that
+the output reassembles the input — once for well-formed code and once for
+input that is cut off mid-token.
 
+<Scrollycoding>
+
+## !!steps Two helpers that shape every assertion
+
+`rejoin` concatenates a token stream back into a string, and it exists to make
+the round-trip invariant a one-line assertion.
+
+`typedJs` and `typedPy` do the opposite: they drop every `plain` token, leaving
+only what was actually classified. That is what keeps the expectations legible
+— a test for `const x = null;` can assert exactly two tokens instead of
+enumerating the spaces, the equals sign and the semicolon. It also makes the
+tests robust to how plain runs are coalesced, so a change to `TokenSink`'s
+buffering does not churn every expectation.
+
+```ts ! codeHighlight.test.ts
 const rejoin = (tokens: CodeToken[]): string => tokens.map((t) => t.text).join('');
 const typedJs = (code: string): CodeToken[] =>
+	// !mark
 	tokenizeJs(code).filter((t) => t.type !== 'plain');
 const typedPy = (code: string): CodeToken[] =>
 	tokenizePython(code).filter((t) => t.type !== 'plain');
+```
 
+## !!steps The invariant the editor depends on
+
+The first test is the important one. Its input deliberately mixes the
+constructs most likely to swallow text — an API call with a string argument, a
+comment, and a template literal containing an interpolation — and asserts that
+reassembling the tokens gives back the original source *character for
+character*.
+
+This is the property the editor overlay relies on: a highlighted `<pre>` under a
+transparent `<textarea>` only stays aligned if no character is dropped,
+duplicated or normalized. A tokenizer bug that lost one space would show up
+here rather than as a mysteriously drifting caret.
+
+```ts ! codeHighlight.test.ts
 describe('tokenizeJs', () => {
 	it('round-trips the input exactly', () => {
 		const code = [
@@ -27,18 +60,30 @@ describe('tokenizeJs', () => {
 			'const s = `sum: ${total * 2}`;',
 			'return s;'
 		].join('\n');
+		// !mark
 		expect(rejoin(tokenizeJs(code))).toBe(code);
 	});
+```
 
-	it('classifies keywords and literals', () => {
-		expect(typedJs('const x = null;')).toEqual([
-			{ type: 'keyword', text: 'const' },
-			{ type: 'literal', text: 'null' }
-		]);
-	});
+## !!steps Words, and words that only look like keywords
 
+Classification is checked in three cases that build on each other. Keywords and
+literals are the baseline.
+
+The second is the regression guard for the `afterDot` lookbehind: `a.new` and
+`b .delete` must produce **no typed tokens at all**, since both are property
+accesses that merely happen to spell reserved words. The spaced variant is
+there deliberately — it is what proves the check skips inline whitespace rather
+than just peeking one character back.
+
+The third pins the call heuristic together with the string scanner, and its
+expectation is precise about what `q.cells('D6')` yields: `q` stays plain,
+`cells` becomes a function because `(` follows, and the argument is a string.
+
+```ts ! codeHighlight.test.ts
 	it('does not treat property names as keywords', () => {
 		expect(typedJs('a.new').length).toBe(0);
+		// !mark
 		expect(typedJs('b .delete').length).toBe(0);
 	});
 
@@ -48,18 +93,24 @@ describe('tokenizeJs', () => {
 			{ type: 'string', text: "'D6'" }
 		]);
 	});
+```
 
-	it('handles line and block comments', () => {
-		expect(typedJs('// hi\nlet x')).toEqual([
-			{ type: 'comment', text: '// hi' },
-			{ type: 'keyword', text: 'let' }
-		]);
-		expect(typedJs('/* a\nb */ 1')).toEqual([
-			{ type: 'comment', text: '/* a\nb */' },
-			{ type: 'number', text: '1' }
-		]);
-	});
+## !!steps Escapes, unterminated strings, and interpolation
 
+Three awkward cases in a row. The escape test pins that `'it\'s'` stays a
+single token rather than ending at the middle quote.
+
+The unterminated case encodes a decision rather than a language rule: in
+JavaScript a string with no closing quote is a syntax error, but here it must
+stop at the newline so the following line still highlights normally. Asserting
+that `let` on the next line comes back as a keyword is what proves the string
+did not swallow the rest of the file — the behavior that matters while someone
+is mid-keystroke.
+
+The template test confirms the recursion: the interpolation's `1` is classified
+as a number, so the pieces come back as string, number, string.
+
+```ts ! codeHighlight.test.ts
 	it('handles escaped quotes inside strings', () => {
 		expect(typedJs("'it\\'s'")).toEqual([{ type: 'string', text: "'it\\'s'" }]);
 	});
@@ -67,6 +118,7 @@ describe('tokenizeJs', () => {
 	it('terminates unclosed strings at the newline', () => {
 		expect(typedJs('"abc\nlet x')).toEqual([
 			{ type: 'string', text: '"abc' },
+			// !mark
 			{ type: 'keyword', text: 'let' }
 		]);
 	});
@@ -78,7 +130,23 @@ describe('tokenizeJs', () => {
 			{ type: 'string', text: 'b`' }
 		]);
 	});
+```
 
+## !!steps Number formats, and input that stops mid-token
+
+The number test packs four formats into one line — hex, an exponent, a BigInt
+suffix and the leading-dot form — and asserts they come back as four separate
+number tokens, which also confirms the regex is anchored and does not run
+together across the spaces.
+
+The suite then closes on the harder half of the round-trip property. Each of
+these four inputs is truncated inside a construct: an unclosed interpolation, an
+unclosed template, an unclosed string, and a string ending on a lone backslash
+— the case where the escape handling could read past the end. Every one must
+still reassemble exactly. This is the test that would catch an off-by-one in
+any of the scanners' bounds.
+
+```ts ! codeHighlight.test.ts
 	it('recognizes number formats', () => {
 		expect(typedJs('0xFF 1.5e3 10n .25')).toEqual([
 			{ type: 'number', text: '0xFF' },
@@ -89,43 +157,33 @@ describe('tokenizeJs', () => {
 	});
 
 	it('round-trips unterminated templates and strings', () => {
+		// !mark(1:3)
 		for (const code of ['`abc${x', '`abc', '"abc', "'a\\"]) {
 			expect(rejoin(tokenizeJs(code))).toBe(code);
 		}
 	});
 });
+```
 
-describe('tokenizePython', () => {
-	it('round-trips the input exactly', () => {
-		const code = ['# fetch a cell', 'total = cell(0, 0)', "msg = f'total: {total}'"].join('\n');
-		expect(rejoin(tokenizePython(code))).toBe(code);
-	});
+## !!steps The Python suite, mirrored and specialized
 
-	it('classifies keywords and literals', () => {
-		expect(typedPy('if x is None:')).toEqual([
-			{ type: 'keyword', text: 'if' },
-			{ type: 'keyword', text: 'is' },
-			{ type: 'literal', text: 'None' }
-		]);
-	});
+The Python half repeats the same shape — round trip, classification, property
+access, calls and comments — with `df.import_` and `obj.pass` standing in as
+the attribute-access guard.
 
-	it('does not treat attribute names as keywords', () => {
-		expect(typedPy('df.import_')).toEqual([]);
-		expect(typedPy('obj.pass')).toEqual([]);
-	});
+Where it diverges is the literal forms unique to the language. Triple-quoted
+strings must span lines and still hand back control afterwards, which the
+trailing `return` keyword proves. Prefixed strings must absorb their prefix
+into one token, tested for both a single-letter `f` and the two-letter `rb`,
+covering both arms of the prefix pattern. And the number test includes
+`1_000` and `2j` — the digit separator and the imaginary suffix that the
+JavaScript regex has no equivalent for.
 
-	it('marks calls and hash comments', () => {
-		expect(typedPy('cell(0, 0)  # ref')).toEqual([
-			{ type: 'function', text: 'cell' },
-			{ type: 'number', text: '0' },
-			{ type: 'number', text: '0' },
-			{ type: 'comment', text: '# ref' }
-		]);
-	});
-
+```ts ! codeHighlight.test.ts
 	it('handles triple-quoted strings across lines', () => {
 		expect(typedPy('"""a\nb"""\nreturn')).toEqual([
 			{ type: 'string', text: '"""a\nb"""' },
+			// !mark
 			{ type: 'keyword', text: 'return' }
 		]);
 	});
@@ -134,28 +192,26 @@ describe('tokenizePython', () => {
 		expect(typedPy("f'total: {t}'")).toEqual([{ type: 'string', text: "f'total: {t}'" }]);
 		expect(typedPy('rb"\\d+"')).toEqual([{ type: 'string', text: 'rb"\\d+"' }]);
 	});
-
-	it('terminates unclosed single-quoted strings at the newline', () => {
-		expect(typedPy("'abc\npass")).toEqual([
-			{ type: 'string', text: "'abc" },
-			{ type: 'keyword', text: 'pass' }
-		]);
-	});
-
+	// ...
 	it('recognizes number formats', () => {
 		expect(typedPy('0xFF 1_000 1.5e3 2j .25')).toEqual([
 			{ type: 'number', text: '0xFF' },
+			// !mark(1:2)
 			{ type: 'number', text: '1_000' },
 			{ type: 'number', text: '1.5e3' },
 			{ type: 'number', text: '2j' },
 			{ type: 'number', text: '.25' }
 		]);
 	});
+```
 
-	it('round-trips unterminated strings', () => {
-		for (const code of ['"""abc\ndef', "'abc", "f'a{b", "'a\\"]) {
-			expect(rejoin(tokenizePython(code))).toBe(code);
-		}
-	});
-});
-````
+</Scrollycoding>
+
+Run with `pnpm test`. The f-string case is worth reading against the tokenizer's
+own documentation: `f'total: {t}'` is asserted to be a *single string token*,
+confirming the deliberate limitation that Python interpolations are not
+tokenized as code — unlike JavaScript template literals, which are.
+
+What has no coverage here is `tokenizeCode`, the language dispatch, and with it
+the decision to route formulas through the JavaScript tokenizer; both suites
+call the two tokenizers directly.

@@ -1,21 +1,66 @@
 ---
 title: "keyboardSymbols.ts"
-description: "Source file src/lib/helpers/keyboardSymbols.ts of quadratic-svelte."
+description: "Platform-aware glyphs for keyboard shortcuts — eight lines that keep menu labels honest on both Mac and Windows"
 source: "src/lib/helpers/keyboardSymbols.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The smallest module in the project, and one every menu depends on. Shortcut
+labels have to read `⌘K` on a Mac and `Ctrl+K` everywhere else, and hard-coding
+either would show half the users a chord they cannot press.
 
-````ts keyboardSymbols.ts -n
+This file is display only. The actual key handling lives in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts), which checks `metaKey` and
+`ctrlKey` independently — these glyphs never influence what a shortcut does.
+
+<Scrollycoding>
+
+## !!steps Detecting a Mac, defensively
+
+`navigator.platform` is the check, guarded by a `typeof` test so evaluating this
+module without a DOM cannot throw. That guard is belt-and-braces here — the app
+is client-only, as [+layout.ts](/docs/src/routes/+layout.ts) establishes — but
+it also keeps the module importable from a test runner.
+
+Detection happens **once at module load** rather than per read, since the
+platform cannot change mid-session.
+
+```ts ! keyboardSymbols.ts
 const isMac = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform);
+```
 
+## !!steps One asymmetric glyph
+
+Three of the four entries are plain Unicode: the shift arrow, the return
+symbol, and the escape glyph, all of which mean the same thing on any platform.
+
+`Cmd` is the one that branches, and the asymmetry is in the value rather than
+the name: `'⌘'` has no separator while `'Ctrl+'` carries a trailing plus. That
+is because callers concatenate directly — [TopBar.svelte](/docs/src/lib/components/TopBar.svelte)
+and [CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte)
+build labels as `` `${C}O` `` — so the string has to supply its own joining
+convention. Mac shortcuts are conventionally written with no separator, Windows
+ones with a plus, and baking that into the value means no caller has to know
+which platform it is on.
+
+```ts ! keyboardSymbols.ts
 export const KeyboardSymbols = {
+	// !mark
 	Cmd: isMac ? '⌘' : 'Ctrl+',
 	Shift: '⇧',
 	Enter: '↵',
 	Escape: '⎋'
 };
-````
+```
+
+</Scrollycoding>
+
+Imported by the four components that display shortcuts:
+[TopBar.svelte](/docs/src/lib/components/TopBar.svelte),
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte),
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte) and
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte).
+
+Worth noting: `navigator.platform` is deprecated in favour of
+`navigator.userAgentData`, though it remains widely supported and is still the
+common approach for exactly this kind of cosmetic branch.

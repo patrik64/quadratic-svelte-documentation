@@ -1,24 +1,40 @@
 ---
 title: "codeHighlight.ts"
-description: "Minimal tokenizers for editor and hover-card syntax highlighting. Each produces a flat token stream whose concatenated text is exactly the input, so a highli…"
+description: "Hand-written JavaScript and Python tokenizers whose output concatenates back to the exact input, so an overlay stays aligned"
 source: "src/lib/helpers/codeHighlight.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Two small tokenizers, written by hand rather than pulled from a library. They
+power the code editor's highlighting and the cell hover card, and they are
+built around one unusual constraint: **the concatenated text of the tokens must
+equal the input exactly**.
 
-````ts codeHighlight.ts -n
-/** Minimal tokenizers for editor and hover-card syntax highlighting.
- *
- * Each produces a flat token stream whose concatenated text is exactly the
- * input, so a highlighted <pre> stays glyph-for-glyph aligned with the
- * transparent textarea layered on top of it. JS regex literals are not
- * recognized (indistinguishable from division without a parser) and render
- * as plain text; Python f-string interpolations render as string.
- */
+That constraint comes from how the editor works. A highlighted `<pre>` sits
+underneath a transparent `<textarea>`, and the two only stay aligned if the
+rendered text is glyph-for-glyph identical to what was typed. A tokenizer that
+normalized whitespace, dropped a stray character, or skipped an unterminated
+string would desynchronize the caret from the text under it.
 
+<Scrollycoding>
+
+## !!steps Six token types and an escape hatch
+
+The type union is deliberately small — these classes map onto the `syn-*` CSS
+rules in [app.css](/docs/src/app.css), and every additional class would need a
+color in both themes.
+
+`plain` is what makes the round-trip guarantee achievable: anything the
+tokenizer does not recognize is still emitted, just unstyled. There is no
+"unknown" failure mode and nothing is ever discarded.
+
+The header comment is candid about the limits. JavaScript regex literals are
+not recognized at all, because telling `/foo/` from division requires knowing
+whether the previous token was a value — that is a parser's job, not a
+scanner's — so they render as plain text. Python f-string interpolations stay
+inside the string rather than being tokenized as code.
+
+```ts ! codeHighlight.ts
 export type CodeTokenType =
 	| 'keyword'
 	| 'literal'
@@ -26,13 +42,28 @@ export type CodeTokenType =
 	| 'number'
 	| 'comment'
 	| 'function'
+	// !mark
 	| 'plain';
 
 export interface CodeToken {
 	type: CodeTokenType;
 	text: string;
 }
+```
 
+## !!steps Three languages, two tokenizers
+
+Formula cells reuse the JavaScript tokenizer. The doc comment justifies it
+rather than hiding it: formulas are mostly strings, numbers and call-shaped
+identifiers, all of which the JS scanner already classifies correctly. A
+dedicated formula tokenizer would add a third code path for very little visible
+gain.
+
+The consequence is that a formula's function names light up because they are
+followed by `(`, not because the tokenizer knows anything about the function
+library in [functions/mod.rs](/docs/quadratic-core/src/formulas/functions/mod.rs).
+
+```ts ! codeHighlight.ts
 /** Picks the tokenizer for a code cell / editor language. Formulas reuse the
  * JS tokenizer: strings, numbers, and call-shaped identifiers cover formula
  * syntax well. */
@@ -40,10 +71,24 @@ export function tokenizeCode(
 	lang: 'FORMULA' | 'PYTHON' | 'JAVASCRIPT',
 	code: string
 ): CodeToken[] {
+	// !mark
 	return lang === 'PYTHON' ? tokenizePython(code) : tokenizeJs(code);
 }
+```
 
-/** Token accumulator that coalesces consecutive plain text into one token. */
+## !!steps Coalescing the unstyled runs
+
+Both tokenizers emit plain characters one at a time as they fall through their
+recognizers. Left alone that would produce a token per space and per operator —
+and since each token becomes a DOM node in the rendered `<pre>`, a 200-line
+cell would generate thousands of `span` elements.
+
+`TokenSink` buffers consecutive plain text and only materializes it when a
+typed token interrupts it, so `x = y + 1` yields a handful of nodes rather than
+a dozen. Every path that emits a typed token calls `flush` first, which is what
+keeps the output in source order. `done` flushes the tail.
+
+```ts ! codeHighlight.ts
 class TokenSink {
 	tokens: CodeToken[] = [];
 	private plain = '';
@@ -56,6 +101,7 @@ class TokenSink {
 	}
 	push(type: CodeTokenType, text: string): void {
 		if (!text) return;
+		// !mark
 		this.flush();
 		this.tokens.push({ type, text });
 	}
@@ -71,47 +117,27 @@ class TokenSink {
 		return this.tokens;
 	}
 }
+```
 
-const skipInlineSpace = (code: string, i: number, step: 1 | -1): number => {
-	while (i >= 0 && i < code.length && (code[i] === ' ' || code[i] === '\t')) i += step;
-	return i;
-};
+## !!steps Comments and strings that never run away
 
-// ---------------------------------------------------------------- JavaScript
+Both comment forms clamp to the end of input when unterminated: a `//` with no
+newline takes `j = n`, and an unclosed `/*` does the same. Neither can index
+past the end, and both consume every character they saw — the round-trip
+guarantee holding at the edges.
 
-const JS_KEYWORDS = new Set(
-	(
-		'async await break case catch class const continue debugger default delete do else ' +
-		'export extends finally for function if import in instanceof let new of return ' +
-		'static super switch this throw try typeof var void while with yield'
-	).split(' ')
-);
+The string scanner steps over a backslash and the character after it, which is
+how `'it\'s'` stays one token. The second stop condition is the interesting
+one: a newline ends the string even without a closing quote. That is not how
+JavaScript actually parses — an unterminated string is a syntax error — but it
+is the right behavior for a *live editor*, where a half-typed string would
+otherwise paint the rest of the file as a string until the closing quote
+arrives.
 
-const JS_LITERALS = new Set(['true', 'false', 'null', 'undefined', 'NaN', 'Infinity']);
-
-const JS_IDENT_START = /[A-Za-z_$]/;
-const JS_IDENT_PART = /[A-Za-z0-9_$]/;
-const JS_NUMBER =
-	/^(?:0[xX][0-9a-fA-F]+n?|0[bB][01]+n?|0[oO][0-7]+n?|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?n?|\.\d+(?:[eE][+-]?\d+)?)/;
-
-export function tokenizeJs(code: string): CodeToken[] {
-	const out = new TokenSink();
-	const n = code.length;
-	let i = 0;
-	while (i < n) {
-		const ch = code[i];
-		const next = code[i + 1];
-
-		if (ch === '/' && next === '/') {
-			let j = code.indexOf('\n', i);
-			if (j === -1) j = n;
-			out.push('comment', code.slice(i, j));
-			i = j;
-			continue;
-		}
-
+```ts ! codeHighlight.ts
 		if (ch === '/' && next === '*') {
 			const end = code.indexOf('*/', i + 2);
+			// !mark
 			const j = end === -1 ? n : end + 2;
 			out.push('comment', code.slice(i, j));
 			i = j;
@@ -130,28 +156,33 @@ export function tokenizeJs(code: string): CodeToken[] {
 			i = j;
 			continue;
 		}
+```
 
-		// template literal; ${…} interpolations are tokenized as code (brace
-		// matching is a naive depth count, so a brace inside a nested string
-		// can cut an interpolation short — harmless for highlighting)
-		if (ch === '`') {
-			let seg = i;
-			let j = i + 1;
-			while (j < n) {
-				const c = code[j];
-				if (c === '\\') {
-					j += 2;
-					continue;
-				}
-				if (c === '`') {
-					j++;
-					break;
-				}
+## !!steps Template literals, tokenized recursively
+
+The most involved branch, because a template literal is a string containing
+code containing possibly more strings.
+
+When `${` appears, the string segment so far is emitted, the delimiter is
+pushed as plain, and the interpolation's extent is found by counting braces.
+Its contents are then handed to **`tokenizeJs` recursively**, so `${x + 1}`
+highlights its number and identifiers exactly as it would outside the template
+— and nesting works to any depth for free.
+
+The comment is honest about where this breaks: the depth count does not know
+about strings, so a `}` inside a nested string ends the interpolation early.
+The `closed` flag is what keeps that harmless — when the braces never balance,
+the closing `}` is not emitted and `k` has run to the end, so the remaining
+text is still consumed and the round trip survives. Highlighting degrades;
+alignment does not.
+
+```ts ! codeHighlight.ts
 				if (c === '$' && code[j + 1] === '{') {
 					out.push('string', code.slice(seg, j));
 					out.push('plain', '${');
 					let depth = 1;
 					let k = j + 2;
+					// !mark(1:5)
 					while (k < n && depth > 0) {
 						if (code[k] === '{') depth++;
 						else if (code[k] === '}') depth--;
@@ -164,18 +195,32 @@ export function tokenizeJs(code: string): CodeToken[] {
 					seg = j;
 					continue;
 				}
-				j++;
-			}
-			out.push('string', code.slice(seg, Math.min(j, n)));
-			i = j;
-			continue;
-		}
+```
 
+## !!steps Two lookarounds decide what a word is
+
+Identifiers are classified by looking at their neighbours, and both checks skip
+inline whitespace via `skipInlineSpace` so spacing does not change the answer.
+
+`afterDot` prevents property names from being painted as keywords — `a.new` and
+`q.delete` are ordinary members, and highlighting them as syntax would be
+actively misleading. It gates both the keyword and literal branches.
+
+`isCall` is the function heuristic: an identifier followed by `(` is styled as
+a call. It is a heuristic rather than analysis — no declaration is consulted —
+but it costs one character of lookahead and catches essentially every call
+users write, including the `q.cells(...)` and `cell(...)` API.
+
+Anything left over goes to `pushPlain`, joining the buffered run rather than
+becoming its own node.
+
+```ts ! codeHighlight.ts
 		if (JS_IDENT_START.test(ch)) {
 			let j = i + 1;
 			while (j < n && JS_IDENT_PART.test(code[j])) j++;
 			const word = code.slice(i, j);
 			// dotted property access is never a keyword: `a.new`, `q.delete`
+			// !mark(1:2)
 			const afterDot = code[skipInlineSpace(code, i - 1, -1)] === '.';
 			const isCall = code[skipInlineSpace(code, j, 1)] === '(';
 			if (!afterDot && JS_KEYWORDS.has(word)) out.push('keyword', word);
@@ -185,44 +230,49 @@ export function tokenizeJs(code: string): CodeToken[] {
 			i = j;
 			continue;
 		}
+```
 
-		if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(next ?? ''))) {
-			const m = JS_NUMBER.exec(code.slice(i));
-			if (m) {
-				out.push('number', m[0]);
-				i += m[0].length;
-				continue;
-			}
-		}
+## !!steps Numbers, in both languages
 
-		out.pushPlain(ch);
-		i++;
-	}
-	return out.done();
-}
+Each language gets one alternation-heavy regex anchored at the current
+position, covering hex, binary and octal prefixes, decimals with optional
+exponents, and a leading-dot form like `.25`.
 
-// -------------------------------------------------------------------- Python
+The tails differ by language and are the giveaway that these were written
+separately: JavaScript allows a `n` suffix for BigInt, while Python allows `j`
+for imaginary numbers and — the easily-forgotten one — underscores as digit
+separators, so `1_000` must scan as a single number rather than a number
+followed by an identifier.
 
-const PY_KEYWORDS = new Set(
-	(
-		'and as assert async await break class continue def del elif else except finally for ' +
-		'from global if import in is lambda nonlocal not or pass raise return try while with yield'
-	).split(' ')
-);
+Both are only attempted when the current character is a digit, or a dot
+followed by one, so the regex never runs against arbitrary text.
 
-const PY_LITERALS = new Set(['True', 'False', 'None']);
-
-const PY_IDENT_START = /[A-Za-z_]/;
-const PY_IDENT_PART = /[A-Za-z0-9_]/;
+```ts ! codeHighlight.ts
+const JS_NUMBER =
+	/^(?:0[xX][0-9a-fA-F]+n?|0[bB][01]+n?|0[oO][0-7]+n?|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?n?|\.\d+(?:[eE][+-]?\d+)?)/;
+// ...
 const PY_NUMBER =
+	// !mark
 	/^(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|\d[\d_]*(?:\.[\d_]*)?(?:[eE][+-]?\d+)?[jJ]?|\.\d[\d_]*(?:[eE][+-]?\d+)?[jJ]?)/;
+```
 
-/** Consumes a Python string starting at its quote; returns the end index.
- * Handles ''' and """ triples; unterminated single-quoted strings stop at
- * the newline. */
+## !!steps Python strings, including the triple-quoted kind
+
+Python's string rules need their own scanner because a `'''` or `"""` string
+spans lines, while a single-quoted one must still stop at a newline for the
+same live-editing reason as JavaScript.
+
+`triple` is decided once by peeking three characters, and the loop then applies
+whichever termination rule fits — a matching triple for one, a quote or newline
+for the other. Escapes skip two characters in both. Every path returns an index
+inside the input, and running off the end returns `n`, so the caller always
+consumes something and never loops forever.
+
+```ts ! codeHighlight.ts
 function scanPyString(code: string, quoteAt: number): number {
 	const n = code.length;
 	const q = code[quoteAt];
+	// !mark
 	const triple = code.slice(quoteAt, quoteAt + 3) === q + q + q;
 	let j = quoteAt + (triple ? 3 : 1);
 	while (j < n) {
@@ -241,34 +291,30 @@ function scanPyString(code: string, quoteAt: number): number {
 	}
 	return n;
 }
+```
 
-export function tokenizePython(code: string): CodeToken[] {
-	const out = new TokenSink();
-	const n = code.length;
-	let i = 0;
-	while (i < n) {
-		const ch = code[i];
+## !!steps Prefixed strings, caught in the identifier branch
 
-		if (ch === '#') {
-			let j = code.indexOf('\n', i);
-			if (j === -1) j = n;
-			out.push('comment', code.slice(i, j));
-			i = j;
-			continue;
-		}
+`f'...'`, `rb"..."` and friends begin with what looks like an identifier, so
+they are handled where identifiers are handled rather than in the string
+branch.
 
-		if (ch === '"' || ch === "'") {
-			const j = scanPyString(code, i);
-			out.push('string', code.slice(i, j));
-			i = j;
-			continue;
-		}
+Once a word is scanned, the check is whether a quote follows *immediately* and
+the word matches one or two prefix letters. If so the whole thing — prefix and
+string together — is emitted as a single string token, which is why an f-string
+appears entirely as a string rather than a stray `f` followed by one.
 
+The one-or-two-character bound is what stops an ordinary identifier that
+happens to precede a quote from being swallowed; a longer word is left alone
+and the quote is scanned separately on the next pass.
+
+```ts ! codeHighlight.ts
 		if (PY_IDENT_START.test(ch)) {
 			let j = i + 1;
 			while (j < n && PY_IDENT_PART.test(code[j])) j++;
 			const word = code.slice(i, j);
 			// string prefix: f'…', rb"…", …
+			// !mark(1:2)
 			if ((code[j] === '"' || code[j] === "'") && /^[rbufRBUF]{1,2}$/.test(word)) {
 				const end = scanPyString(code, j);
 				out.push('string', code.slice(i, end));
@@ -284,19 +330,17 @@ export function tokenizePython(code: string): CodeToken[] {
 			i = j;
 			continue;
 		}
+```
 
-		if (/[0-9]/.test(ch) || (ch === '.' && /[0-9]/.test(code[i + 1] ?? ''))) {
-			const m = PY_NUMBER.exec(code.slice(i));
-			if (m) {
-				out.push('number', m[0]);
-				i += m[0].length;
-				continue;
-			}
-		}
+</Scrollycoding>
 
-		out.pushPlain(ch);
-		i++;
-	}
-	return out.done();
-}
-````
+The tokens are rendered as `span` elements carrying `syn-{type}` classes by
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) — the overlay
+whose alignment depends on the round-trip guarantee — and by the cell hover card
+in [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte). Because
+those class names are built at runtime, their colors have to live in the global
+[app.css](/docs/src/app.css) rather than in either component.
+
+The round-trip property is asserted directly, for both languages and including
+unterminated input, in
+[codeHighlight.test.ts](/docs/src/lib/helpers/codeHighlight.test.ts).
