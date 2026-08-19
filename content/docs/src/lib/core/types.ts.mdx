@@ -1,60 +1,144 @@
 ---
 title: "types.ts"
-description: "Core data model, mirroring Quadratic's GridFile v1.3 schema shapes."
+description: "The shared data model — cell and format shapes mirroring the .grid v1.3 schema, plus the coordinate key scheme"
 source: "src/lib/core/types.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Almost all declarations, and the one file nearly every other imports. Its
+header states the constraint that shapes it: these types mirror Quadratic's
+`.grid` v1.3 schema, so they are a **file format** first and a convenient
+in-memory model second.
 
-````ts types.ts -n
+That explains a few shapes that would otherwise look odd, including two fields
+that exist only because the format has them.
+
+<Scrollycoding>
+
+## !!steps Five cell types, of which three are code
+
+`CellType` covers what a cell can be, and `COMPUTED` is the one that is not a
+user choice: it marks a cell produced by another cell's spilled array output.
+So a spilled block has one `JAVASCRIPT` or `PYTHON` cell at its origin and
+`COMPUTED` cells filling the rest — the arrangement
+[generate-examples.mjs](/docs/scripts/generate-examples.mjs) constructs by hand.
+
+`isCodeCellType` is a **type predicate**, narrowing to the three code types
+rather than returning a plain boolean. That means a caller guarding on it can
+then assign `cell.type` straight into the editor mode without a cast, which is
+exactly what
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) does when
+double-clicking opens a code cell.
+
+Excluding `COMPUTED` is the point: a spilled cell has no source to edit, so
+double-clicking one must not open an editor.
+
+```ts ! types.ts
 // Core data model, mirroring Quadratic's GridFile v1.3 schema shapes.
 
+// !mark
 export type CellType = 'TEXT' | 'FORMULA' | 'PYTHON' | 'JAVASCRIPT' | 'COMPUTED';
 
 /** Cell types whose content is code opened in the code editor. */
+// !mark
 export function isCodeCellType(type: CellType): type is 'FORMULA' | 'PYTHON' | 'JAVASCRIPT' {
 	return type === 'FORMULA' || type === 'PYTHON' || type === 'JAVASCRIPT';
 }
+```
 
-export type Coordinate = { x: number; y: number };
+## !!steps One result shape for three very different engines
 
+This is the interface that unifies the app. A Rust formula evaluated through
+WebAssembly, JavaScript run in an `AsyncFunction`, and Python run under Pyodide
+all produce exactly this record — which is why
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts) can drive
+all three through one pipeline.
+
+`cells_accessed` is the most consequential field. It is the authoritative
+record of what a computation read, and the dependency graph in
+[Sheet.ts](/docs/src/lib/core/Sheet.ts) is rebuilt from it — which is what makes
+that graph a discardable cache rather than something to maintain
+transactionally.
+
+`error_span` carries a byte range so the editor can underline the offending
+part of a formula, and its `null` rather than `undefined` mirrors what the Rust
+side serializes.
+
+```ts ! types.ts
 export interface CellEvaluationResult {
 	success: boolean;
 	std_out?: string;
 	std_err?: string;
 	output_value: string | null;
+	// !mark
 	cells_accessed: [number, number][];
 	array_output?: ArrayOutput;
 	/** PNG data URL of a returned canvas, drawn over the grid at the cell. */
 	image_output?: string;
+	// !mark
 	error_span: [number, number] | null;
 }
+```
 
-export type ArrayOutputValue = string | number | boolean;
-export type ArrayOutput = ArrayOutputValue[] | ArrayOutputValue[][];
+## !!steps Three code fields, and one that is never read
 
+A cell carries `formula_code`, `python_code` and `javascript_code` as separate
+optional fields rather than a single source plus a language tag.
+
+That is not redundancy — it means one cell can hold a draft in each language
+independently, which is why
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) includes the
+editor mode in its reload key: switching language on the same cell loads
+different text.
+
+`array_cells` lists the coordinates a spilled result occupies, letting the app
+clear the whole block when the source is re-run.
+
+`dependent_cells` is the vestigial one. Searching the project finds exactly one
+reference — a `delete` when copying a cell — so nothing ever writes or reads
+it. It exists because the v1.3 schema has it, and dropping it on copy is a
+defensive cleanup of data that may arrive in a file written by the original
+application.
+
+```ts ! types.ts
 export interface Cell {
 	x: number;
 	y: number;
 	type: CellType;
 	value: string;
+	// !mark(1:3)
 	formula_code?: string;
 	python_code?: string;
 	javascript_code?: string;
 	evaluation_result?: CellEvaluationResult;
 	array_cells?: [number, number][];
+	// !mark
 	dependent_cells?: [number, number][];
 	last_modified?: string;
 }
+```
 
-export type CellAlignment = 'left' | 'right' | 'center';
-export type CellWrapping = 'wrap' | 'clip';
+## !!steps A discriminated union with one odd member
 
+`CellTextFormat` is discriminated on `type`, so narrowing on it gives each
+variant its own fields — which is what lets the switch in
+[cellTextFormatter.ts](/docs/src/lib/core/cellTextFormatter.ts) access
+`symbol` in the currency branch without an optional check elsewhere.
+
+`CURRENCY` carries an extra required field, `display: 'CURRENCY'`, which is
+redundant with the discriminant it sits beside. It buys nothing here and exists
+because the schema being mirrored has it — visible at every construction site,
+where callers must pass it.
+
+`CellBorders` uses absence rather than a boolean or a null: an edge with no
+entry has no border. That is what makes the border-folding import in
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) a matter of assigning the edges
+present and skipping the rest.
+
+```ts ! types.ts
 export type CellTextFormat =
 	| { type: 'NUMBER'; decimalPlaces?: number }
+	// !mark
 	| { type: 'CURRENCY'; display: 'CURRENCY'; symbol?: string; decimalPlaces?: number }
 	| { type: 'PERCENTAGE'; decimalPlaces?: number }
 	| { type: 'EXPONENTIAL'; decimalPlaces?: number };
@@ -66,8 +150,26 @@ export interface CellBorders {
 	left?: string;
 	right?: string;
 }
+```
 
+## !!steps The format record, keyed by its own coordinates
+
+`CellFormat` carries `x` and `y` alongside its attributes, even though it is
+stored in a map already keyed by those coordinates. The duplication is what
+makes the format array serializable directly — the file stores a flat list, not
+a keyed object.
+
+It also explains the pruning rule in [Sheet.ts](/docs/src/lib/core/Sheet.ts):
+a format with only two keys left must be carrying just `x` and `y`, so every
+real attribute has been cleared and the record can be dropped. That check reads
+as a magic number until you see this shape.
+
+Every attribute is optional, so a format expresses only what has been set —
+consistent with the sparse approach used for cells and headings.
+
+```ts ! types.ts
 export interface CellFormat {
+	// !mark(1:2)
 	x: number;
 	y: number;
 	alignment?: CellAlignment;
@@ -79,25 +181,30 @@ export interface CellFormat {
 	wrapping?: CellWrapping;
 	borders?: CellBorders;
 }
+```
 
-export interface Heading {
-	id: number;
-	size?: number;
-}
+## !!steps The file envelope, with two fields nobody reads
 
-export interface GridFileData {
-	cells: Cell[];
-	formats: CellFormat[];
-	columns: Heading[];
-	rows: Heading[];
-	cell_dependency: string;
-}
+`GridFileData` is one sheet's contents; `GridFile` is the whole document,
+inlining those same fields per sheet rather than nesting a `GridFileData`.
 
+Two members are worth flagging. `borders: unknown[]` is typed as unknown
+because this port stores borders inside each cell's format instead — it is
+written as an empty array on export and only *read* by the compatibility path
+that folds the original application's separate border records into formats.
+
+`order` is written on export but never consulted on import, which reconstructs
+sheets in array order. Two representations of the same ordering, only one of
+which is authoritative — worth knowing before relying on the field.
+
+```ts ! types.ts
 export interface GridFile {
 	sheets: {
 		name: string;
+		// !mark
 		order: number;
 		color?: string;
+		// !mark
 		borders: unknown[];
 		cells: Cell[];
 		formats: CellFormat[];
@@ -111,24 +218,51 @@ export interface GridFile {
 	modified: number;
 	version: '1.3';
 }
+```
 
-export interface Rect {
-	left: number;
-	top: number;
-	right: number;
-	bottom: number;
-}
+## !!steps Defaults, and the key that makes the maps work
 
+The three constants are the grid's default geometry, imported by
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) as the fallback for every
+column and row that has never been resized — which is why its tests assert
+against these names rather than literal numbers.
+
+`coordKey` is the small decision the whole model rests on: a coordinate pair
+becomes the string `` `${x},${y}` ``. One hash per lookup, no nested maps, and
+negative coordinates need no special handling since `-3,-7` is as ordinary a
+key as `3,7`.
+
+`parseCoordKey` reverses it, and is needed because the dependency graph stores
+its edges as key strings — so reading dependents back out means converting
+strings to coordinates.
+
+```ts ! types.ts
 export const CELL_WIDTH = 100;
 export const CELL_HEIGHT = 20;
 export const HEADING_SIZE = 20;
 
 export function coordKey(x: number, y: number): string {
+	// !mark
 	return `${x},${y}`;
 }
 
 export function parseCoordKey(key: string): Coordinate {
+	// !mark
 	const [x, y] = key.split(',').map(Number);
 	return { x, y };
 }
-````
+```
+
+</Scrollycoding>
+
+Because these shapes are the file format, changing one is a compatibility
+decision rather than a refactor — which is the reason the vestigial fields
+survive. The v1.3 marker on `GridFile` is what
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) writes, and its importer accepts
+older layouts by detecting their shape rather than reading that version string.
+
+The runtime counterparts are documented alongside their engines:
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts),
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) and
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts) each declare a result
+interface that mirrors `CellEvaluationResult` on its own side of the boundary.
