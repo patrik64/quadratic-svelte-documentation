@@ -1,131 +1,73 @@
 ---
 title: "GridCanvas.svelte"
-description: "The GridCanvas Svelte component."
+description: "The bridge between Svelte and PixiJS — owns the engine, snapshots UI state for it, and turns pointer events into every grid gesture"
 source: "src/lib/components/GridCanvas.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The grid itself is drawn by PixiJS, which knows nothing about Svelte. This
+component is the seam between them: it creates and owns the engine, feeds it a
+snapshot of the reactive UI state, and translates raw pointer events into the
+gestures a spreadsheet needs — select, drag-select, fill, resize columns and
+rows, point at cells while writing a formula.
 
-````svelte GridCanvas.svelte -n
+That last part is the bulk of the file. A single `pointerdown` can mean six
+different things depending on where it lands and what is open, and the ordering
+of those checks is the component's real design.
+
+<Scrollycoding>
+
+## !!steps A snapshot instead of a subscription
+
+`snapshot()` gathers everything the renderer needs into one plain object. The
+engine calls it each frame rather than subscribing to anything, which keeps
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) free of any Svelte
+dependency — it just asks for the current state.
+
+Reading every field also serves a second purpose used below: calling
+`snapshot()` inside an effect registers a dependency on all of them at once.
+
+Note the last two entries are **local** component state, not store state. The
+fill and reference previews exist only while a drag is in progress, so they live
+here and reach the renderer through the same channel as everything else.
+
+```svelte ! GridCanvas.svelte
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { getCellA1Notation } from '../core/a1';
-	import { HEADING_SIZE, isCodeCellType, type Cell } from '../core/types';
-	import { editorModeColor } from '../grid/colors';
-	import { tokenizeCode, type CodeToken } from '../helpers/codeHighlight';
-	import { PixiGrid, type GridUIState } from '../grid/pixi/PixiGrid';
-	import { handleKeyDown } from '../grid/keyboard';
-	import {
-		app,
-		fillRange,
-		getSelectionRect,
-		gotoCell,
-		importCSVAt,
-		openFileFromJSON,
-		pixiRef,
-		screenToWorld,
-		sheetController
-	} from '../state.svelte';
-	import CellInput from './CellInput.svelte';
-	import GridContextMenu from './GridContextMenu.svelte';
-	import SearchBar from './SearchBar.svelte';
-
-	let containerEl: HTMLDivElement | undefined = $state();
-	let cursorStyle = $state('default');
-	let pixi: PixiGrid | undefined;
-	let contextMenu = $state<{ x: number; y: number } | undefined>(undefined);
-
-	let mouseIsDown = false;
-	let spaceHeld = false;
-	let dragMode: 'none' | 'select' | 'col-resize' | 'row-resize' | 'fill' | 'ref' = 'none';
-	let resizeTarget = { index: 0, originalSize: 0, startWorld: 0 };
-	let selectOrigin: { x: number; y: number } | undefined;
-	let fillSource: { x0: number; y0: number; x1: number; y1: number } | undefined;
-	let fillPreview = $state<{ x0: number; y0: number; x1: number; y1: number } | undefined>();
-	// hover card over code/error cells: the timer doubles as the throttle
-	let hoverCard = $state<{ sx: number; sy: number; cell: Cell } | undefined>();
-	let hoverTimer: ReturnType<typeof setTimeout> | undefined;
-	let hoverKey = '';
-
-	function clearHover(): void {
-		clearTimeout(hoverTimer);
-		hoverKey = '';
-		hoverCard = undefined;
-	}
-
-	function hoverInfo(cell: Cell): {
-		label: string;
-		color: string;
-		body: string;
-		tokens?: CodeToken[];
-	} {
-		const err = cell.evaluation_result?.success === false;
-		const label =
-			cell.type === 'PYTHON'
-				? 'Python'
-				: cell.type === 'JAVASCRIPT'
-					? 'JavaScript'
-					: cell.type === 'FORMULA'
-						? 'Formula'
-						: 'Cell';
-		const code = cell.formula_code ?? cell.python_code ?? cell.javascript_code ?? '';
-		const body = (err ? (cell.evaluation_result?.std_err ?? 'Error') : code)
-			.split('\n')
-			.slice(0, 4)
-			.join('\n');
-		return {
-			label: err ? `${label} · error` : label,
-			color:
-				err || !isCodeCellType(cell.type)
-					? 'var(--error)'
-					: editorModeColor(cell.type),
-			body,
-			tokens: !err && isCodeCellType(cell.type) ? tokenizeCode(cell.type, body) : undefined
-		};
-	}
-
-	// formula pointing mode: clicking/dragging the grid inserts a reference
-	let refOrigin: { x: number; y: number } | undefined;
-	let refPointed: { x: number; y: number } | undefined;
-	let refPreview = $state<{ x0: number; y0: number; x1: number; y1: number } | undefined>();
-
-	/** Inserts (or, while dragging, re-inserts) a ref into the formula editor. */
-	function sendRefInsert(a: { x: number; y: number }, b: { x: number; y: number }): void {
-		const x0 = Math.min(a.x, b.x);
-		const y0 = Math.min(a.y, b.y);
-		const x1 = Math.max(a.x, b.x);
-		const y1 = Math.max(a.y, b.y);
-		refPreview = { x0, y0, x1, y1 };
-		const ref =
-			x0 === x1 && y0 === y1
-				? getCellA1Notation(x0, y0)
-				: `${getCellA1Notation(x0, y0)}:${getCellA1Notation(x1, y1)}`;
-		app.pendingInsertIsRef = true;
-		app.pendingEditorInsert = ref;
-	}
-
 	function snapshot(): GridUIState {
 		return {
 			cursorPosition: app.cursorPosition,
 			multiCursor: app.multiCursor,
 			showHeadings: app.showHeadings,
-			showGridAxes: app.showGridAxes,
-			showGridLines: app.showGridLines,
-			showCellTypeOutlines: app.showCellTypeOutlines,
-			showA1Notation: app.showA1Notation,
-			presentationMode: app.presentationMode,
-			editorOpen: app.showCodeEditor,
-			editorMode: app.editorMode,
-			editorCell: app.editorCell,
+			// ...
 			inputOpen: app.showInput,
+			// !mark(1:2)
 			fillPreview,
 			refPreview
 		};
 	}
+</script>
+```
 
+## !!steps Creating and tearing down the engine
+
+`onMount` builds the `PixiGrid`, handing it two accessors — the current sheet
+and the snapshot function — so the engine pulls rather than being pushed to.
+
+Initialization is async, and `disposed` guards the callback: if the component
+unmounts before WebGL finishes setting up, the continuation returns instead of
+configuring a destroyed engine. The `ResizeObserver` is created inside that
+callback for the same reason.
+
+The camera link is established here too, and it runs both ways — `onViewportChanged`
+writes pans and zooms into the store, while `applyViewport` pushes the stored
+position back in. The epsilon guard inside `applyViewport` is what stops those
+two directions from oscillating.
+
+The returned cleanup removes all three listeners and destroys the engine,
+releasing GPU resources that garbage collection would not reclaim.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 	onMount(() => {
 		const grid = new PixiGrid(() => sheetController.sheet, snapshot);
 		pixi = grid;
@@ -134,6 +76,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		let observer: ResizeObserver | undefined;
 
 		void grid.init(containerEl!).then(() => {
+			// !mark
 			if (disposed) return;
 			// pixi viewport is the source of truth while the user pans/zooms
 			grid.onViewportChanged = (x, y, scale) => {
@@ -146,43 +89,63 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			});
 			observer.observe(containerEl!);
 		});
+</script>
+```
 
-		window.addEventListener('keydown', onWindowKeyDownCapture, true);
-		window.addEventListener('keydown', onWindowKeyDown);
-		window.addEventListener('keyup', onWindowKeyUp);
-		return () => {
-			disposed = true;
-			observer?.disconnect();
-			window.removeEventListener('keydown', onWindowKeyDownCapture, true);
-			window.removeEventListener('keydown', onWindowKeyDown);
-			window.removeEventListener('keyup', onWindowKeyUp);
-			grid.destroy();
-		};
-	});
+## !!steps Translating reactivity into dirty flags
 
-	// push state changes into the pixi engine via dirty flags
-	$effect(() => {
-		void app.redraw;
-		if (pixi) pixi.dirtyCells = true;
-	});
+Three effects convert Svelte's change notifications into the engine's dirty
+flags. The first watches the redraw counter that signals a non-reactive sheet
+mutation and marks the cells dirty.
+
+The second is the clever one. Calling `snapshot()` registers a dependency on
+*every* UI field at once, so any of them re-runs this effect — but not all of
+them cost the same to redraw. Cursor movement needs only the overlay repainted,
+whereas toggling gridlines or headings changes the whole scene. So the settings
+are joined into a string and compared with the previous one, and the expensive
+`dirtyViewport` flag is raised only when something structural actually changed.
+
+The third pushes externally-driven camera moves — zoom buttons, go-to, keyboard
+scrolling — down into the viewport.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 	let lastSettings = '';
 	$effect(() => {
 		const s = snapshot(); // registers all UI-state dependencies
 		const settings = `${s.showHeadings}|${s.showGridAxes}|${s.showGridLines}|${s.showCellTypeOutlines}|${s.showA1Notation}|${s.presentationMode}`;
 		if (pixi) {
 			pixi.dirtyCursor = true;
+			// !mark
 			if (settings !== lastSettings) pixi.dirtyViewport = true; // lines/outlines/headings visibility
 		}
 		lastSettings = settings;
 	});
-	$effect(() => {
-		const { x, y, scale } = app.viewport;
-		pixi?.applyViewport(x, y, scale);
-	});
+</script>
+```
 
+## !!steps One key that must always get through
+
+Presentation mode hides every control, so Escape is the only way out — and by
+then a modal, the cell input or the code editor may be focused, all of which
+stop propagation of bubbled keys.
+
+Registering this listener in the **capture** phase gets ahead of all of them:
+capture runs from the window down toward the target, so this handler sees the
+event before any component can swallow it. It acts only in presentation mode,
+leaving Escape to behave normally everywhere else.
+
+The space bar handler shows the opposite concern. Space toggles pan mode, but
+only outside a text field, where it is an ordinary character. `preventDefault`
+stops the page scrolling, and the comment records that `pixi-viewport`'s drag
+plugin watches the key itself — so this only manages the app's own pan state.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 	// capture phase so Esc exits presentation mode even when a component
 	// (code editor, modal, cell input) stops propagation of bubbled keys
 	function onWindowKeyDownCapture(e: KeyboardEvent): void {
+		// !mark
 		if (e.key === 'Escape' && app.presentationMode) {
 			app.presentationMode = false;
 			e.preventDefault();
@@ -196,6 +159,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			target instanceof HTMLInputElement ||
 			target instanceof HTMLTextAreaElement ||
 			target?.isContentEditable;
+		// !mark
 		if (e.key === ' ' && !inField && !app.showInput) {
 			spaceHeld = true;
 			if (app.panMode === 'disabled') app.panMode = 'enabled';
@@ -204,27 +168,29 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		}
 		handleKeyDown(e);
 	}
+</script>
+```
 
-	function onWindowKeyUp(e: KeyboardEvent): void {
-		if (e.key === ' ') {
-			spaceHeld = false;
-			if (mouseIsDown) return; // keep panning until mouseup
-			app.panMode = 'disabled';
-		}
-	}
+## !!steps Hit-testing in screen space
 
-	function rowHeadingWidth(): number {
-		return pixi?.headings?.rowHeadingWidth ?? 0;
-	}
+Turning a pointer position into a grid location goes through
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) — screen to world, then
+world to column and row indices, so the DOM layer and the renderer agree
+exactly on which cell is where.
 
-	function cellAtScreen(sx: number, sy: number): { x: number; y: number } {
-		const w = screenToWorld(sx, sy);
-		return {
-			x: sheetController.sheet.gridOffsets.getColumnIndex(w.x),
-			y: sheetController.sheet.gridOffsets.getRowIndex(w.y)
-		};
-	}
+The fill handle test converts the other way, projecting the selection's
+bottom-right corner into screen space and accepting anything within six pixels.
+Doing it in screen space rather than world space is deliberate: the handle stays
+the same physical size at every zoom level, so the grab area has to be measured
+in pixels too.
 
+`hitHeadingEdge` uses the same approach with a four-pixel tolerance, checking
+both the edge of the column under the pointer and the next one so the boundary
+is grabbable from either side. It reports `index - 1`, since dragging an edge
+resizes the column to its *left*.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 	/** True when the screen point is over the fill handle (selection corner). */
 	function hitFillHandle(sx: number, sy: number): boolean {
 		const sel = getSelectionRect();
@@ -232,98 +198,33 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		const rect = offsets.getCellRect(sel.x1, sel.y1);
 		const hx = (rect.x + rect.w - app.viewport.x) * app.viewport.scale;
 		const hy = (rect.y + rect.h - app.viewport.y) * app.viewport.scale;
+		// !mark
 		return Math.abs(sx - hx) <= 6 && Math.abs(sy - hy) <= 6;
 	}
+</script>
+```
 
-	/** Which heading edge (if any) is near screen point, for resize cursors. */
-	function hitHeadingEdge(
-		sx: number,
-		sy: number
-	): { kind: 'col' | 'row'; index: number } | undefined {
-		const offsets = sheetController.sheet.gridOffsets;
-		const rhw = rowHeadingWidth();
-		const TOLERANCE = 4;
-		if (app.showHeadings && sy < HEADING_SIZE && sx > rhw) {
-			const w = screenToWorld(sx, sy);
-			const col = offsets.getColumnIndex(w.x);
-			for (const c of [col, col + 1]) {
-				const edgeScreen = (offsets.getColumnX(c) - app.viewport.x) * app.viewport.scale;
-				if (Math.abs(sx - edgeScreen) < TOLERANCE) return { kind: 'col', index: c - 1 };
-			}
-		}
-		if (app.showHeadings && sx < rhw && sy > HEADING_SIZE) {
-			const w = screenToWorld(sx, sy);
-			const row = offsets.getRowIndex(w.y);
-			for (const r of [row, row + 1]) {
-				const edgeScreen = (offsets.getRowY(r) - app.viewport.y) * app.viewport.scale;
-				if (Math.abs(sy - edgeScreen) < TOLERANCE) return { kind: 'row', index: r - 1 };
-			}
-		}
-		return undefined;
-	}
+## !!steps Six meanings for one press, in priority order
 
-	function selectColumn(x: number, shift: boolean): void {
-		const bounds = sheetController.sheet.getBounds();
-		const y0 = bounds?.top ?? 0;
-		const y1 = bounds?.bottom ?? 0;
-		if (shift && app.multiCursor) {
-			const o = app.multiCursor.originPosition;
-			app.multiCursor = { originPosition: o, terminalPosition: { x, y: y1 } };
-		} else {
-			app.cursorPosition = { x, y: y0 };
-			app.keyboardMovePosition = { x, y: y0 };
-			app.multiCursor = { originPosition: { x, y: y0 }, terminalPosition: { x, y: y1 } };
-		}
-	}
+`onPointerDown` is a cascade, and the order encodes which gesture wins when two
+are possible.
 
-	function selectRow(y: number, shift: boolean): void {
-		const bounds = sheetController.sheet.getBounds();
-		const x0 = bounds?.left ?? 0;
-		const x1 = bounds?.right ?? 0;
-		if (shift && app.multiCursor) {
-			const o = app.multiCursor.originPosition;
-			app.multiCursor = { originPosition: o, terminalPosition: { x: x1, y } };
-		} else {
-			app.cursorPosition = { x: x0, y };
-			app.keyboardMovePosition = { x: x0, y };
-			app.multiCursor = { originPosition: { x: x0, y }, terminalPosition: { x: x1, y } };
-		}
-	}
+Pan mode comes first and returns immediately, handing the drag to
+`pixi-viewport`. Then the fill handle, checked before anything else on the grid
+because it sits *on top of* a cell — testing the cell first would make the
+handle unreachable. Heading edges come before heading bodies for the same
+reason: the resize zone overlaps the header you would otherwise be clicking to
+select.
 
-	function onContextMenu(e: MouseEvent): void {
-		e.preventDefault();
-		if (!containerEl || app.panMode !== 'disabled') return;
-		const rect = containerEl.getBoundingClientRect();
-		const sx = e.clientX - rect.left;
-		const sy = e.clientY - rect.top;
-		if (app.showHeadings && (sy < HEADING_SIZE || sx < rowHeadingWidth())) return;
-		const cell = cellAtScreen(sx, sy);
-		// right-clicking outside the selection moves the cursor first
-		const sel = getSelectionRect();
-		const inside = cell.x >= sel.x0 && cell.x <= sel.x1 && cell.y >= sel.y0 && cell.y <= sel.y1;
-		if (!inside) {
-			app.cursorPosition = cell;
-			app.keyboardMovePosition = cell;
-			app.multiCursor = undefined;
-		}
-		contextMenu = { x: e.clientX, y: e.clientY };
-	}
+`setPointerCapture` appears in every branch that starts a drag. It routes
+subsequent pointer events to this element even when the pointer leaves it, so
+dragging a selection past the window edge keeps working instead of silently
+stopping.
 
-	function onPointerDown(e: PointerEvent): void {
-		if (!containerEl) return;
-		mouseIsDown = true;
-		contextMenu = undefined;
-		clearHover();
-		if (app.panMode !== 'disabled') {
-			app.panMode = 'dragging'; // pixi-viewport performs the actual pan
-			return;
-		}
-		if (e.button !== 0) return;
-		const rect = containerEl.getBoundingClientRect();
-		const sx = e.clientX - rect.left;
-		const sy = e.clientY - rect.top;
-
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 		// fill-handle drag
+		// !mark
 		if (!app.showInput && hitFillHandle(sx, sy)) {
 			containerEl.setPointerCapture(e.pointerId);
 			fillSource = getSelectionRect();
@@ -344,33 +245,33 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 					originalSize: offsets.getColumnWidth(edge.index),
 					startWorld: screenToWorld(sx, sy).x
 				};
-			} else {
-				dragMode = 'row-resize';
-				resizeTarget = {
-					index: edge.index,
-					originalSize: offsets.getRowHeight(edge.index),
-					startWorld: screenToWorld(sx, sy).y
-				};
 			}
 			return;
 		}
-		const rhw = rowHeadingWidth();
-		if (app.showHeadings && sy < HEADING_SIZE && sx < rhw) {
-			const bounds = sheetController.sheet.getBounds();
-			if (bounds) gotoCell(bounds.left, bounds.top, { x1: bounds.right, y1: bounds.bottom });
-			return;
-		}
-		if (app.showHeadings && sy < HEADING_SIZE) {
-			selectColumn(cellAtScreen(sx, sy).x, e.shiftKey);
-			return;
-		}
-		if (app.showHeadings && sx < rhw) {
-			selectRow(cellAtScreen(sx, sy).y, e.shiftKey);
-			return;
-		}
+</script>
+```
 
+## !!steps When a click means a reference, not a selection
+
+With a formula open, clicking the grid does something different: it inserts the
+clicked cell's reference into the editor rather than moving the cursor. This is
+the pointing mode every spreadsheet has, and it is checked before the ordinary
+selection branch so it takes precedence.
+
+`!e.shiftKey` is the escape hatch — shift-clicking still selects normally, so
+the grid remains navigable while an editor is open.
+
+The reference is sent immediately on press, then re-sent on every drag that
+changes the cell, which is how dragging out a range updates the formula live.
+That works because [CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte)
+remembers where the last reference landed and **replaces** it rather than
+appending — the `lastRefSpan` mechanism on that page.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 		// formula pointing mode: a grid click inserts the cell's reference
 		// into the open formula editor instead of moving the cursor
+		// !mark
 		if (app.showCodeEditor && app.editorMode === 'FORMULA' && !e.shiftKey) {
 			containerEl.setPointerCapture(e.pointerId);
 			const pointed = cellAtScreen(sx, sy);
@@ -380,55 +281,31 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			dragMode = 'ref';
 			return;
 		}
+</script>
+```
 
-		// grid selection
-		containerEl.setPointerCapture(e.pointerId);
-		const cell = cellAtScreen(sx, sy);
-		if (e.shiftKey) {
-			app.multiCursor = {
-				originPosition: { ...app.cursorPosition },
-				terminalPosition: cell
-			};
-			app.keyboardMovePosition = cell;
-			return;
-		}
-		app.showInput = false;
-		app.cursorPosition = cell;
-		app.keyboardMovePosition = cell;
-		app.multiCursor = undefined;
-		selectOrigin = cell;
-		dragMode = 'select';
-	}
+## !!steps Fill extends along one axis only
 
-	function onPointerMove(e: PointerEvent): void {
-		if (!containerEl) return;
-		const rect = containerEl.getBoundingClientRect();
-		const sx = e.clientX - rect.left;
-		const sy = e.clientY - rect.top;
+While dragging the fill handle, the preview grows in whichever direction the
+pointer has travelled further — comparing the vertical and horizontal distance
+past the selection's edge and committing to the larger.
 
-		if (dragMode === 'col-resize') {
-			const dw = screenToWorld(sx, sy).x - resizeTarget.startWorld;
-			sheetController.sheet.gridOffsets.setColumnWidth(
-				resizeTarget.index,
-				resizeTarget.originalSize + dw
-			);
-			app.markDirty();
-			return;
-		}
-		if (dragMode === 'row-resize') {
-			const dh = screenToWorld(sx, sy).y - resizeTarget.startWorld;
-			sheetController.sheet.gridOffsets.setRowHeight(
-				resizeTarget.index,
-				resizeTarget.originalSize + dh
-			);
-			app.markDirty();
-			return;
-		}
+Constraining it to a single axis matches how fill works everywhere: filling
+down and right at once has no sensible meaning. The `dy >= dx` comparison
+breaks ties toward vertical, which is the more common gesture.
+
+Neither branch can shrink the source: both distances must be positive, and
+dragging back inside the selection falls through to the `else`, restoring the
+preview to the original rectangle.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 		if (dragMode === 'fill' && fillSource) {
 			const cell = cellAtScreen(sx, sy);
 			// extend along the dominant axis only, never shrinking the source
 			const dy = cell.y - fillSource.y1;
 			const dx = cell.x - fillSource.x1;
+			// !mark(1:6)
 			if (dy >= dx && dy > 0) {
 				fillPreview = { ...fillSource, y1: cell.y };
 			} else if (dx > 0) {
@@ -438,94 +315,28 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			}
 			return;
 		}
-		if (dragMode === 'ref' && refOrigin) {
-			const cell = cellAtScreen(sx, sy);
-			// re-insert live while dragging; the editor replaces the last ref
-			if (cell.x !== refPointed?.x || cell.y !== refPointed?.y) {
-				refPointed = cell;
-				sendRefInsert(refOrigin, cell);
-			}
-			return;
-		}
-		if (dragMode === 'select' && selectOrigin) {
-			const cell = cellAtScreen(sx, sy);
-			if (cell.x === selectOrigin.x && cell.y === selectOrigin.y) {
-				app.multiCursor = undefined;
-			} else {
-				app.multiCursor = {
-					originPosition: { ...selectOrigin },
-					terminalPosition: cell
-				};
-			}
-			app.keyboardMovePosition = cell;
-			return;
-		}
+</script>
+```
 
-		// hover cursor styling
-		if (app.panMode === 'enabled') cursorStyle = 'grab';
-		else if (app.panMode === 'dragging') cursorStyle = 'grabbing';
-		else if (!app.showInput && hitFillHandle(sx, sy)) cursorStyle = 'crosshair';
-		else {
-			const edge = hitHeadingEdge(sx, sy);
-			if (edge) cursorStyle = edge.kind === 'col' ? 'col-resize' : 'row-resize';
-			else if (app.showHeadings && (sy < HEADING_SIZE || sx < rowHeadingWidth()))
-				cursorStyle = 'pointer';
-			else cursorStyle = 'default';
-		}
+## !!steps Making a resize undoable after the fact
 
-		// hover card for code and error cells
-		const overGrid =
-			!mouseIsDown &&
-			app.panMode === 'disabled' &&
-			(!app.showHeadings || (sy >= HEADING_SIZE && sx >= rowHeadingWidth()));
-		const hovered = overGrid ? cellAtScreen(sx, sy) : undefined;
-		const hcell = hovered ? sheetController.sheet.getCell(hovered.x, hovered.y) : undefined;
-		const interesting =
-			hcell && (isCodeCellType(hcell.type) || hcell.evaluation_result?.success === false);
-		const key = interesting && hovered ? `${hovered.x},${hovered.y}` : '';
-		if (key !== hoverKey) {
-			clearTimeout(hoverTimer);
-			hoverKey = key;
-			hoverCard = undefined;
-			if (interesting && hcell) {
-				hoverTimer = setTimeout(() => (hoverCard = { sx, sy, cell: hcell }), 150);
-			}
-		}
-	}
+Resizing is the one gesture that has to be rewritten when it ends. During the
+drag, each move writes straight into `GridOffsets` so the columns track the
+pointer — fast, but invisible to the undo system, and it would otherwise record
+dozens of intermediate widths.
 
-	function onPointerUp(): void {
-		mouseIsDown = false;
-		if (app.panMode === 'dragging') app.panMode = spaceHeld ? 'enabled' : 'disabled';
-		if (dragMode === 'ref') {
-			dragMode = 'none';
-			refOrigin = undefined;
-			refPointed = undefined;
-			refPreview = undefined;
-			return;
-		}
-		if (dragMode === 'fill' && fillSource && fillPreview) {
-			const source = fillSource;
-			const preview = fillPreview;
-			fillSource = undefined;
-			fillPreview = undefined;
-			dragMode = 'none';
-			if (preview.y1 > source.y1) {
-				void fillRange(source, preview.y1 - source.y1, 'y').then(() => {
-					app.multiCursor = {
-						originPosition: { x: source.x0, y: source.y0 },
-						terminalPosition: { x: source.x1, y: preview.y1 }
-					};
-				});
-			} else if (preview.x1 > source.x1) {
-				void fillRange(source, preview.x1 - source.x1, 'x').then(() => {
-					app.multiCursor = {
-						originPosition: { x: source.x0, y: source.y0 },
-						terminalPosition: { x: preview.x1, y: source.y1 }
-					};
-				});
-			}
-			return;
-		}
+So on release the final size is read back, the offsets are **reset to the
+original**, and the change is replayed through a single transaction on
+[SheetController.ts](/docs/src/lib/core/SheetController.ts). The user sees no
+flicker because both happen in the same tick, and undo now has exactly one
+operation to reverse: the whole resize.
+
+The fill branch above it commits through `fillRange` and then selects the
+result, so the newly filled cells are highlighted — matching what a spreadsheet
+does after a fill.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 		if (dragMode === 'col-resize' || dragMode === 'row-resize') {
 			// re-apply through a transaction so resize is undoable
 			const offsets = sheetController.sheet.gridOffsets;
@@ -534,38 +345,34 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				kind === 'column'
 					? offsets.getColumnWidth(resizeTarget.index)
 					: offsets.getRowHeight(resizeTarget.index);
+			// !mark(1:2)
 			if (kind === 'column') offsets.setColumnWidth(resizeTarget.index, resizeTarget.originalSize);
 			else offsets.setRowHeight(resizeTarget.index, resizeTarget.originalSize);
 			sheetController.startTransaction();
 			sheetController.execute({ type: 'setHeading', kind, id: resizeTarget.index, size: finalSize });
 			sheetController.endTransaction();
 		}
-		dragMode = 'none';
-		selectOrigin = undefined;
-	}
+</script>
+```
 
-	function onDoubleClick(e: MouseEvent): void {
-		if (!containerEl) return;
-		// pointing mode owns grid clicks; don't retarget the editor
-		if (app.showCodeEditor && app.editorMode === 'FORMULA') return;
-		const rect = containerEl.getBoundingClientRect();
-		const sx = e.clientX - rect.left;
-		const sy = e.clientY - rect.top;
-		if (app.showHeadings && (sy < HEADING_SIZE || sx < rowHeadingWidth())) return;
-		const cell = cellAtScreen(sx, sy);
-		app.cursorPosition = cell;
-		app.keyboardMovePosition = cell;
-		const existing = sheetController.sheet.getCell(cell.x, cell.y);
-		if (existing && isCodeCellType(existing.type)) {
-			app.editorMode = existing.type;
-			app.editorCell = cell;
-			app.showCodeEditor = true;
-		} else {
-			app.inputInitialValue = existing?.value ?? '';
-			app.showInput = true;
-		}
-	}
+## !!steps Double-click, right-click, and dropped files
 
+Double-clicking opens whatever the cell warrants — the code editor for a code
+cell, the plain input otherwise — but returns early when a formula is being
+edited, since pointing mode owns grid clicks and retargeting the editor
+mid-formula would be wrong.
+
+The context menu handler adds a rule worth knowing: right-clicking **outside**
+the current selection moves the cursor there first, so the menu always acts on
+what you right-clicked. Right-clicking inside a selection leaves it intact, so
+a menu action applies to the whole block.
+
+Dropping a file dispatches on extension — `.grid` and `.json` replace the whole
+document, while a `.csv` imports **at the cell under the pointer**, so where you
+drop determines where the data lands.
+
+```svelte ! GridCanvas.svelte
+<script lang="ts">
 	async function onDrop(e: DragEvent): Promise<void> {
 		e.preventDefault();
 		const file = e.dataTransfer?.files?.[0];
@@ -575,19 +382,31 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			openFileFromJSON(text, file.name);
 		} else if (file.name.endsWith('.csv')) {
 			const rect = containerEl?.getBoundingClientRect();
+			// !mark(1:3)
 			const at = rect
 				? cellAtScreen(e.clientX - rect.left, e.clientY - rect.top)
 				: app.cursorPosition;
 			await importCSVAt(text, at);
 		}
 	}
-
-	const containerCursor = $derived(
-		app.panMode === 'dragging' ? 'grabbing' : app.panMode === 'enabled' ? 'grab' : cursorStyle
-	);
 </script>
+```
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
+## !!steps The DOM layers above the canvas
+
+The container holds the canvas and every DOM element that has to sit over it:
+the floating cell editor, the search bar, the context menu and the hover card.
+
+They live here rather than in [+page.svelte](/docs/src/routes/+page.svelte)
+because each is positioned in grid coordinates, and this element is their
+positioning context. `role="application"` tells assistive technology this is an
+interactive widget rather than a document, since none of the grid is real DOM.
+
+The cursor is driven by a derived value rather than set imperatively, so pan
+mode always wins over whatever hover styling the pointer-move handler last
+computed.
+
+```svelte ! GridCanvas.svelte
 <div
 	bind:this={containerEl}
 	class="grid-container"
@@ -606,16 +425,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	{#if app.showInput}
 		<CellInput />
 	{/if}
-	{#if app.showSearch}
-		<SearchBar />
-	{/if}
-	{#if contextMenu}
-		<GridContextMenu
-			x={contextMenu.x}
-			y={contextMenu.y}
-			onclose={() => (contextMenu = undefined)}
-		/>
-	{/if}
+```
+
+## !!steps A hover card that stays on screen
+
+Hovering a code or error cell shows a card with its source or error text, after
+a delay tracked by `hoverTimer` and `hoverKey` so moving across cells does not
+flash cards continuously.
+
+Its position is computed to keep it inside the container: `left` is clamped so a
+card near the right edge does not overflow, and `top` flips the card **above**
+the pointer when there is not enough room below — the standard tooltip
+behavior, done with one conditional.
+
+The body reuses the tokenizer from
+[codeHighlight.ts](/docs/src/lib/helpers/codeHighlight.ts), rendering the same
+`syn-{type}` spans the code editor uses. That is the second consumer that makes
+those classes global in [app.css](/docs/src/app.css), and it means a formula
+looks identical whether you hover it or open it.
+
+```svelte ! GridCanvas.svelte
 	{#if hoverCard}
 		{@const info = hoverInfo(hoverCard.cell)}
 		<div
@@ -629,47 +458,15 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			<pre class="hc-body">{#if info.tokens}{#each info.tokens as t}{#if t.type === 'plain'}{t.text}{:else}<span class="syn-{t.type}">{t.text}</span>{/if}{/each}{:else}{info.body}{/if}</pre>
 		</div>
 	{/if}
-</div>
+```
 
-<style>
-	.grid-container {
-		position: relative;
-		flex: 1;
-		overflow: hidden;
-		min-width: 0;
-	}
-	.grid-container :global(canvas.grid-canvas) {
-		display: block;
-		touch-action: none;
-	}
-	.hover-card {
-		position: absolute;
-		z-index: 55;
-		max-width: 320px;
-		background: var(--panel);
-		border: 1px solid var(--border);
-		border-radius: 5px;
-		box-shadow: 0 4px 16px var(--shadow);
-		padding: 0.4rem 0.6rem;
-		pointer-events: none;
-	}
-	.hc-head {
-		font-size: 0.68rem;
-		font-weight: 600;
-		letter-spacing: 0.06em;
-		text-transform: uppercase;
-		margin-bottom: 0.25rem;
-	}
-	.hc-body {
-		margin: 0;
-		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-		font-size: 0.72rem;
-		line-height: 1.45;
-		color: var(--text);
-		white-space: pre-wrap;
-		word-break: break-word;
-		max-height: 6.5rem;
-		overflow: hidden;
-	}
-</style>
-````
+</Scrollycoding>
+
+Almost every mutation here routes through
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) rather than touching the sheet
+directly, so the same operations are reachable from
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts) and the command palette. The
+exception is the live resize, which writes to
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) directly and then replays
+itself as a transaction — the one place performance justified bypassing the
+model, with the bypass corrected before it becomes permanent.
