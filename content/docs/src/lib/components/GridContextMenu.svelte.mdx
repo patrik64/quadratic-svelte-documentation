@@ -1,41 +1,45 @@
 ---
 title: "GridContextMenu.svelte"
-description: "Right-click grid menu, ported from the modern client's GridContextMenuCell."
+description: "The right-click grid menu — positioned at the pointer, dismissed by containment because Svelte delegates mousedown"
 source: "src/lib/components/GridContextMenu.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The menu that appears on right-click, offering clipboard actions and row and
+column operations for whatever is selected. It is short, and two things in it
+are worth the read: how it decides where to appear, and why it dismisses itself
+by testing containment rather than stopping the event.
 
-````svelte GridContextMenu.svelte -n
+It deliberately does not reuse
+[DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte). That
+component anchors a panel beneath a trigger button; this one has no trigger and
+must appear at arbitrary coordinates, so it brings its own container.
+
+<Scrollycoding>
+
+## !!steps Coordinates in, actions for the selection
+
+The pointer position arrives as props from
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which also
+guarantees something useful before rendering this: right-clicking outside the
+current selection moves the cursor there first. So by the time the menu exists,
+the selection is always what the user just right-clicked.
+
+Both deriveds read `app.redraw` first — the manual subscription to the
+non-reactive sheet model, the same pattern used in
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte). Without it the
+menu could open with a stale idea of whether the cursor holds a code cell.
+
+`cols` and `rows` are counts rather than coordinates, computed inclusively,
+because the only thing they are used for is pluralizing labels.
+
+```svelte ! GridContextMenu.svelte
 <script lang="ts">
-	// Right-click grid menu, ported from the modern client's GridContextMenuCell.
-	import { isCodeCellType } from '../core/types';
-	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
-	import {
-		app,
-		copySelection,
-		copySelectionAsPng,
-		deleteColumns,
-		deleteRows,
-		downloadSelectionAsCsv,
-		getSelectionRect,
-		insertColumn,
-		insertRow,
-		pasteFromClipboard,
-		rerunCurrentCell,
-		sheetController
-	} from '../state.svelte';
-
-	const C = KeyboardSymbols.Cmd;
-	const S = KeyboardSymbols.Shift;
-
 	let { x, y, onclose }: { x: number; y: number; onclose: () => void } = $props();
 	let menuEl: HTMLDivElement | undefined = $state();
 
 	const sel = $derived.by(() => {
+		// !mark
 		void app.redraw;
 		return getSelectionRect();
 	});
@@ -46,20 +50,65 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		const cell = sheetController.sheet.getCell(app.cursorPosition.x, app.cursorPosition.y);
 		return cell !== undefined && isCodeCellType(cell.type);
 	});
+</script>
+```
 
+## !!steps Staying on screen with estimated dimensions
+
+Right-clicking near the bottom-right corner would otherwise put half the menu
+off-screen, so each coordinate is capped.
+
+The interesting part is that the limits use **hard-coded estimates** — 250 and
+420 — rather than measuring the rendered element. Measuring would mean rendering
+first, reading `offsetHeight`, then repositioning, which is a layout round trip
+and a visible jump. Since the menu's width is fixed by its `min-width` and its
+height varies only by whether the code-cell entry is present, constants are
+close enough and cost nothing.
+
+The `typeof window` guards are defensive rather than necessary here, the app
+being client-only, but they keep the module evaluable outside a browser.
+
+```svelte ! GridContextMenu.svelte
+<script lang="ts">
 	// keep the menu on-screen
+	// !mark(1:2)
 	const left = $derived(Math.min(x, (typeof window !== 'undefined' ? window.innerWidth : 1200) - 250));
 	const top = $derived(Math.min(y, (typeof window !== 'undefined' ? window.innerHeight : 800) - 420));
 
 	function run(action: () => unknown): void {
+		// !mark(1:2)
 		onclose();
 		void action();
 	}
+</script>
+```
 
+## !!steps Why containment, not stopPropagation
+
+The comment here documents a genuine Svelte 5 trap, and it is the reason this
+component looks the way it does.
+
+The obvious way to dismiss a menu is a window listener plus `stopPropagation`
+on clicks inside it. That does not work reliably, because Svelte **delegates**
+events like `mousedown`: rather than attaching a listener to each element, it
+attaches one at the root and dispatches from there. By the time a handler inside
+the menu runs, the event has already reached the root — so stopping it cannot
+prevent a window-level listener that was registered directly.
+
+Testing containment sidesteps the whole question: the listener asks whether the
+event's target is inside the menu, which is true regardless of how the event
+travelled.
+
+Escape is registered in the capture phase and stops propagation, so closing the
+menu does not also trigger the Escape handling further down the app.
+
+```svelte ! GridContextMenu.svelte
+<script lang="ts">
 	$effect(() => {
 		// containment check rather than stopPropagation: Svelte delegates
 		// mousedown, so stopping it inside the menu is unreliable
 		const close = (e: MouseEvent) => {
+			// !mark
 			if (!menuEl?.contains(e.target as Node)) onclose();
 		};
 		const key = (e: KeyboardEvent) => {
@@ -69,6 +118,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			}
 		};
 		window.addEventListener('mousedown', close);
+		// !mark
 		window.addEventListener('keydown', key, true);
 		return () => {
 			window.removeEventListener('mousedown', close);
@@ -76,15 +126,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		};
 	});
 </script>
+```
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-	class="ctx"
-	bind:this={menuEl}
-	style:left="{left}px"
-	style:top="{top}px"
-	oncontextmenu={(e) => e.preventDefault()}
->
+## !!steps An entry that only sometimes exists
+
+`Run code` and its separator appear only when the cursor holds a code cell, so
+the menu does not offer an action that would do nothing on a text cell.
+
+The shortcut hints are built from the platform-aware glyphs in
+[keyboardSymbols.ts](/docs/src/lib/helpers/keyboardSymbols.ts), aliased to `C`
+and `S` at the top of the file — the same convention
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) uses.
+
+Every action is wrapped in `run`, so all of them close the menu before acting.
+The wrapping also normalizes the calling convention: `rerunCurrentCell` is
+passed directly while `copySelection` needs an argument, and `run` accepts
+either since it just invokes what it is given.
+
+```svelte ! GridContextMenu.svelte
 	{#if isCodeCell}
 		<button class="item" onclick={() => run(rerunCurrentCell)}>
 			<span>Run code</span><span class="key">{C}↵</span>
@@ -100,14 +159,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	<button class="item" onclick={() => run(pasteFromClipboard)}>
 		<span>Paste</span><span class="key">{C}V</span>
 	</button>
-	<div class="sep"></div>
-	<button class="item" onclick={() => run(copySelectionAsPng)}>
-		<span>Copy as PNG</span><span class="key">{C}{S}C</span>
-	</button>
-	<button class="item" onclick={() => run(downloadSelectionAsCsv)}>
-		<span>Download as CSV</span><span class="key">{C}{S}E</span>
-	</button>
-	<div class="sep"></div>
+```
+
+## !!steps Labels that describe what will happen
+
+The structural commands read their arguments from the derived selection, so
+inserting a column left uses the selection's left edge and inserting right uses
+one past its right edge — matching what the equivalent entries in the command
+palette do.
+
+The delete labels are the nice touch: they pluralize from the actual selection,
+so the menu says `Delete column` for one and `Delete 3 columns` for three.
+Naming the count turns a potentially destructive action into one whose scope is
+obvious before clicking, which matters more here than in a menu where you chose
+the target explicitly.
+
+```svelte ! GridContextMenu.svelte
 	<button class="item" onclick={() => run(() => insertColumn(sel.x0))}>
 		<span>Insert column left</span>
 	</button>
@@ -127,8 +194,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	<button class="item" onclick={() => run(() => deleteRows(sel.y0, sel.y1))}>
 		<span>Delete {rows > 1 ? `${rows} rows` : 'row'}</span>
 	</button>
-</div>
+```
 
+## !!steps Fixed positioning, and duplicated item styles
+
+`position: fixed` places the menu against the viewport, which is what makes the
+raw `clientX`/`clientY` values usable directly — no conversion into any
+container's coordinate space. The `z-index` of 250 puts it above the grid and
+its overlays but below the full-screen
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) at 300.
+
+The item rules are essentially a copy of the ones
+[DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte) exposes for
+its menu content — same flex layout, same `space-between`, same padding and
+shortcut treatment. Because this component does not use that one, it cannot
+inherit them, so the appearance is kept in step by duplication rather than by
+sharing. That is the cost of the positioning difference, and worth knowing if a
+menu restyle ever needs applying in two places.
+
+```svelte ! GridContextMenu.svelte
 <style>
 	.ctx {
 		position: fixed;
@@ -158,13 +242,19 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	.item:hover {
 		background: var(--accent-soft);
 	}
-	.key {
-		color: var(--faint-2);
-		font-size: 0.72rem;
-	}
-	.sep {
-		border-top: 1px solid var(--border-light);
-		margin: 4px 0;
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Mounted by [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte),
+which owns the `contextMenu` coordinates and clears them through the `onclose`
+prop — so this component never decides whether it exists, only how it behaves
+while it does.
+
+Every action it offers is also available from
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) and,
+for most, from [keyboard.ts](/docs/src/lib/grid/keyboard.ts). All three route
+through the same functions in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), so the menu adds reach rather
+than behavior.
