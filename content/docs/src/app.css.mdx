@@ -1,15 +1,36 @@
 ---
 title: "app.css"
-description: "Global styles and CSS custom properties for the app shell."
+description: "The DOM half of the theme — semantic custom properties, global syntax token classes, and the dark override"
 source: "src/app.css"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The application's only global stylesheet, imported once by
+[+layout.svelte](/docs/src/routes/+layout.svelte). It defines almost no layout;
+it is a palette, expressed as CSS custom properties that every component reads
+through `var(...)`.
 
-````css app.css -n
+This is one of two palettes in the project. The canvas cannot use CSS variables
+— PixiJS needs concrete color values at draw time — so the grid keeps its own
+copy in [colors.ts](/docs/src/lib/grid/colors.ts). The two are maintained in
+parallel and share values by convention, not by mechanism.
+
+<Scrollycoding>
+
+## !!steps Surfaces and text, named by role
+
+The light palette leads with the structural colors, and the names describe
+*roles* rather than appearances — `--panel`, `--hover`, `--border` — which is
+what allows the dark block later to redefine them without any component
+knowing.
+
+The layering is deliberate: `--bg` for the page, `--panel` for raised surfaces
+like bars and menus, `--panel-2` for a slightly recessed variant, and `--hover`
+for interactive feedback. Text follows the same gradation from `--text` through
+`--muted` to two levels of `--faint`, giving components a ready-made hierarchy
+instead of each inventing its own greys.
+
+```css ! app.css
 /* Theme custom properties. Light is the original palette; dark mirrors the
  * slide deck's dark palette. `data-theme` on <html> is set by state.svelte.ts
  * (persisted, defaulting to prefers-color-scheme). */
@@ -25,6 +46,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	--faint-2: #a7b2bc;
 	--border: #cfd7de;
 	--border-light: #e6ebf0;
+}
+```
+
+## !!steps Accents, states and the language colors
+
+The rest of the palette covers intent rather than structure: the accent blue
+and its tinted background, error and warning pairs that keep foreground and
+background together so a caller cannot mismatch them, and a shadow expressed as
+`rgba` because it will need a different opacity in dark mode, not just a
+different hue.
+
+Then three colors named after languages — `--formula`, `--python`,
+`--javascript`. These are the DOM-side counterparts of the `cellColorUser*`
+entries in [colors.ts](/docs/src/lib/grid/colors.ts), so a Python cell is
+tinted the same blue whether it is drawn on the canvas or in the editor panel.
+The `--syn-*` group closes the block with one color per syntax token type.
+
+```css ! app.css
+:root {
 	--accent: #2463eb;
 	--accent-soft: #eef4ff;
 	--error: #f25f5c;
@@ -40,7 +80,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	--syn-number: #b45309;
 	--syn-function: #2463eb;
 }
+```
 
+## !!steps Form controls need explicit theming
+
+Native form controls are the one place a theme reliably leaks. Left alone they
+take user-agent styling — a white background and black text — which looks
+correct in light mode and becomes a glaring white box in dark mode. So the
+three offenders get the palette applied directly.
+
+`caret-color` is the easily-missed third property: without it the text cursor
+stays dark and effectively disappears against a dark input. The comment records
+why this is safe as a bare element selector — a class-scoped rule inside a
+component has higher specificity and still wins, so this only ever acts as a
+default.
+
+```css ! app.css
 /* themed defaults for form controls that rely on UA styling; component
  * class-scoped rules still win on specificity */
 input,
@@ -50,7 +105,27 @@ select {
 	color: var(--text);
 	caret-color: var(--text);
 }
+```
 
+## !!steps Syntax classes that have to be global
+
+These six classes are the reason the stylesheet contains rules at all rather
+than only variables. They style highlighted code tokens, and they are applied
+from two places — the code editor and the cell hover card — as
+`class="syn-{t.type}"`, with the type coming from the tokenizer in
+[codeHighlight.ts](/docs/src/lib/helpers/codeHighlight.ts).
+
+That dynamic construction is exactly why they cannot live inside either
+component. Svelte's scoped styles are resolved at compile time by matching
+class names in the markup; a class assembled from a runtime value gives the
+compiler nothing to match, so a scoped rule would be treated as unused and
+pruned. Being global sidesteps that, and has the side benefit that the editor
+and the hover card cannot drift apart.
+
+Note `.syn-comment` reuses `--faint` instead of taking a dedicated variable,
+and is the only one adding a non-color property.
+
+```css ! app.css
 /* syntax token colors, shared by the code editor and the cell hover card */
 .syn-keyword {
 	color: var(--syn-keyword);
@@ -71,7 +146,27 @@ select {
 .syn-function {
 	color: var(--syn-function);
 }
+```
 
+## !!steps The dark override
+
+Dark mode is a single attribute-scoped block redefining every variable. Because
+components only ever read `var(--panel)`, flipping `data-theme` on the root
+element re-resolves all of them at once — no component re-renders, no class
+toggling, no JavaScript beyond setting the attribute.
+
+The overrides are more than inverted lightness. `--shadow` jumps from `0.14` to
+`0.55` opacity, since a shadow that reads clearly on white is invisible on a
+dark surface. The accent lightens from `#2463eb` to `#6ea0ff` for contrast
+against a dark background, the warning pair swaps to a dark amber on muted
+gold, and the syntax colors move wholesale to a dark-editor palette. `--error`
+is the only variable repeated unchanged — it works against both.
+
+The attribute is set in [state.svelte.ts](/docs/src/lib/state.svelte.ts), which
+writes `document.documentElement.dataset.theme` both on startup and whenever
+the preference changes, persisting it to `localStorage`.
+
+```css ! app.css
 :root[data-theme='dark'] {
 	--bg: #14171b;
 	--panel: #1b1f24;
@@ -98,4 +193,18 @@ select {
 	--syn-number: #d19a66;
 	--syn-function: #6ea0ff;
 }
-````
+```
+
+</Scrollycoding>
+
+Switching the theme has to reach the canvas too, which is a separate path:
+`setTheme` in [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) swaps the
+PixiJS palette and marks every cell dirty so cached text labels re-rasterize in
+the new font color. The document-level pieces this stylesheet supports live in
+[+layout.svelte](/docs/src/routes/+layout.svelte).
+
+One discrepancy worth noting: the header comment says the theme defaults to
+`prefers-color-scheme`, but [state.svelte.ts](/docs/src/lib/state.svelte.ts)
+reads only the stored `quadratic-theme` value and falls back to `'light'` —
+there is no media-query check, and its own comment there says dark applies
+only when the user picks it.
