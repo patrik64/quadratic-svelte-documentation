@@ -1,64 +1,171 @@
 ---
 title: "series.test.ts"
-description: "Unit tests for series.ts."
+description: "Vitest coverage for fill-series detection — arithmetic runs, float drift, name cycles with wrap-around, and the cases that must not extrapolate"
 source: "src/lib/core/series.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Twelve tests over [series.ts](/docs/src/lib/core/series.ts), split into the two
+kinds of series it recognizes. They read as a specification of what dragging
+the fill handle does — and, just as importantly, of when it declines to guess.
 
-````ts series.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { seriesNext } from './series';
+That second half matters more than it might seem. `seriesNext` returning
+`undefined` is not a failure; it tells the caller to copy the values instead of
+extrapolating, so a test asserting `undefined` is asserting *restraint*.
 
-describe('seriesNext — arithmetic series', () => {
+<Scrollycoding>
+
+## !!steps The step argument, checked twice
+
+The opening test does something the rest mostly do not: it calls the same input
+with two different `step` values.
+
+That pins the parameter's meaning as a zero-based distance past the end of the
+samples, not a repeated single-step call. `['1','2']` at step 0 is `3` and at
+step 1 is `4` — so the caller filling ten cells asks ten independent questions
+rather than iterating, and each answer is computed from the original samples.
+
+That design is what keeps a long fill from accumulating error, and it is also
+why the single-value case works: with one sample the delta is `0`, so every
+step returns the same value and dragging a lone `10` copies it rather than
+counting up.
+
+```ts ! series.test.ts
 	it('continues an increasing integer series', () => {
+		// !mark(1:2)
 		expect(seriesNext(['1', '2'], 0)).toBe('3');
 		expect(seriesNext(['1', '2'], 1)).toBe('4');
 	});
 
 	it('repeats a single value (delta 0)', () => {
 		expect(seriesNext(['10'], 0)).toBe('10');
+		// !mark
 		expect(seriesNext(['10'], 5)).toBe('10');
 	});
+```
 
+## !!steps The float test that justifies its own line of code
+
+`['1.5','2.5']` continuing to `3.5` is unremarkable. The next test is the one
+worth reading.
+
+`0.1` and `0.2` have a delta that is not exactly `0.1` in binary floating
+point, so the naive continuation is `0.30000000000000004`. Asserting `'0.3'`
+requires the rounding pass in [series.ts](/docs/src/lib/core/series.ts) —
+`toPrecision(13)` followed by `parseFloat` — and would fail without it.
+
+This is a case where the test explains a line of implementation that otherwise
+looks like superstition. Anyone tempted to simplify that arithmetic finds out
+here.
+
+```ts ! series.test.ts
 	it('continues floats', () => {
 		expect(seriesNext(['1.5', '2.5'], 0)).toBe('3.5');
 	});
 
 	it('clamps float precision drift', () => {
+		// !mark
 		expect(seriesNext(['0.1', '0.2'], 0)).toBe('0.3');
 	});
+```
 
+## !!steps Counting down, past zero, into negatives
+
+Decreasing series get their own test because the sign of the delta must not be
+special-cased anywhere.
+
+The three assertions walk a descending run through the interesting territory:
+`5, 3` continues to `1`, then to `-1` at the next step — crossing zero without
+stopping, which a `Math.abs` or an unsigned guard would break.
+
+The third is the subtle one. `['2','1']` continues to `0`, and `0` is falsy —
+so any implementation returning `value || undefined`, or truthiness-checking
+before stringifying, would drop it and fall back to copying. Asserting the
+string `'0'` closes that off.
+
+```ts ! series.test.ts
 	it('continues a decreasing series through zero and negatives', () => {
 		expect(seriesNext(['5', '3'], 0)).toBe('1');
+		// !mark
 		expect(seriesNext(['5', '3'], 1)).toBe('-1');
+		// !mark
 		expect(seriesNext(['2', '1'], 0)).toBe('0');
 	});
+```
 
+## !!steps Two ways numbers can fail to be a series
+
+Both rejection tests protect against over-eager extrapolation, and they fail
+for different reasons.
+
+`['1','2','4']` is all numbers but the gaps are inconsistent, so there is no
+single delta to extend. The implementation checks every consecutive pair rather
+than just the first two — without that, this input would confidently produce
+`5`, quietly inventing data the user never implied.
+
+`['3','x']` mixes a number with text. The numeric branch requires *every*
+sample to parse, and having failed that it deliberately does not fall through
+to the name matcher — because a run containing a number can never be a weekday
+sequence either. Returning `undefined` hands the decision back to the caller,
+which copies.
+
+```ts ! series.test.ts
 	it('rejects non-arithmetic number runs', () => {
+		// !mark
 		expect(seriesNext(['1', '2', '4'], 0)).toBeUndefined();
 	});
 
 	it('rejects mixed numeric/text values', () => {
+		// !mark
 		expect(seriesNext(['3', 'x'], 0)).toBeUndefined();
 	});
 });
+```
 
-describe('seriesNext — day/month name series', () => {
+## !!steps Cycles that wrap, in both lengths
+
+The name tests each pair an ordinary continuation with a wrap-around, which is
+the only place the modular arithmetic shows.
+
+`Sat, Sun` continuing to `Mon` proves the week is a cycle rather than a list
+that ends — the same for `December` to `January` across the twelve-month table.
+
+`['December']` is also a single-sample case, and it behaves differently from the
+single-sample number above: with names there is no delta to be zero, so one
+sample still advances by one position rather than repeating. That asymmetry
+between the two branches is stated here rather than left to be discovered.
+
+```ts ! series.test.ts
 	it('continues weekday names and wraps around', () => {
 		expect(seriesNext(['Mon', 'Tue'], 0)).toBe('Wed');
+		// !mark
 		expect(seriesNext(['Sat', 'Sun'], 0)).toBe('Mon');
 	});
 
 	it('continues month names and wraps around', () => {
 		expect(seriesNext(['Jan', 'Feb'], 0)).toBe('Mar');
+		// !mark
 		expect(seriesNext(['December'], 0)).toBe('January');
 	});
+```
 
+## !!steps Case follows the sample, and two ways to not match
+
+The case test covers all three branches of the case rule in one go: all-upper
+input yields `WED`, all-lower yields `tue`, and anything else — here the
+canonical `Monday` — yields the table's own spelling. Matching itself is
+case-insensitive, so the input is recognized regardless.
+
+The final two rejections are precise about *why* a name run can fail.
+`['Mon','Feb']` draws from two different tables, so no single cycle contains
+both. `['Mon','Wed']` draws from one table but skips a position — and this is
+the more opinionated assertion, since a user might reasonably expect every-other-day
+to continue as `Fri`. The implementation only extends by one position at a time,
+and this test records that limit rather than leaving it ambiguous.
+
+```ts ! series.test.ts
 	it('preserves the case of the first sample', () => {
+		// !mark(1:3)
 		expect(seriesNext(['MON', 'TUE'], 0)).toBe('WED');
 		expect(seriesNext(['mon'], 0)).toBe('tue');
 		expect(seriesNext(['Monday'], 0)).toBe('Tuesday');
@@ -69,7 +176,22 @@ describe('seriesNext — day/month name series', () => {
 	});
 
 	it('rejects non-consecutive names', () => {
+		// !mark
 		expect(seriesNext(['Mon', 'Wed'], 0)).toBeUndefined();
 	});
 });
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. The function's callers are the fill-handle drag in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) and the
+`⌘D`/`⌘R` fill shortcuts, both routed through
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) — and both treat `undefined`
+as "copy the source values", which is why the rejection tests describe real
+behavior rather than error handling.
+
+Not covered here: the abbreviated and full forms are tested for days and months
+respectively but never crossed, so a mixed run like `Mon, Tuesday` has no
+assertion, and the `May` entry — the one string appearing in both the long and
+short month tables — is never exercised.
