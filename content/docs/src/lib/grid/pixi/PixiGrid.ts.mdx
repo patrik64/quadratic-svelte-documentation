@@ -1,79 +1,45 @@
 ---
 title: "PixiGrid.ts"
-description: "Pixi.js grid engine — the port of Quadratic's gridGL/pixiApp. Display objects persist between frames; pan/zoom is a pure viewport transform, and layers redra…"
+description: "Pixi renderer for the grid: persistent display objects, dirty-flag redraws, viewport culling and a signature-keyed cache of cell labels."
 source: "src/lib/grid/pixi/PixiGrid.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This is the engine that actually paints the spreadsheet — a port of Quadratic's
+`gridGL/pixiApp` onto pixi.js v8 and `pixi-viewport`. It owns a WebGL canvas, a
+handful of long-lived layers, and a per-frame update that decides whether
+anything needs to be redrawn at all.
 
-````ts PixiGrid.ts -n
-// Pixi.js grid engine — the port of Quadratic's gridGL/pixiApp.
-// Display objects persist between frames; pan/zoom is a pure viewport
-// transform, and layers redraw only when their dirty flag is set.
+The three ideas that make it fast are stated in its own header comment: display
+objects **persist between frames**, panning and zooming are a **pure viewport
+transform** (nothing is re-laid-out), and each layer redraws only when its
+**dirty flag** is set. The class is deliberately UI-framework-agnostic: it reads
+the sheet and the UI state through two callbacks passed to the constructor, so
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) can drive it
+with Svelte runes without the renderer knowing Svelte exists.
 
-import { Application, Container, Graphics, Rectangle, Sprite, Text, Texture } from 'pixi.js';
-import { Viewport } from 'pixi-viewport';
-import { formatCellValue } from '../../core/cellTextFormatter';
-import type { Sheet } from '../../core/Sheet';
-import { coordKey, type Coordinate } from '../../core/types';
-import {
-	colors,
-	editorModeColor,
-	gridLineAlpha,
-	setPixiTheme,
-	themeBackground,
-	type ThemeName
-} from '../colors';
-import { GridHeadings, refreshHeadingLabelStyle } from './GridHeadings';
-import { CELL_TEXT_MARGIN_LEFT, FONT_SIZE, measureWrapped } from './measureText';
+<Scrollycoding>
 
-export interface GridUIState {
-	cursorPosition: Coordinate;
-	multiCursor?: { originPosition: Coordinate; terminalPosition: Coordinate };
-	showHeadings: boolean;
-	showGridAxes: boolean;
-	showGridLines: boolean;
-	showCellTypeOutlines: boolean;
-	showA1Notation: boolean;
-	presentationMode: boolean;
-	editorOpen: boolean;
-	editorMode: 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
-	editorCell: Coordinate;
-	inputOpen: boolean;
-	fillPreview?: { x0: number; y0: number; x1: number; y1: number };
-	refPreview?: { x0: number; y0: number; x1: number; y1: number };
-}
+## !!steps Dirty flags and persistent layers
 
-const CULL_MARGIN_CELLS = 3;
+Every layer is created **once**, in the field initializers, and lives for the
+lifetime of the engine — a `Graphics` per drawing concern plus two `Container`s
+for objects that come and go. Redrawing a layer means `clear()` and re-issuing
+its commands, never rebuilding the scene graph.
 
-/** Rough luminance check for hex colors like `#ffe9b3`. */
-function isLightColor(hex: string): boolean {
-	const m = /^#([0-9a-f]{6})$/i.exec(hex);
-	if (!m) return false;
-	const n = parseInt(m[1], 16);
-	const r = (n >> 16) & 0xff;
-	const g = (n >> 8) & 0xff;
-	const b = n & 0xff;
-	return 0.299 * r + 0.587 * g + 0.114 * b > 150;
-}
-const MAX_VISIBLE_LABELS = 6000;
-// Text rasterization is the expensive step; cap creations per frame and
-// stream the rest in on subsequent frames so panning never blocks
-const LABEL_BUDGET_PER_FRAME = 250;
+The three booleans are the whole scheduling protocol. `dirtyCells` means the
+sheet's content changed, `dirtyViewport` means the camera moved, `dirtyCursor`
+means only the selection moved — the cheapest of the three. `labelCache` maps a
+cell key to an already-rasterized `Text`, and `imageTextures` holds chart
+textures keyed by a cheap signature so the same PNG is uploaded to the GPU once.
 
-interface CachedLabel {
-	text: Text;
-	sig: string;
-}
-
+```ts ! PixiGrid.ts
 export class PixiGrid {
 	app = new Application();
 	viewport!: Viewport;
 	headings!: GridHeadings;
 
+	// !mark(1:3)
 	dirtyViewport = true;
 	dirtyCells = true;
 	dirtyCursor = true;
@@ -89,6 +55,7 @@ export class PixiGrid {
 	private labelLayer = new Container();
 	private imageLayer = new Container();
 	private selectionGfx = new Graphics();
+	// !mark
 	private labelCache = new Map<string, CachedLabel>();
 	// canvas outputs (charts), keyed by a cheap signature of the data URL
 	private imageTextures = new Map<string, Texture | 'loading'>();
@@ -98,11 +65,29 @@ export class PixiGrid {
 		private getSheet: () => Sheet,
 		private getState: () => GridUIState
 	) {}
+}
+```
 
+## !!steps Booting the application and the viewport
+
+`init` is async because pixi v8 initializes the renderer asynchronously; the
+`destroyed` check right after the `await` handles a component that unmounted
+while the GPU context was still coming up. `resolution` plus `autoDensity` make
+the canvas render at device pixel density so text stays crisp on retina
+displays.
+
+Then `pixi-viewport` takes over input. The plugin chain is the entire pan/zoom
+story: `drag` only pans while Space is held (a spreadsheet still needs plain
+drag for selection), `decelerate` adds inertia, `pinch` and `wheel` handle
+trackpads, and `clampZoom` bounds the scale to `0.1 … 10`. Because zoom is a
+transform on one container, zooming costs nothing per cell.
+
+```ts ! PixiGrid.ts
 	async init(container: HTMLElement): Promise<void> {
 		await this.app.init({
 			background: '#ffffff',
 			antialias: true,
+			// !mark(1:2)
 			resolution: window.devicePixelRatio || 1,
 			autoDensity: true,
 			width: container.clientWidth || 800,
@@ -127,7 +112,26 @@ export class PixiGrid {
 			.pinch()
 			.wheel({ trackpadPinch: true, wheelZoom: false, percent: 1.5 })
 			.clampZoom({ minScale: 0.1, maxScale: 10 });
+		// ...
+	}
+```
 
+## !!steps Layer order and the frame ticker
+
+One `addChild` call fixes the painter's-algorithm order for the whole app:
+fills at the bottom, then gridlines, then axes, then borders (above gridlines so
+a cell border paints over them), code outlines, text labels, chart images, and
+the selection overlay on top of everything.
+
+The headings are added to the **stage**, not the viewport — they must stay
+pinned to the screen edges while the world scrolls underneath, so
+[GridHeadings.ts](/docs/src/lib/grid/pixi/GridHeadings.ts) draws in screen space
+and reads the viewport itself. Finally `handleMoved` closes the loop with the
+outside world: any viewport movement marks the viewport dirty *and* reports the
+new camera through `onViewportChanged`, which the Svelte layer stores in
+`app.viewport` so DOM overlays can follow the grid.
+
+```ts ! PixiGrid.ts
 		this.viewport.addChild(
 			this.fills,
 			this.gridLines,
@@ -140,19 +144,13 @@ export class PixiGrid {
 		);
 		this.app.stage.addChild(this.viewport);
 
+		// !mark(1:2)
 		this.headings = new GridHeadings(this.getSheet, () => this.viewport);
 		this.app.stage.addChild(this.headings.container);
 
 		this.viewport.on('moved', this.handleMoved, this);
 		this.viewport.on('zoomed', this.handleMoved, this);
-
-		// cmd+wheel zooms (trackpad pinch arrives as ctrl+wheel and is handled
-		// by the pinch/wheel plugins); capture phase so the plugin never pans
-		this.app.canvas.addEventListener('wheel', this.handleMetaWheel, {
-			capture: true,
-			passive: false
-		});
-
+		// ...
 		this.app.ticker.add(this.update, this);
 	}
 
@@ -160,90 +158,24 @@ export class PixiGrid {
 		this.dirtyViewport = true;
 		this.onViewportChanged(this.viewport.left, this.viewport.top, this.viewport.scale.x);
 	}
+```
 
-	private handleMetaWheel = (e: WheelEvent): void => {
-		if (!e.metaKey || e.ctrlKey) return;
-		e.preventDefault();
-		e.stopImmediatePropagation();
-		const rect = this.app.canvas.getBoundingClientRect();
-		const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
-		const factor = Math.pow(2, -e.deltaY * 0.01);
-		const newScale = Math.min(10, Math.max(0.1, this.viewport.scale.x * factor));
-		const world = this.viewport.toWorld(point.x, point.y);
-		this.viewport.setZoom(newScale, false);
-		this.viewport.moveCorner(world.x - point.x / newScale, world.y - point.y / newScale);
-		this.handleMoved();
-	};
+## !!steps The dirty flag frame loop
 
-	/** Apply externally-driven viewport state (zoom buttons, goto, arrows). */
-	/** Switches the Pixi palette; dirtyCells destroys the label cache, so
-	 * every label re-rasterizes with the new font color. PNG export keeps a
-	 * white background regardless of theme. */
-	setTheme(theme: ThemeName): void {
-		setPixiTheme(theme);
-		refreshHeadingLabelStyle();
-		this.app.renderer.background.color = themeBackground(theme);
-		this.dirtyCells = true;
-		this.dirtyViewport = true;
-		this.dirtyCursor = true;
-	}
+`update` runs on every pixi tick and its job is mostly to decide *not* to work.
+When `dirtyCells` is set the content changed, so the entire label cache is
+destroyed and `lastRange` is poisoned with `NaN` — that forces the cell pass to
+re-run and every label to re-rasterize with fresh text and styles.
 
-	applyViewport(x: number, y: number, scale: number): void {
-		if (!this.viewport) return;
-		const eps = 0.0001;
-		if (
-			Math.abs(this.viewport.left - x) < eps &&
-			Math.abs(this.viewport.top - y) < eps &&
-			Math.abs(this.viewport.scale.x - scale) < eps
-		)
-			return;
-		this.viewport.setZoom(scale, false);
-		this.viewport.moveCorner(x, y);
-		this.dirtyViewport = true;
-	}
+The interesting condition is the second one: while panning, every `moved` event
+sets `dirtyViewport`, but the cell layers are only redrawn when the *visible
+cell range* actually changed. Scrolling half a cell moves the camera without changing
+which cells are on screen, so the labels simply ride along with the viewport
+transform and nothing is rebuilt. The final `else if` is the cheap path — a
+cursor move repaints only the selection graphics and the headings, leaving
+fills, gridlines and thousands of text objects untouched.
 
-	resize(width: number, height: number): void {
-		if (!this.viewport) return;
-		this.app.renderer.resize(width, height);
-		this.viewport.resize(width, height);
-		this.dirtyViewport = true;
-	}
-
-	/** Renders a world-space rectangle to a PNG blob (selection overlay hidden). */
-	async extractPng(x: number, y: number, w: number, h: number): Promise<Blob | null> {
-		if (!this.viewport) return null;
-		this.selectionGfx.visible = false;
-		try {
-			const canvas = this.app.renderer.extract.canvas({
-				target: this.viewport,
-				frame: new Rectangle(x, y, w, h),
-				resolution: 2,
-				clearColor: '#ffffff'
-			});
-			if ('convertToBlob' in canvas) {
-				return await (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' });
-			}
-			return await new Promise<Blob | null>((resolve) =>
-				(canvas as HTMLCanvasElement).toBlob((blob) => resolve(blob), 'image/png')
-			);
-		} catch {
-			return null;
-		} finally {
-			this.selectionGfx.visible = true;
-		}
-	}
-
-	destroy(): void {
-		this.destroyed = true;
-		this.app.canvas?.removeEventListener('wheel', this.handleMetaWheel, { capture: true });
-		this.app.destroy(true, { children: true, texture: true });
-	}
-
-	// ------------------------------------------------------------ frame update
-
-	private lastRange = { colStart: NaN, colEnd: NaN, rowStart: NaN, rowEnd: NaN };
-	private labelsPending = false;
-
+```ts ! PixiGrid.ts
 	private update(): void {
 		if (!this.viewport) return;
 		const state = this.getState();
@@ -262,6 +194,7 @@ export class PixiGrid {
 			range.rowEnd !== this.lastRange.rowEnd;
 
 		// cell layers only when content or the visible cell range changed
+		// !mark
 		if (this.dirtyCells || this.labelsPending || (this.dirtyViewport && rangeChanged)) {
 			this.drawCells(state, range);
 			this.lastRange = range;
@@ -273,41 +206,39 @@ export class PixiGrid {
 			this.dirtyCells = false;
 			this.dirtyViewport = false;
 			this.dirtyCursor = false;
+			// !mark
 		} else if (this.dirtyCursor) {
 			this.drawCursor(state);
 			this.headings.draw(this.headingsState(state));
 			this.dirtyCursor = false;
 		}
 	}
+```
 
-	private headingsState(state: GridUIState) {
-		return {
-			showHeadings: state.showHeadings,
-			showA1Notation: state.showA1Notation,
-			presentationMode: state.presentationMode,
-			selection: this.selectionRange(state)
-		};
-	}
+## !!steps Culling to the visible range
 
-	private selectionRange(state: GridUIState): { x0: number; y0: number; x1: number; y1: number } {
-		if (state.multiCursor) {
-			const o = state.multiCursor.originPosition;
-			const t = state.multiCursor.terminalPosition;
-			return {
-				x0: Math.min(o.x, t.x),
-				y0: Math.min(o.y, t.y),
-				x1: Math.max(o.x, t.x),
-				y1: Math.max(o.y, t.y)
-			};
-		}
-		const c = state.cursorPosition;
-		return { x0: c.x, y0: c.y, x1: c.x, y1: c.y };
-	}
+The sheet is infinite, so every drawing pass first asks *which cells are on
+screen*. `visibleRange` converts the viewport's world rectangle into cell
+indices with [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) — the same
+coordinate mapping the mouse handlers and the cell editor use — and pads the
+result by `CULL_MARGIN_CELLS` so a few rows and columns just outside the frame
+are already drawn when they scroll in.
 
+`drawGridLines` shows the pattern: it iterates only `colStart … colEnd + 1`, but
+extends each line 100 world units past the viewport edges so no gap is visible
+at the border. `pixelLine: true` keeps lines exactly one device pixel wide at
+any zoom, and `gridLineAlpha` (from [colors.ts](/docs/src/lib/grid/colors.ts))
+fades the grid out below `0.6` scale — at that point the lines would otherwise
+merge into a solid gray field.
+
+```ts ! PixiGrid.ts
+const CULL_MARGIN_CELLS = 3;
+// ...
 	private visibleRange(): { colStart: number; colEnd: number; rowStart: number; rowEnd: number } {
 		const offsets = this.getSheet().gridOffsets;
 		const v = this.viewport;
 		return {
+			// !mark(1:4)
 			colStart: offsets.getColumnIndex(v.left) - CULL_MARGIN_CELLS,
 			colEnd: offsets.getColumnIndex(v.left + v.screenWidth / v.scale.x) + CULL_MARGIN_CELLS,
 			rowStart: offsets.getRowIndex(v.top) - CULL_MARGIN_CELLS,
@@ -315,40 +246,42 @@ export class PixiGrid {
 		};
 	}
 
-	// ------------------------------------------------------------ layers
-
 	private drawGridLines(state: GridUIState): void {
-		const g = this.gridLines;
-		g.clear();
-		const offsets = this.getSheet().gridOffsets;
-		const v = this.viewport;
+		// ...
 		const { colStart, colEnd, rowStart, rowEnd } = this.visibleRange();
-		const wLeft = v.left - 100;
-		const wTop = v.top - 100;
-		const wRight = v.left + v.screenWidth / v.scale.x + 100;
-		const wBottom = v.top + v.screenHeight / v.scale.y + 100;
-
+		// ...
 		if (state.showGridLines && !state.presentationMode) {
 			for (let x = colStart; x <= colEnd + 1; x++) {
 				const wx = offsets.getColumnX(x);
 				g.moveTo(wx, wTop).lineTo(wx, wBottom);
 			}
-			for (let y = rowStart; y <= rowEnd + 1; y++) {
-				const wy = offsets.getRowY(y);
-				g.moveTo(wLeft, wy).lineTo(wRight, wy);
-			}
+			// ...
 			// modern look: gridlines fade out as you zoom out
 			g.stroke({ color: colors.gridLines, alpha: 0.2 * gridLineAlpha(v.scale.x), pixelLine: true });
 		}
-
-		const a = this.axes;
-		a.clear();
-		if (state.showGridAxes && !state.presentationMode) {
-			a.moveTo(0, wTop).lineTo(0, wBottom).moveTo(wLeft, 0).lineTo(wRight, 0);
-			a.stroke({ color: 0x000000, alpha: 0.35, pixelLine: true });
-		}
 	}
+```
 
+## !!steps Fills and borders from formats
+
+`drawCells` is the heart of the renderer. It opens by resetting the per-frame
+label budget, then repaints the fill and border layers by walking every format
+in the sheet and skipping the ones outside the visible range. Formats are sparse
+— only cells the user actually styled have one — so this loop is short even on
+large sheets. Each rectangle comes from `getCellRect`, so a resized column moves
+its fill and its text together with no extra bookkeeping.
+
+The cell query that follows is subtler: it starts **40 columns to the left** of
+the visible range. Unwrapped text overflows into empty neighbors, so a long
+label anchored far off-screen can still be partly visible; without that margin
+it would pop in only when its own cell scrolled into view.
+
+```ts ! PixiGrid.ts
+const MAX_VISIBLE_LABELS = 6000;
+// Text rasterization is the expensive step; cap creations per frame and
+// stream the rest in on subsequent frames so panning never blocks
+const LABEL_BUDGET_PER_FRAME = 250;
+// ...
 	private drawCells(state: GridUIState, range: ReturnType<PixiGrid['visibleRange']>): void {
 		const offsets = this.getSheet().gridOffsets;
 		const { colStart, colEnd, rowStart, rowEnd } = range;
@@ -362,6 +295,7 @@ export class PixiGrid {
 		borders.clear();
 		for (const format of this.getSheet().getAllFormats()) {
 			if (!format.fillColor && !format.borders) continue;
+			// !mark(1:2)
 			if (format.x < colStart || format.x > colEnd || format.y < rowStart || format.y > rowEnd)
 				continue;
 			const r = offsets.getCellRect(format.x, format.y);
@@ -370,50 +304,40 @@ export class PixiGrid {
 			if (b) {
 				if (b.top)
 					borders.moveTo(r.x, r.y).lineTo(r.x + r.w, r.y).stroke({ color: b.top, pixelLine: true });
-				if (b.bottom)
-					borders
-						.moveTo(r.x, r.y + r.h)
-						.lineTo(r.x + r.w, r.y + r.h)
-						.stroke({ color: b.bottom, pixelLine: true });
-				if (b.left)
-					borders.moveTo(r.x, r.y).lineTo(r.x, r.y + r.h).stroke({ color: b.left, pixelLine: true });
-				if (b.right)
-					borders
-						.moveTo(r.x + r.w, r.y)
-						.lineTo(r.x + r.w, r.y + r.h)
-						.stroke({ color: b.right, pixelLine: true });
+				// ...
 			}
 		}
-
-		// labels + code outlines
-		const outlines = this.outlines;
-		outlines.clear();
+		// ...
 		const cells = this.getSheet().getCellsInRect({
 			left: colStart - 40, // long text from offscreen cells can overflow in
 			top: rowStart,
 			right: colEnd,
 			bottom: rowEnd
 		});
-		let labelCount = 0;
-		for (const cell of cells) {
-			if (
-				state.showCellTypeOutlines &&
-				!state.presentationMode &&
-				cell.x >= colStart &&
-				cell.x <= colEnd
-			) {
-				let color: string | undefined;
-				if (cell.evaluation_result && cell.evaluation_result.success === false)
-					color = colors.cellColorError;
-				else if (cell.type === 'PYTHON') color = colors.cellColorUserPython;
-				else if (cell.type === 'FORMULA') color = colors.cellColorUserFormula;
-				else if (cell.type === 'JAVASCRIPT') color = colors.cellColorUserJavascript;
-				if (color) {
-					const r = offsets.getCellRect(cell.x, cell.y);
-					outlines.rect(r.x, r.y, r.w, r.h).stroke({ color, pixelLine: true });
-				}
-			}
+		// ...
+	}
+```
 
+## !!steps The label cache signature
+
+Rasterizing text is by far the most expensive thing a canvas spreadsheet does,
+so each label is keyed by its cell and tagged with a `sig` string that encodes
+everything its bitmap depends on: the formatted text (from
+[cellTextFormatter.ts](/docs/src/lib/core/cellTextFormatter.ts)), bold/italic,
+color, alignment and wrapping mode. If the signature still matches, the existing
+`Text` object is reused untouched; if it differs, the old one is destroyed and
+rebuilt. For wrapped cells the cell's size joins the signature, because
+line-breaking depends on the column width — resizing that column must
+re-rasterize.
+
+The two guards above it are the throughput limits. `MAX_VISIBLE_LABELS` caps how
+many labels a single frame will consider, and `creationBudget` caps how many new
+`Text` objects may be *created* per frame; when it runs out the loop sets
+`labelsPending` and bails, and the frame loop calls `drawCells` again next tick
+to stream in the rest. That is what keeps a fast pan across dense data from
+blocking on hundreds of glyph rasterizations in one frame.
+
+```ts ! PixiGrid.ts
 			if (labelCount >= MAX_VISIBLE_LABELS) continue;
 			const format = this.getSheet().getFormat(cell.x, cell.y);
 			const displayText = formatCellValue(cell, format);
@@ -432,6 +356,7 @@ export class PixiGrid {
 					: colors.cellFontColor);
 			// wrapped layout depends on the cell's size, so resizes re-rasterize
 			const sizeSig = wrapping === 'wrap' ? `|${r.w}x${r.h}` : '';
+			// !mark
 			const sig = `${displayText}|${format?.bold ? 'b' : ''}${format?.italic ? 'i' : ''}|${fontColor}|${align}|${wrapping ?? ''}${sizeSig}`;
 			let cached = this.labelCache.get(key);
 			if (cached && cached.sig !== sig) {
@@ -440,10 +365,31 @@ export class PixiGrid {
 				cached = undefined;
 				this.labelCache.delete(key);
 			}
+			// !mark(1:4)
 			if (!cached && creationBudget <= 0) {
 				this.labelsPending = true; // stream the rest in on the next frame
 				continue;
 			}
+```
+
+## !!steps Rasterizing a label once
+
+Only a cache miss reaches this block. Wrapped cells are pre-wrapped through
+`measureWrapped` from
+[measureText.ts](/docs/src/lib/grid/pixi/measureText.ts) — the same measurer
+pixi uses internally, so the line count matches what will actually render — and
+lines beyond the row height are dropped rather than drawn and clipped.
+
+The `resolution` of at least 2 is what keeps glyphs sharp when the user zooms
+in, since a `Text` is a bitmap and scaling it up would otherwise blur. Overflow
+is handled by measuring against `availableExtent`, which walks up to 40 columns
+in the direction of the alignment and adds their widths until it hits a
+non-empty neighbor; text longer than that is truncated by a proportional
+character estimate instead of re-measuring repeatedly. Alignment and vertical
+centering are plain position math on the cell rect, and only then does the label
+enter the layer and the cache.
+
+```ts ! PixiGrid.ts
 			if (!cached) {
 				creationBudget--;
 				let labelText = displayText;
@@ -462,12 +408,9 @@ export class PixiGrid {
 						fontFamily: 'OpenSans, sans-serif',
 						fontSize: FONT_SIZE,
 						fill: fontColor,
-						fontWeight: format?.bold ? 'bold' : 'normal',
-						fontStyle: format?.italic ? 'italic' : 'normal',
-						...(wrapping === 'wrap'
-							? { align: align as 'left' | 'center' | 'right' }
-							: {})
+						// ...
 					},
+					// !mark
 					resolution: Math.max(2, window.devicePixelRatio || 1)
 				});
 
@@ -483,13 +426,30 @@ export class PixiGrid {
 				else text.position.set(r.x + CELL_TEXT_MARGIN_LEFT, 0);
 				text.y = r.y + (r.h - text.height) / 2 + 0.5;
 
+				// !mark(1:2)
 				this.labelLayer.addChild(text);
 				this.labelCache.set(key, { text, sig });
 			}
-		}
+```
 
+## !!steps Dropping labels that scrolled away
+
+A cache that only grows would eventually hold a `Text` — and a GPU texture — for
+every cell ever visited. So the pass ends by sweeping the cache and destroying
+anything outside the range it just drew. The keys are `"x,y"` strings from
+`coordKey`, parsed back with a single `indexOf` rather than a `split`, since
+this runs over the whole cache every frame that redraws cells.
+
+`KEEP_MARGIN` is the reason panning feels smooth: labels are kept for ten cells
+past the culling boundary, so nudging the view back and forth across an edge
+reuses the same objects instead of destroying and re-rasterizing them on every
+direction change. The same eviction idea applies to chart textures in
+`drawImages`, which destroys the `Texture` of any image that left the view.
+
+```ts ! PixiGrid.ts
 		// drop labels that scrolled out of range (with margin so near-edge
 		// labels survive small pans without re-rasterizing)
+		// !mark
 		const KEEP_MARGIN = 10;
 		for (const [key, cached] of this.labelCache) {
 			const comma = key.indexOf(',');
@@ -506,74 +466,25 @@ export class PixiGrid {
 				this.labelCache.delete(key);
 			}
 		}
+```
 
-		this.drawImages(range);
-	}
+## !!steps Cursor and selection overlays
 
-	/** Canvas outputs (charts) anchored at their cell's top-left, drawn at the
-	 * image's natural pixel size. The wide top/left margins keep an image
-	 * visible while its origin cell is scrolled off-screen. */
-	private drawImages(range: ReturnType<PixiGrid['visibleRange']>): void {
-		this.imageLayer.removeChildren();
-		const offsets = this.getSheet().gridOffsets;
-		const cells = this.getSheet().getCellsInRect({
-			left: range.colStart - 40,
-			top: range.rowStart - 60,
-			right: range.colEnd,
-			bottom: range.rowEnd
-		});
-		const used = new Set<string>();
-		for (const cell of cells) {
-			const url = cell.evaluation_result?.image_output;
-			if (!url) continue;
-			const key = `${url.length}:${url.slice(-40)}`;
-			used.add(key);
-			const tex = this.imageTextures.get(key);
-			if (tex === undefined) {
-				this.imageTextures.set(key, 'loading');
-				const img = new Image();
-				img.onload = () => {
-					if (this.destroyed) return;
-					this.imageTextures.set(key, Texture.from(img));
-					this.dirtyCells = true;
-				};
-				img.src = url;
-				continue;
-			}
-			if (tex === 'loading') continue;
-			const r = offsets.getCellRect(cell.x, cell.y);
-			const sprite = new Sprite(tex);
-			sprite.position.set(r.x, r.y);
-			this.imageLayer.addChild(sprite);
-		}
-		// evict textures for images that left the view or were re-run
-		for (const [key, tex] of this.imageTextures) {
-			if (!used.has(key) && tex !== 'loading') {
-				tex.destroy(true);
-				this.imageTextures.delete(key);
-			}
-		}
-	}
+`drawCursor` repaints one `Graphics` — the topmost layer — from the UI state
+snapshot. A multi-cursor becomes a translucent rectangle spanning the normalized
+selection (`selectionRange` sorts origin and terminal so dragging in any
+direction works), and the cursor cell gets an outline drawn as an open path with
+a small gap in the bottom-right corner, leaving room for the fill handle.
 
-	private availableExtent(
-		x: number,
-		y: number,
-		cellWidth: number,
-		align: string,
-		wrapping: string | undefined
-	): number {
-		let extent = cellWidth - CELL_TEXT_MARGIN_LEFT * 2;
-		if (wrapping === 'clip' || wrapping === 'wrap' || align === 'center') return extent;
-		const offsets = this.getSheet().gridOffsets;
-		const dir = align === 'right' ? -1 : 1;
-		for (let i = 1; i <= 40; i++) {
-			const neighbor = this.getSheet().getCell(x + dir * i, y);
-			if (neighbor && neighbor.value !== '') break;
-			extent += offsets.getColumnWidth(x + dir * i);
-		}
-		return extent;
-	}
+Note the divisions by `scale`: line widths and the gap are specified as
+`1.5 / scale` and `5 / scale` so that after the viewport's transform they land
+at a constant number of screen pixels. Without that, the cursor outline would
+grow into a thick band when zoomed in and vanish when zoomed out. The rest of
+the method draws the fill-handle square, the fill-drag preview, the formula
+pointing-mode preview and the code-editor cell highlight — all from optional
+fields on the state snapshot, all in the same single `Graphics`.
 
+```ts ! PixiGrid.ts
 	private drawCursor(state: GridUIState): void {
 		const g = this.selectionGfx;
 		g.clear();
@@ -591,18 +502,15 @@ export class PixiGrid {
 				.fill({ color: colors.cursorCell, alpha: 0.1 })
 				.stroke({ color: colors.cursorCell, pixelLine: true });
 		}
-
-		// cursor box
-		const editorOnCursor =
-			state.editorOpen &&
-			state.editorCell.x === state.cursorPosition.x &&
-			state.editorCell.y === state.cursorPosition.y;
+		// ...
 		const r = offsets.getCellRect(state.cursorPosition.x, state.cursorPosition.y);
 		if (!editorOnCursor) {
+			// !mark
 			const lw = 1.5 / scale;
 			if (state.multiCursor) {
 				g.rect(r.x, r.y, r.w, r.h).stroke({ color: colors.cursorCell, width: lw });
 			} else {
+				// !mark
 				const gap = 5 / scale;
 				g.moveTo(r.x + r.w - gap, r.y + r.h)
 					.lineTo(r.x, r.y + r.h)
@@ -612,52 +520,27 @@ export class PixiGrid {
 					.stroke({ color: colors.cursorCell, width: lw });
 			}
 		}
-
-		// fill-handle indicator
-		if (!state.inputOpen && scale > 0.1) {
-			const endCell = state.multiCursor ? state.multiCursor.terminalPosition : state.cursorPosition;
-			const er = offsets.getCellRect(endCell.x, endCell.y);
-			const size = Math.max(8 / scale, 4);
-			g.rect(er.x + er.w - size / 2, er.y + er.h - size / 2, size, size).fill(
-				state.editorOpen && !state.multiCursor
-					? editorModeColor(state.editorMode)
-					: colors.cursorCell
-			);
-		}
-
-		// fill-handle drag preview
-		if (state.fillPreview) {
-			const p = state.fillPreview;
-			const left = offsets.getColumnX(p.x0);
-			const top = offsets.getRowY(p.y0);
-			const right = offsets.getColumnX(p.x1) + offsets.getColumnWidth(p.x1);
-			const bottom = offsets.getRowY(p.y1) + offsets.getRowHeight(p.y1);
-			g.rect(left, top, right - left, bottom - top)
-				.fill({ color: colors.cursorCell, alpha: 0.08 })
-				.stroke({ color: colors.cursorCell, alpha: 0.7, pixelLine: true });
-		}
-
-		// formula pointing-mode preview, tinted like the formula editor
-		if (state.refPreview) {
-			const p = state.refPreview;
-			const left = offsets.getColumnX(p.x0);
-			const top = offsets.getRowY(p.y0);
-			const right = offsets.getColumnX(p.x1) + offsets.getColumnWidth(p.x1);
-			const bottom = offsets.getRowY(p.y1) + offsets.getRowHeight(p.y1);
-			const color = editorModeColor('FORMULA');
-			g.rect(left, top, right - left, bottom - top)
-				.fill({ color, alpha: 0.06 })
-				.stroke({ color, width: 2 / scale });
-		}
-
-		// code editor cell highlight
-		if (state.editorOpen) {
-			const er = offsets.getCellRect(state.editorCell.x, state.editorCell.y);
-			g.rect(er.x, er.y, er.w, er.h).stroke({
-				color: editorModeColor(state.editorMode),
-				width: 2 / scale
-			});
-		}
+		// ...
 	}
-}
-````
+```
+
+</Scrollycoding>
+
+The engine is created and owned by
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which passes in
+the sheet getter and a `snapshot()` of the UI state, sets the dirty flags from
+Svelte effects, and mirrors the camera both ways: `onViewportChanged` writes
+`app.viewport` in [state.svelte.ts](/docs/src/lib/state.svelte.ts), while
+`applyViewport` pushes external changes (zoom buttons, go-to, keyboard
+scrolling) back into the viewport — guarded by an epsilon comparison so the two
+directions cannot ping-pong. That component also drives `resize` from a
+`ResizeObserver`.
+
+Everything geometric goes through
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts), so cells, gridlines,
+cursors and the DOM-based [CellInput.svelte](/docs/src/lib/components/CellInput.svelte)
+all agree on where a cell is. Screen-space chrome lives in
+[GridHeadings.ts](/docs/src/lib/grid/pixi/GridHeadings.ts), text metrics in
+[measureText.ts](/docs/src/lib/grid/pixi/measureText.ts), and the palette —
+including the theme switch that invalidates every cached label — in
+[colors.ts](/docs/src/lib/grid/colors.ts).

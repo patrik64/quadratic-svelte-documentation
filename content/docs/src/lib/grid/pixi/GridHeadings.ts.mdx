@@ -1,25 +1,38 @@
 ---
 title: "GridHeadings.ts"
-description: "Screen-space row/column headings, drawn over the viewport (port of src/gridGL/UI/gridHeadings/GridHeadings.ts)."
+description: "Screen-space row and column headings: pooled labels, A1 or numeric titles, selection highlight, and a row heading that widens to fit"
 source: "src/lib/grid/pixi/GridHeadings.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A spreadsheet keeps its column letters and row numbers pinned to the edges of
+the window while the sheet scrolls underneath. `GridHeadings` is the piece
+that does that here — a port of Quadratic's
+`src/gridGL/UI/gridHeadings/GridHeadings.ts`.
 
-````ts GridHeadings.ts -n
-// Screen-space row/column headings, drawn over the viewport
-// (port of src/gridGL/UI/gridHeadings/GridHeadings.ts).
+The trick is where its `Container` lives:
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) adds it to the Pixi
+*stage*, not to the panning `Viewport`, so it never inherits the viewport's
+transform and never moves. Instead every coordinate is projected by hand —
+world x from [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) becomes
+screen x as `(worldX - viewport.left) * scale` — and the whole thing is
+redrawn from scratch on each frame PixiGrid marks dirty.
 
-import { CanvasTextMetrics, Container, Graphics, Text, TextStyle } from 'pixi.js';
-import type { Viewport } from 'pixi-viewport';
-import { getColumnA1Notation, getRowA1Notation } from '../../core/a1';
-import type { Sheet } from '../../core/Sheet';
-import { HEADING_SIZE } from '../../core/types';
-import { colors } from '../colors';
+<Scrollycoding>
 
+## !!steps A shared label style
+
+`HeadingsState` is the entire input to a frame: PixiGrid's private
+`headingsState` helper packs the three view toggles plus a normalized
+selection rectangle into it, so this class never touches app state directly.
+
+All labels share one 10px `TextStyle`. Pixi propagates a style mutation to
+every `Text` using it, which makes the theme switch a single assignment:
+`refreshHeadingLabelStyle` is called from `PixiGrid.setTheme` right after
+[colors.ts](/docs/src/lib/grid/colors.ts) swaps the palette in place, and all
+pooled labels recolor at once.
+
+```ts ! GridHeadings.ts
 export interface HeadingsState {
 	showHeadings: boolean;
 	showA1Notation: boolean;
@@ -36,9 +49,28 @@ const LABEL_STYLE = new TextStyle({
 /** Re-reads theme colors into the shared label style (TextStyle changes
  * propagate to every pooled Text instance). */
 export function refreshHeadingLabelStyle(): void {
+	// !mark
 	LABEL_STYLE.fill = colors.darkGray;
 }
+```
 
+## !!steps Two children and a pool of labels
+
+The container has exactly two children: one `Graphics` for every fill and
+stroke, and a sub-container holding the labels. The sheet and the viewport
+arrive as getter functions rather than references, so switching sheets needs
+no re-wiring. `rowHeadingWidth` is public because
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) reads
+`pixi.headings.rowHeadingWidth` to decide whether a pointer is over a heading,
+over a resize edge, or over the grid.
+
+Labels are pooled by index. `labelsUsed` resets to zero at the top of each
+draw; `label()` takes the next pooled `Text` (creating one, center-anchored,
+only when the pool runs short) and reassigns `.text` only when it actually
+changed — assigning a string marks the label dirty and re-rasterizes it, so
+the guard avoids that work for the labels a pan leaves untouched.
+
+```ts ! GridHeadings.ts
 export class GridHeadings {
 	container = new Container();
 	rowHeadingWidth = HEADING_SIZE;
@@ -63,17 +95,35 @@ export class GridHeadings {
 			this.labelPool.push(t);
 			this.labels.addChild(t);
 		}
+		// !mark
 		if (t.text !== text) t.text = text;
 		t.position.set(x, y);
 		t.visible = true;
 		this.labelsUsed++;
 	}
+}
+```
 
+## !!steps Every frame starts clean
+
+`draw` is immediate-mode: clear the graphics, reset the label counter, rebuild
+everything. When headings are turned off — or presentation mode is on — it
+zeroes `rowHeadingWidth` and hides the container, which also tells
+GridCanvas's hit tests that the entire canvas is now grid.
+
+Otherwise it snapshots what it needs from the viewport. `viewport.top` is the
+world y of the top edge, so `viewport.top + height / scale` is the bottom
+edge; feeding both through `getRowIndex` gives the first and last visible row.
+Only that range is ever iterated, which is what keeps an infinite grid
+affordable.
+
+```ts ! GridHeadings.ts
 	draw(state: HeadingsState): void {
 		const g = this.graphics;
 		g.clear();
 		this.labelsUsed = 0;
 
+		// !mark(1:5)
 		if (!state.showHeadings || state.presentationMode) {
 			this.rowHeadingWidth = 0;
 			this.container.visible = false;
@@ -90,7 +140,22 @@ export class GridHeadings {
 
 		const rowStart = offsets.getRowIndex(viewport.top);
 		const rowEnd = offsets.getRowIndex(viewport.top + height / scale);
+```
 
+## !!steps The row heading widens to fit
+
+Column headings have a fixed height (`HEADING_SIZE`, 20px from
+[types.ts](/docs/src/lib/core/types.ts)), but the row heading has to hold
+numbers that grow with the row index. Four candidates — the first and last
+visible row plus both ends of the selection — are compared by the digit count
+of their absolute value, the winner is rendered to its label text, and
+`CanvasTextMetrics` measures that string against the very style it will be
+drawn with. Ten pixels of padding are added and `HEADING_SIZE` is the floor.
+
+The measured width becomes `rowHeadingWidth`, then the two background strips
+are painted: the full-width top bar, and the left bar below it.
+
+```ts ! GridHeadings.ts
 		// row-heading width adapts to the widest visible label
 		let rowWidth = HEADING_SIZE;
 		const widestRow = [rowStart, rowEnd, sel.y0, sel.y1].reduce(
@@ -98,6 +163,7 @@ export class GridHeadings {
 			0
 		);
 		const widestLabel = state.showA1Notation ? getRowA1Notation(widestRow) : String(widestRow);
+		// !mark(1:4)
 		rowWidth = Math.max(
 			rowWidth,
 			CanvasTextMetrics.measureText(widestLabel, LABEL_STYLE).width + 10
@@ -107,7 +173,21 @@ export class GridHeadings {
 		// backgrounds
 		g.rect(0, 0, width, HEADING_SIZE).fill(colors.headerBackground);
 		g.rect(0, HEADING_SIZE, rowWidth, height - HEADING_SIZE).fill(colors.headerBackground);
+```
 
+## !!steps Highlighting the selected rows and columns
+
+The visible column range comes from the same projection applied to
+`viewport.left`. Both highlight loops then run over the *intersection* of the
+selection and the visible range — `Math.max(sel.x0, colStart)` to
+`Math.min(sel.x1, colEnd)` — so a selection scrolled far off screen costs
+nothing at all.
+
+The row bar carries an extra guard. A row whose highlight would land entirely
+above `HEADING_SIZE` is skipped, and the rest is clamped down to that line, so
+a selection bar never paints across the column heading strip.
+
+```ts ! GridHeadings.ts
 		const colStart = offsets.getColumnIndex(viewport.left);
 		const colEnd = offsets.getColumnIndex(viewport.left + width / scale);
 
@@ -120,11 +200,30 @@ export class GridHeadings {
 		for (let y = Math.max(sel.y0, rowStart); y <= Math.min(sel.y1, rowEnd); y++) {
 			const sy = (offsets.getRowY(y) - viewport.top) * scale;
 			const sh = offsets.getRowHeight(y) * scale;
+			// !mark(1:2)
 			if (sy + sh > HEADING_SIZE)
 				g.rect(0, Math.max(sy, HEADING_SIZE), rowWidth, sh).fill(colors.headerSelectedBackground);
 		}
+```
 
+## !!steps Labels in A1 or in raw coordinates
+
+The label text is the one place the headings meet
+[a1.ts](/docs/src/lib/core/a1.ts). With A1 notation on, columns become letters
+via `getColumnA1Notation` (column 0 is `A`, negatives get an `n` prefix, so
+column −1 reads `nA`) and rows go through `getRowA1Notation`, which is the row
+number itself with the same `n` prefix for negatives. With it off, both are
+just the signed integer index — the underlying coordinate.
+
+Two guards keep the strip readable. `labelSkip` grows as you zoom out, so at
+low scales only every nth column is labeled — except inside the selection,
+which is always labeled so the current cell's column stays identified. And any
+label whose center would fall under the row heading is dropped, so nothing
+collides with the corner box.
+
+```ts ! GridHeadings.ts
 		// column labels (skip when narrow)
+		// !mark
 		const labelSkip = Math.max(1, Math.ceil(24 / (100 * scale)));
 		for (let x = colStart; x <= colEnd; x++) {
 			if (x % labelSkip !== 0 && !(x >= sel.x0 && x <= sel.x1)) continue;
@@ -151,7 +250,22 @@ export class GridHeadings {
 				sy + sh / 2 + 0.5
 			);
 		}
+```
 
+## !!steps Separators the corner box and leftovers
+
+Tick marks between heading cells are only worth drawing above 20% zoom; below
+that they would merge into a smear, so the whole block is skipped. The loops
+run one past the end so the final edge is closed, and everything is stroked in
+one call with `pixelLine` for crisp hairlines at any device pixel ratio.
+
+Painting order does the rest of the work: the corner box is filled *after* the
+tick marks and the selection highlight, covering whatever ran under it, and
+the two outer border lines are drawn last. Finally the leftover pooled labels
+— created for a denser frame than this one — are hidden rather than destroyed,
+so the pool is ready for the next zoom-in.
+
+```ts ! GridHeadings.ts
 		// heading cell separators
 		if (scale > 0.2) {
 			for (let x = colStart; x <= colEnd + 1; x++) {
@@ -168,6 +282,7 @@ export class GridHeadings {
 		}
 
 		// corner box + outer borders
+		// !mark
 		g.rect(0, 0, rowWidth, HEADING_SIZE).fill(colors.headerBackground);
 		g.moveTo(0, HEADING_SIZE + 0.5)
 			.lineTo(width, HEADING_SIZE + 0.5)
@@ -178,5 +293,19 @@ export class GridHeadings {
 		// hide unused pooled labels
 		for (let i = this.labelsUsed; i < this.labelPool.length; i++) this.labelPool[i].visible = false;
 	}
-}
-````
+```
+
+</Scrollycoding>
+
+`draw` is called from the frame loop in
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) whenever cells, the
+viewport, or the cursor are dirty — a cursor move alone is enough, since the
+selection highlight lives here. The geometry all comes from
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts), the label text from
+[a1.ts](/docs/src/lib/core/a1.ts), the palette from
+[colors.ts](/docs/src/lib/grid/colors.ts), and `HEADING_SIZE` from
+[types.ts](/docs/src/lib/core/types.ts). On the consuming side,
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) uses the
+published `rowHeadingWidth` for heading clicks and resize cursors, while the
+`showHeadings`, `showA1Notation`, and `presentationMode` toggles are owned by
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).

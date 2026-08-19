@@ -1,24 +1,67 @@
 ---
 title: "measureText.ts"
-description: "Text measurement for wrapped cells, shared by the Pixi renderer (line clipping) and the state layer (row autofit). Uses Pixi's own measurer so the numbers ma…"
+description: "Pixi-backed measurement for wrapped cell text: the shared style builder and the line and height metrics behind clipping and row autofit"
 source: "src/lib/grid/pixi/measureText.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Two very different parts of the app need to know how tall a cell's text will
+be *before* it is drawn: the renderer, which must decide how many wrapped
+lines fit inside the row, and the formatting commands, which grow the row so
+that all of them do. Both questions have the same answer only if both ask the
+same measurer.
 
-````ts measureText.ts -n
+That is this module's job. It is a tiny wrapper around Pixi's own
+`CanvasTextMetrics`, so the numbers it returns are exactly the layout Pixi
+will produce when it rasterizes the label — not an approximation from a
+separate canvas context with a slightly different font state.
+
+<Scrollycoding>
+
+## !!steps Two constants and one options bag
+
+`FONT_SIZE` and `CELL_TEXT_MARGIN_LEFT` are the shared cell-text dimensions,
+imported straight into [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts)
+where labels are built and positioned: the margin is the left inset for
+left-aligned text, the right inset for right-aligned text, and — doubled —
+the horizontal padding subtracted from a column before wrapping.
+
+`wrappedTextStyle` takes everything that can change a cell's metrics. Every
+field is optional, which is what lets the same builder serve a plain
+measurement and a fully styled one.
+
+```ts ! measureText.ts
 // Text measurement for wrapped cells, shared by the Pixi renderer (line
 // clipping) and the state layer (row autofit). Uses Pixi's own measurer so
 // the numbers match what the labels actually render.
 
 import { CanvasTextMetrics, TextStyle } from 'pixi.js';
 
+// !mark(1:2)
 export const FONT_SIZE = 14;
 export const CELL_TEXT_MARGIN_LEFT = 3;
 
+export function wrappedTextStyle(opts?: {
+	bold?: boolean;
+	italic?: boolean;
+	colWidth?: number;
+	align?: string;
+	fill?: string;
+}): TextStyle {
+	// ...
+}
+```
+
+## !!steps The base style
+
+The unconditional half of the style is the font itself: the same family and
+size the renderer uses for cell labels, plus the three things that change a
+glyph's width — weight, slant, and (for completeness) fill. Bold and italic
+matter here because a bold string wraps at a different point than a regular
+one, so a measurement that ignored them would under-estimate the row height a
+bold cell needs.
+
+```ts ! measureText.ts
 export function wrappedTextStyle(opts?: {
 	bold?: boolean;
 	italic?: boolean;
@@ -30,8 +73,37 @@ export function wrappedTextStyle(opts?: {
 		fontFamily: 'OpenSans, sans-serif',
 		fontSize: FONT_SIZE,
 		fill: opts?.fill ?? '#000000',
+		// !mark(1:2)
 		fontWeight: opts?.bold ? 'bold' : 'normal',
 		fontStyle: opts?.italic ? 'italic' : 'normal',
+		// ...
+	});
+}
+```
+
+## !!steps Word wrap only when a width is given
+
+The wrapping fields are spread in conditionally: pass a `colWidth` and the
+style wraps, omit it and the style measures a single unbroken line. The wrap
+width is the column minus the margin on both sides, floored at 8px so a
+column dragged down to its minimum still leaves something to wrap into rather
+than a zero or negative width.
+
+`breakWords` means a single long token — a URL, a hash — is split rather than
+allowed to overflow the cell, and `align` is carried along because Pixi treats
+alignment as part of the text layout.
+
+```ts ! measureText.ts
+export function wrappedTextStyle(opts?: {
+	bold?: boolean;
+	italic?: boolean;
+	colWidth?: number;
+	align?: string;
+	fill?: string;
+}): TextStyle {
+	return new TextStyle({
+		// ...
+		// !mark(1:2)
 		...(opts?.colWidth !== undefined
 			? {
 					wordWrap: true,
@@ -42,14 +114,51 @@ export function wrappedTextStyle(opts?: {
 			: {})
 	});
 }
+```
 
+## !!steps The measurement itself
+
+`measureWrapped` is the whole public surface for callers: give it a string and
+a column width, get back the wrapped `lines`, the `lineHeight`, and the total
+`height`. Note that it always passes `colWidth` through, so it is by
+definition the wrapping measurement.
+
+Each of the three returned values has a consumer. PixiGrid uses `lineHeight`
+to compute how many lines fit the row (`Math.floor((r.h - 2) / m.lineHeight)`)
+and then joins that many entries of `lines` with newlines, which is how a
+wrapped cell is clipped to its row instead of spilling. The `autofitWrappedRows`
+helper in [state.svelte.ts](/docs/src/lib/state.svelte.ts) uses `height`
+instead: it takes the tallest measurement across the affected cells, adds
+vertical padding, and emits a `setHeading` row-resize operation when the row
+is shorter than that — the reason a row grows the moment you turn on wrapping.
+
+```ts ! measureText.ts
+import { CanvasTextMetrics, TextStyle } from 'pixi.js';
+// ...
 /** Wrapped lines and their metrics for a cell's text at a column width. */
 export function measureWrapped(
 	text: string,
 	colWidth: number,
 	opts?: { bold?: boolean; italic?: boolean }
 ): { lines: string[]; lineHeight: number; height: number } {
+	// !mark
 	const m = CanvasTextMetrics.measureText(text, wrappedTextStyle({ ...opts, colWidth }));
 	return { lines: m.lines, lineHeight: m.lineHeight, height: m.height };
 }
-````
+```
+
+</Scrollycoding>
+
+The two callers of `measureWrapped` are the wrapped-label branch of
+`drawCells` in [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) and
+`autofitWrappedRows` in [state.svelte.ts](/docs/src/lib/state.svelte.ts),
+which turns its result into a row-height operation through
+[SheetController.ts](/docs/src/lib/core/SheetController.ts) and
+[GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts). `wrappedTextStyle` is
+exported but currently used only by `measureWrapped` — PixiGrid builds its own
+inline `Text` style with the same font family and `FONT_SIZE`.
+
+The headings are the one part of the renderer that does not go through here:
+[GridHeadings.ts](/docs/src/lib/grid/pixi/GridHeadings.ts) calls
+`CanvasTextMetrics.measureText` directly against its own 10px label style,
+because it is sizing a heading, not a wrapped cell.
