@@ -1,23 +1,36 @@
 ---
 title: "colors.ts"
-description: "Quadratic's palette, updated to the modern client's theme (quadratic-client/src/app/theme/colors.ts @ v0.24), with a dark variant. `colors` is mutated in pla…"
+description: "The canvas palette — a mutable object swapped between light and dark in place, plus the zoom-based gridline fade"
 source: "src/lib/grid/colors.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The PixiJS renderer can't use CSS custom properties: it draws into a canvas,
+where every color has to be a concrete value at draw time. So the grid keeps
+its palette here, in TypeScript, as a port of Quadratic's modern client theme
+with a dark variant added.
 
-````ts colors.ts -n
-// Quadratic's palette, updated to the modern client's theme
-// (quadratic-client/src/app/theme/colors.ts @ v0.24), with a dark variant.
-// `colors` is mutated in place by setPixiTheme so every consumer (PixiGrid,
-// GridHeadings) sees the switch without import churn.
+The interesting decision is in the module's own header comment: `colors` is
+**mutated in place** rather than replaced. That one choice is what lets a theme
+switch reach every consumer without any of them subscribing to anything.
 
+<Scrollycoding>
+
+## !!steps The light palette
+
+The base theme, with names carried over from Quadratic. Beyond the obvious
+entries there is a color per code-cell language — Python blue, formula magenta,
+JavaScript amber, plain text green — which is what tints a cell's marker so you
+can tell at a glance what computes it.
+
+The comments record where values diverged from the original: gridlines moved to
+a modern slate, and the cursor to the accent blue that replaced the older cyan.
+
+```ts ! colors.ts
 const LIGHT = {
 	gridLines: '#233143', // modern slate; drawn with zoom-faded alpha
 	cellFontColor: '#000000',
+	// !mark(1:4)
 	cellColorUserText: '#8ecb89',
 	cellColorUserPython: '#3776ab',
 	cellColorUserFormula: '#8c1a6a',
@@ -34,7 +47,23 @@ const LIGHT = {
 	quadraticSecondary: '#8ecb89',
 	error: '#f25f5c'
 };
+```
 
+## !!steps Dark as a spread over light
+
+Dark mode is defined as an override rather than a second full palette: spread
+`LIGHT`, then replace only what actually needs to change. Typing it as
+`typeof LIGHT` means a key renamed in the light palette but forgotten here is a
+compile error, not a silently missing color at runtime.
+
+The overrides are exactly the entries that would fail against a dark
+background. The language colors are lightened rather than re-hued — Python
+stays blue, formulas stay magenta — so the code-cell vocabulary survives the
+switch. Entries like `quadraticPrimary` and `error` are absent because they
+read acceptably on both.
+
+```ts ! colors.ts
+// !mark
 const DARK: typeof LIGHT = {
 	...LIGHT,
 	gridLines: '#2e3a4a',
@@ -49,31 +78,91 @@ const DARK: typeof LIGHT = {
 	mediumGray: '#343c46',
 	darkGray: '#9aa4ad'
 };
+```
 
+## !!steps Switching the theme by mutation
+
+Here is the trick the header comment describes. `colors` starts as a *copy* of
+`LIGHT`, and `setPixiTheme` uses `Object.assign` to overwrite that same object's
+properties. The object identity never changes.
+
+That matters because every consumer imports the binding once and reads
+properties off it at draw time — `colors.gridLines` inside a render loop, for
+instance. Had the module reassigned `colors` to a different object, importers
+holding the old reference would keep painting the old theme, and each would need
+some subscription mechanism to notice. Mutation makes the switch invisible:
+the next frame simply reads different values out of the same object.
+
+`themeBackground` stays a plain function because the canvas background isn't
+part of the palette — the renderer sets it directly.
+
+```ts ! colors.ts
+// !mark
 export const colors = { ...LIGHT };
 
 export type ThemeName = 'light' | 'dark';
 
 export function setPixiTheme(theme: ThemeName): void {
+	// !mark
 	Object.assign(colors, theme === 'dark' ? DARK : LIGHT);
 }
 
 export function themeBackground(theme: ThemeName): string {
 	return theme === 'dark' ? '#14171b' : '#ffffff';
 }
+```
 
+## !!steps One color per code language
+
+A small lookup mapping an editor mode to its palette entry, with Python as the
+fallback. Because it reads `colors` at call time rather than capturing values,
+it picks up the current theme automatically.
+
+It has three consumers, which is why it lives here rather than in the renderer:
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) tints code-cell markers on
+the canvas, [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte)
+colors the DOM hover card, and
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte) accents the
+editor panel. All three agree on what "a Python cell" looks like.
+
+```ts ! colors.ts
 export type CodeEditorMode = 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
 
 export function editorModeColor(mode: CodeEditorMode): string {
 	if (mode === 'FORMULA') return colors.cellColorUserFormula;
 	if (mode === 'JAVASCRIPT') return colors.cellColorUserJavascript;
+	// !mark
 	return colors.cellColorUserPython;
 }
+```
 
+## !!steps Fading the gridlines out
+
+On an infinite grid, gridlines drawn at a constant alpha turn into a solid
+smear as you zoom out — thousands of lines land within a few pixels of each
+other. This ramp prevents that: below 10% zoom the lines are skipped entirely,
+above 60% they are fully opaque, and in between the alpha ramps linearly, since
+`scale * 2 - 0.2` runs from 0 to 1 across that range.
+
+The caller multiplies the result by a further `0.2`, so the lines are faint even
+at full strength — see the gridline drawing in
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts).
+
+```ts ! colors.ts
 /** Modern gridline fade: lines dim as you zoom out and vanish below 10%. */
 export function gridLineAlpha(scale: number): number {
+	// !mark(1:3)
 	if (scale < 0.1) return 0;
 	if (scale < 0.6) return scale * 2 - 0.2;
 	return 1;
 }
-````
+```
+
+</Scrollycoding>
+
+The theme switch enters through `setTheme` in
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts), which calls `setPixiTheme`,
+repaints the renderer background with `themeBackground`, and then marks the
+cells dirty — every cached text label has its font color baked into a texture,
+so they all have to re-rasterize. Screen-space chrome reads the same palette in
+[GridHeadings.ts](/docs/src/lib/grid/pixi/GridHeadings.ts).

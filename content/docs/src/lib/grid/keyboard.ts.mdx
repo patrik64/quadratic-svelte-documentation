@@ -1,65 +1,77 @@
 ---
 title: "keyboard.ts"
-description: "Keyboard handling, ported from src/gridGL/interaction/keyboard/*. characters that open the inline editor when typed on a cell"
+description: "Two layers of keyboard handling — window-level chords first, then grid keys for navigation, selection, clipboard and editing"
 source: "src/lib/grid/keyboard.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Every keystroke that isn't swallowed by a focused field ends up here. The file
+is a port of Quadratic's `src/gridGL/interaction/keyboard/*`, flattened into
+two exported predicates — `keyboardViewport` for app-wide chords and
+`keyboardGrid` for the spreadsheet itself — plus the `handleKeyDown` entry
+point that orders them.
 
-````ts keyboard.ts -n
-// Keyboard handling, ported from src/gridGL/interaction/keyboard/*.
+Both predicates return a boolean meaning *I handled this*, which is the only
+thing that decides whether `preventDefault` is called. Nothing in the file
+touches the canvas directly: every branch either flips a flag on the `app`
+store or calls an action exported from
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).
 
-import { isCodeCellType } from '../core/types';
+<Scrollycoding>
 
-import {
-	app,
-	clearFormatting,
-	copySelection,
-	deleteCellsInRect,
-	getSelectionRect,
-	gotoCell,
-	pasteFromClipboard,
-	redo,
-	sheetController,
-	toggleBold,
-	toggleItalic,
-	undo,
-	zoomIn,
-	zoomOut,
-	zoomTo100,
-	zoomToFit,
-	zoomToSelection,
-	ensureCursorVisible,
-	switchSheetRelative,
-	insertTodayDate,
-	copyFormat,
-	copySelectionAsPng,
-	downloadSelectionAsCsv,
-	pasteFormat,
-	rerunAllCode,
-	fillDown,
-	fillRight
-} from '../state.svelte';
+## !!steps One entry point, three phases
 
-// characters that open the inline editor when typed on a cell
-const ALLOWED_FIRST_CHARS = /^[a-zA-Z0-9!"#$%&'()*+,\-.:;<>?@[\\\]^_`{|}~]$/;
+`handleKeyDown` is the only export the rest of the app calls. It runs the
+window layer **first**, before it checks whether focus is in a text field — so
+chords like the command palette still work while a search box has focus.
+Only after that does it bail out for fields and open modals, and finally hand
+the event to the grid layer.
 
-function anyModalOpen(): boolean {
-	return (
-		app.showCommandPalette ||
-		app.showGoToMenu ||
-		app.showCellTypeMenu ||
-		app.showFileMenu ||
-		app.showFormulaDocs ||
-		app.showInput
-	);
+`inField` covers real inputs, textareas and anything `contentEditable`.
+`anyModalOpen()` is a separate check over six `app` flags (command palette,
+go-to menu, cell-type menu, file menu, formula docs, and the cell input) — when
+any is set, grid keys are suppressed so the open UI owns them.
+
+```ts ! keyboard.ts
+export function handleKeyDown(e: KeyboardEvent): void {
+	// modals/inputs own their keys
+	const target = e.target as HTMLElement;
+	const inField =
+		target instanceof HTMLInputElement ||
+		target instanceof HTMLTextAreaElement ||
+		target?.isContentEditable;
+
+	// !mark(1:4)
+	if (keyboardViewport(e)) {
+		e.preventDefault();
+		return;
+	}
+	if (inField || anyModalOpen()) return;
+	if (keyboardGrid(e)) {
+		e.preventDefault();
+	}
 }
+```
 
+## !!steps The window layer: sheets, file menu, palette
+
+`keyboardViewport` normalizes up front: `mod` is `metaKey || ctrlKey` (so
+every chord below works with either Cmd or Ctrl), and `key` is lowercased once
+for the whole function.
+
+Alt is handled first. Alt with no `mod` steps between sheets — right or up for
+the next sheet, left or down for the previous — via `switchSheetRelative`.
+Any *other* Alt combination returns `false` immediately, which lets it fall
+through to the grid layer (that's how the Alt-based format painter below still
+gets a chance). `mod+O` toggles the file menu and closes the other menus; while
+the file menu is open, Escape closes it and every other key returns `false`,
+leaving the menu in charge. `mod+P`, `mod+K` and `mod+/` all toggle the command
+palette.
+
+```ts ! keyboard.ts
 /** Window-level shortcuts (Quadratic's keyboardViewport). Returns true if handled. */
 export function keyboardViewport(e: KeyboardEvent): boolean {
+	// !mark(1:2)
 	const mod = e.metaKey || e.ctrlKey;
 	const key = e.key.toLowerCase();
 
@@ -96,14 +108,35 @@ export function keyboardViewport(e: KeyboardEvent): boolean {
 		app.showCellTypeMenu = false;
 		return true;
 	}
-	if (mod && key === '\\') {
-		clearFormatting();
-		return true;
-	}
+	// ...
+}
+```
+
+## !!steps The rest of the chord table
+
+Everything after that is a flat list of `if (mod && key === …)` branches, each
+one calling a store action and returning `true`. In file order:
+`mod+backslash` clears formatting, `mod+.` toggles presentation mode, `mod+B`
+and `mod+I` toggle bold and italic, `mod+F` opens search with
+`app.searchAllSheets` taken from `e.shiftKey` (so `mod+shift+F` widens it to
+every sheet), and `mod+G` or `mod+J` opens the go-to menu. Then five zoom
+branches: `mod+=` or `mod++` in, `mod+-` or `mod+_` out, `mod+8` to the
+selection, `mod+9` to fit the sheet, `mod+0` back to 100%.
+
+Escape is the odd one out — it exits presentation mode when active, and
+otherwise returns `false` down both paths, deliberately leaving the key to
+whichever modal or the code editor is open. The tail adds `mod+shift+Enter` to
+rerun every code cell and `mod+;` to write today's date (`e.shiftKey` appends
+the time). `mod+S` does nothing but return `true`, which makes `handleKeyDown`
+call `preventDefault` and suppress the browser's save dialog. Anything
+unmatched returns `false` and falls through to the grid layer.
+
+```ts ! keyboard.ts
 	if (mod && key === '.') {
 		app.presentationMode = !app.presentationMode;
 		return true;
 	}
+	// !mark(1:8)
 	if (key === 'escape') {
 		if (app.presentationMode) {
 			app.presentationMode = false;
@@ -120,36 +153,7 @@ export function keyboardViewport(e: KeyboardEvent): boolean {
 		toggleItalic();
 		return true;
 	}
-	if (mod && key === 'f') {
-		app.searchAllSheets = e.shiftKey;
-		app.showSearch = true;
-		return true;
-	}
-	if (mod && (key === 'g' || key === 'j')) {
-		app.showGoToMenu = !app.showGoToMenu;
-		app.showCommandPalette = false;
-		return true;
-	}
-	if (mod && (key === '=' || key === '+')) {
-		zoomIn();
-		return true;
-	}
-	if (mod && (key === '-' || key === '_')) {
-		zoomOut();
-		return true;
-	}
-	if (mod && key === '8') {
-		zoomToSelection();
-		return true;
-	}
-	if (mod && key === '9') {
-		zoomToFit();
-		return true;
-	}
-	if (mod && key === '0') {
-		zoomTo100();
-		return true;
-	}
+	// ...
 	if (mod && e.shiftKey && key === 'enter') {
 		void rerunAllCode();
 		return true;
@@ -158,93 +162,36 @@ export function keyboardViewport(e: KeyboardEvent): boolean {
 		void insertTodayDate(e.shiftKey);
 		return true;
 	}
+	// !mark(1:3)
 	if (mod && key === 's') {
 		return true; // swallow browser save
 	}
 	return false;
 }
+```
 
-function moveCursor(dx: number, dy: number, shift: boolean): void {
-	if (shift) {
-		const move = { x: app.keyboardMovePosition.x + dx, y: app.keyboardMovePosition.y + dy };
-		app.keyboardMovePosition = move;
-		app.multiCursor = {
-			originPosition: { ...app.cursorPosition },
-			terminalPosition: move
-		};
-	} else {
-		const pos = { x: app.cursorPosition.x + dx, y: app.cursorPosition.y + dy };
-		app.cursorPosition = pos;
-		app.keyboardMovePosition = pos;
-		app.multiCursor = undefined;
-	}
-	ensureCursorVisible();
-}
+## !!steps The grid layer: format painter and clipboard
 
-/** Excel-style ctrl+arrow jump: to the edge of the current content run. */
-function jumpCursor(dx: number, dy: number, shift: boolean): void {
-	const sheet = sheetController.sheet;
-	const base = shift ? app.keyboardMovePosition : app.cursorPosition;
-	let { x, y } = base;
-	const has = (cx: number, cy: number) => {
-		const c = sheet.getCell(cx, cy);
-		return c !== undefined && c.value !== '';
-	};
-	const MAX = 10000;
-	if (has(x, y) && has(x + dx, y + dy)) {
-		// inside a run: go to its far edge
-		let steps = 0;
-		while (has(x + dx, y + dy) && steps++ < MAX) {
-			x += dx;
-			y += dy;
-		}
-	} else {
-		// jump to the next cell with content
-		let steps = 0;
-		let cx = x + dx;
-		let cy = y + dy;
-		while (!has(cx, cy) && steps++ < MAX) {
-			cx += dx;
-			cy += dy;
-		}
-		if (steps < MAX) {
-			x = cx;
-			y = cy;
-		} else {
-			x += dx;
-			y += dy;
-		}
-	}
-	if (shift) {
-		app.keyboardMovePosition = { x, y };
-		app.multiCursor = { originPosition: { ...app.cursorPosition }, terminalPosition: { x, y } };
-	} else {
-		app.cursorPosition = { x, y };
-		app.keyboardMovePosition = { x, y };
-		app.multiCursor = undefined;
-	}
-	ensureCursorVisible();
-}
+`keyboardGrid` keeps `key` in its original case (each branch lowercases as
+needed) so it can still distinguish characters later. It opens with the format
+painter, which matches on `e.code` rather than `e.key` — the comment spells out
+why: on macOS, Option plus a letter produces a different character entirely, so
+`e.key` would not be `c` or `v`.
 
-function openCellEditor(seed?: string): void {
-	const { x, y } = app.cursorPosition;
-	const cell = sheetController.sheet.getCell(x, y);
-	if (cell && isCodeCellType(cell.type)) {
-		app.editorMode = cell.type;
-		app.editorCell = { x, y };
-		app.showCodeEditor = true;
-		return;
-	}
-	app.inputInitialValue = seed !== undefined ? seed : (cell?.value ?? '');
-	app.showInput = true;
-}
+Clipboard order matters here: the `shift` variants are tested first, otherwise
+`mod+shift+C` would be caught by the plain `mod+C` branch. `mod+shift+C` copies
+the selection as a PNG, `mod+shift+E` downloads it as CSV, and `mod+C` /
+`mod+X` / `mod+V` are copy, cut and paste — cut being `copySelection(true)`,
+which writes the text then deletes the range.
 
+```ts ! keyboard.ts
 /** Grid-level keys (Quadratic's onKeyDown chain). Returns true if handled. */
 export function keyboardGrid(e: KeyboardEvent): boolean {
 	const mod = e.metaKey || e.ctrlKey;
 	const key = e.key;
 
 	// format painter (e.code because Option+letter types special chars on mac)
+	// !mark(1:2)
 	if (mod && e.altKey && e.code === 'KeyC') {
 		copyFormat();
 		return true;
@@ -275,7 +222,22 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		void pasteFromClipboard();
 		return true;
 	}
+```
 
+## !!steps Fill, history, and select all
+
+`mod+D` and `mod+R` fill down and right, both guarded with `!e.shiftKey`.
+Undo is `mod+Z` with `shift` switching it to redo; `mod+Y` is accepted as a
+second redo, but note it tests `e.ctrlKey` specifically rather than `mod`, so
+it is a Ctrl-only chord even on macOS.
+
+Select all is not "select the infinite grid" — it asks the sheet for its
+`getBounds()` and, if the sheet has any content, calls `gotoCell` with the
+bounding rectangle as the range, producing a `multiCursor` over the used area.
+An empty sheet does nothing but still returns `true`, so the browser's own
+select-all never fires.
+
+```ts ! keyboard.ts
 	// fill
 	if (mod && key.toLowerCase() === 'd' && !e.shiftKey) {
 		void fillDown();
@@ -292,6 +254,7 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		else undo();
 		return true;
 	}
+	// !mark(1:4)
 	if (e.ctrlKey && key.toLowerCase() === 'y') {
 		redo();
 		return true;
@@ -305,6 +268,42 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		}
 		return true;
 	}
+```
+
+## !!steps Arrows move, shift extends
+
+`moveCursor` is where selection state is maintained. Without shift it moves
+`cursorPosition`, keeps `keyboardMovePosition` in sync and clears
+`multiCursor`. With shift it moves only `keyboardMovePosition` and rebuilds
+`multiCursor` as a rectangle anchored at `cursorPosition` — so the anchor never
+moves while you extend, and an unshifted arrow afterwards steps once from that
+anchor, discarding the extension.
+
+The four arrow branches in `keyboardGrid` are identical apart from the delta:
+each routes to `jumpCursor` when `mod` is held and `moveCursor` otherwise,
+passing `e.shiftKey` straight through. `ensureCursorVisible` scrolls based on
+`app.cursorPosition`, which shift-extension leaves at the anchor.
+
+```ts ! keyboard.ts
+function moveCursor(dx: number, dy: number, shift: boolean): void {
+	// !mark(1:7)
+	if (shift) {
+		const move = { x: app.keyboardMovePosition.x + dx, y: app.keyboardMovePosition.y + dy };
+		app.keyboardMovePosition = move;
+		app.multiCursor = {
+			originPosition: { ...app.cursorPosition },
+			terminalPosition: move
+		};
+	} else {
+		const pos = { x: app.cursorPosition.x + dx, y: app.cursorPosition.y + dy };
+		app.cursorPosition = pos;
+		app.keyboardMovePosition = pos;
+		app.multiCursor = undefined;
+	}
+	ensureCursorVisible();
+}
+
+// ...
 
 	// navigation
 	if (key === 'ArrowUp') {
@@ -317,16 +316,95 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		else moveCursor(0, 1, e.shiftKey);
 		return true;
 	}
-	if (key === 'ArrowLeft') {
-		if (mod) jumpCursor(-1, 0, e.shiftKey);
-		else moveCursor(-1, 0, e.shiftKey);
-		return true;
+	// ...
+```
+
+## !!steps Ctrl plus arrow jumps across content
+
+`jumpCursor` reproduces the Excel jump, and fires for either Ctrl or Cmd since
+the arrow branches test `mod`. It starts from `keyboardMovePosition` when
+extending a selection and from `cursorPosition` otherwise, and defines `has` as
+"a cell exists here and its value is not the empty string".
+
+Two cases. If the current cell has content *and* so does the neighbour in the
+travel direction, you are inside a run, so it walks to the far end of that run.
+Otherwise it scans ahead for the first cell with content. Both loops are
+bounded by `MAX = 10000` steps — if the scan finds nothing within that budget
+the cursor advances a single cell instead of flying off into empty space. The
+tail (elided) commits the result the same way `moveCursor` does: extend
+`multiCursor` under shift, otherwise move the cursor and clear the selection.
+
+```ts ! keyboard.ts
+/** Excel-style ctrl+arrow jump: to the edge of the current content run. */
+function jumpCursor(dx: number, dy: number, shift: boolean): void {
+	const sheet = sheetController.sheet;
+	const base = shift ? app.keyboardMovePosition : app.cursorPosition;
+	let { x, y } = base;
+	// !mark(1:4)
+	const has = (cx: number, cy: number) => {
+		const c = sheet.getCell(cx, cy);
+		return c !== undefined && c.value !== '';
+	};
+	const MAX = 10000;
+	if (has(x, y) && has(x + dx, y + dy)) {
+		// inside a run: go to its far edge
+		let steps = 0;
+		while (has(x + dx, y + dy) && steps++ < MAX) {
+			x += dx;
+			y += dy;
+		}
+	} else {
+		// jump to the next cell with content
+		let steps = 0;
+		let cx = x + dx;
+		let cy = y + dy;
+		while (!has(cx, cy) && steps++ < MAX) {
+			cx += dx;
+			cy += dy;
+		}
+		if (steps < MAX) {
+			x = cx;
+			y = cy;
+		} else {
+			x += dx;
+			y += dy;
+		}
 	}
-	if (key === 'ArrowRight') {
-		if (mod) jumpCursor(1, 0, e.shiftKey);
-		else moveCursor(1, 0, e.shiftKey);
-		return true;
+	// ...
+}
+```
+
+## !!steps Tab, Delete, Enter
+
+`if (mod) return false;` is the dividing line: everything past it is an
+unmodified key. Tab moves one column (Shift+Tab back one) and passes `false`
+for the shift parameter, so tabbing always collapses a selection rather than
+extending it. Backspace and Delete are the same branch — they clear the whole
+selection rectangle from `getSelectionRect`, which is the cursor cell when
+nothing is multi-selected.
+
+Enter calls `openCellEditor` with no seed. That helper is the single door into
+editing: a cell whose type is a code type (per `isCodeCellType` from
+[types.ts](/docs/src/lib/core/types.ts)) opens the code editor at that cell
+instead, and anything else seeds the inline input — with the existing value
+when there is no seed, which is what makes Enter an *edit in place*.
+
+```ts ! keyboard.ts
+function openCellEditor(seed?: string): void {
+	const { x, y } = app.cursorPosition;
+	const cell = sheetController.sheet.getCell(x, y);
+	// !mark(1:6)
+	if (cell && isCodeCellType(cell.type)) {
+		app.editorMode = cell.type;
+		app.editorCell = { x, y };
+		app.showCodeEditor = true;
+		return;
 	}
+	app.inputInitialValue = seed !== undefined ? seed : (cell?.value ?? '');
+	app.showInput = true;
+}
+
+// ...
 
 	if (mod) return false;
 
@@ -345,7 +423,30 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		openCellEditor();
 		return true;
 	}
+```
 
+## !!steps Slash, equals, and typing a character
+
+Slash and equals share a branch with four outcomes: on an existing code cell
+they open the code editor in that cell's language; on any other existing cell
+they open the inline input seeded with the cell's current value (the typed
+character itself is dropped); on an empty cell, equals opens the code editor
+straight into `FORMULA` mode, while slash opens the cell-type menu with
+`PYTHON` preselected.
+
+Every other printable key falls to `ALLOWED_FIRST_CHARS`, a single-character
+regex covering letters, digits and punctuation. A match calls
+`openCellEditor(key)`, seeding the editor with the character just typed.
+Equals and slash are absent from the class because the branch above claims
+them; space is absent too, and never reaches this file — it is intercepted in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) to arm pan
+mode.
+
+```ts ! keyboard.ts
+// characters that open the inline editor when typed on a cell
+const ALLOWED_FIRST_CHARS = /^[a-zA-Z0-9!"#$%&'()*+,\-.:;<>?@[\\\]^_`{|}~]$/;
+
+	// ...
 	if (key === '/' || key === '=') {
 		const { x, y } = app.cursorPosition;
 		const cell = sheetController.sheet.getCell(x, y);
@@ -369,29 +470,30 @@ export function keyboardGrid(e: KeyboardEvent): boolean {
 		return true;
 	}
 
+	// !mark(1:4)
 	if (ALLOWED_FIRST_CHARS.test(key)) {
 		openCellEditor(key);
 		return true;
 	}
+```
 
-	return false;
-}
+</Scrollycoding>
 
-export function handleKeyDown(e: KeyboardEvent): void {
-	// modals/inputs own their keys
-	const target = e.target as HTMLElement;
-	const inField =
-		target instanceof HTMLInputElement ||
-		target instanceof HTMLTextAreaElement ||
-		target?.isContentEditable;
+`handleKeyDown` is wired to a bubble-phase `window` keydown listener in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which is why
+[CellInput.svelte](/docs/src/lib/components/CellInput.svelte) calls
+`stopPropagation` on its own keydown handler — while the inline editor is open,
+none of these shortcuts fire, and Enter, Tab, arrows and Escape mean
+commit-and-move instead.
 
-	if (keyboardViewport(e)) {
-		e.preventDefault();
-		return;
-	}
-	if (inField || anyModalOpen()) return;
-	if (keyboardGrid(e)) {
-		e.preventDefault();
-	}
-}
-````
+The flags this file flips are consumed by
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte),
+[GoTo.svelte](/docs/src/lib/components/GoTo.svelte),
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte),
+[CellTypeMenu.svelte](/docs/src/lib/components/CellTypeMenu.svelte),
+[SearchBar.svelte](/docs/src/lib/components/SearchBar.svelte) and
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte); the actions
+behind them all live in [state.svelte.ts](/docs/src/lib/state.svelte.ts).
+The chord *labels* users see in menus come from a separate module,
+[keyboardSymbols.ts](/docs/src/lib/helpers/keyboardSymbols.ts) — it is not
+imported here, so the two lists are kept in sync by hand.
