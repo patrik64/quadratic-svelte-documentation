@@ -27,11 +27,24 @@ function SourceLink({ path }: { path: string }) {
   );
 }
 
+// Next.js returns slug segments percent-encoded, so a file whose name starts
+// with `+` (SvelteKit's route convention) arrives as `%2Bpage.svelte` and would
+// never match the source's `+page.svelte`.
+function decodeSlug(slug: string[] | undefined): string[] | undefined {
+  return slug?.map((segment) => {
+    try {
+      return decodeURIComponent(segment);
+    } catch {
+      return segment;
+    }
+  });
+}
+
 export default async function Page(props: {
   params: Promise<{ slug?: string[] }>;
 }) {
   const params = await props.params;
-  const page = source.getPage(params.slug);
+  const page = source.getPage(decodeSlug(params.slug));
   if (!page) notFound();
 
   const MDX = page.data.body;
@@ -60,7 +73,7 @@ export async function generateMetadata(props: {
   params: Promise<{ slug?: string[] }>;
 }): Promise<Metadata> {
   const params = await props.params;
-  const page = source.getPage(params.slug);
+  const page = source.getPage(decodeSlug(params.slug));
   if (!page) notFound();
 
   return {

@@ -1,15 +1,32 @@
 ---
 title: "+page.svelte"
-description: "The +page Svelte component."
+description: "The application shell: mounts every panel, wires the initial file load, and drives presentation mode"
 source: "src/routes/+page.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+This is the only page in the app, and it reads like an assembly diagram. There
+is no business logic here — every component it renders owns its own behavior,
+and every visibility decision is a boolean read from
+[state.svelte.ts](/docs/src/lib/state.svelte.ts). The page's whole
+contribution is deciding *what is on screen* and *in what order*.
 
-````svelte +page.svelte -n
+The result is that adding a panel to the app means adding a component, a flag
+in the store, and one line here.
+
+<Scrollycoding>
+
+## !!steps Ten components and a store
+
+The import list is effectively the app's feature list: the bars along the
+edges, the overlays (command palette, go-to, file menu, formula docs, cell
+type menu), the code editor, and the grid itself. Only two things come from
+the store — `app`, the reactive state object, and `loadInitialFile`.
+
+Nothing here is lazy-loaded; the whole UI is one bundle, consistent with the
+static SPA build configured in [+layout.ts](/docs/src/routes/+layout.ts).
+
+```svelte ! +page.svelte
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import BottomBar from '$lib/components/BottomBar.svelte';
@@ -23,12 +40,45 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	import SheetBar from '$lib/components/SheetBar.svelte';
 	import TopBar from '$lib/components/TopBar.svelte';
 	import { app, loadInitialFile } from '$lib/state.svelte';
+</script>
+```
 
+## !!steps Loading a file on mount
+
+The single piece of behavior in the file. `onMount` runs only in the browser,
+which is the only place it *could* run given `ssr = false` — but it also
+guarantees the call happens after the DOM exists, since loading a file
+repopulates the sheet the canvas is about to draw.
+
+`loadInitialFile` in [state.svelte.ts](/docs/src/lib/state.svelte.ts) restores
+the most recent file from IndexedDB via
+[gridFile.ts](/docs/src/lib/files/gridFile.ts), rebuilds cross-sheet
+dependencies, and falls back to seeding example content when there is no saved
+file or it fails to import. The `void` keyword discards the returned promise
+deliberately — `onMount` callbacks must not be async, because a returned
+promise would be mistaken for a cleanup function.
+
+```svelte ! +page.svelte
+<script lang="ts">
+	// ...
 	onMount(() => {
+		// !mark
 		void loadInitialFile();
 	});
 </script>
+```
 
+## !!steps Overlays, gated by flags
+
+Each overlay renders only when its flag is set. These are true overlays rather
+than layout participants — they position themselves absolutely — so their
+order among the siblings mostly affects stacking, and `CellTypeMenu` comes
+first.
+
+`TopBar` is the exception in this group: it is part of the column layout, and
+it is hidden by `presentationMode` rather than shown by a flag of its own.
+
+```svelte ! +page.svelte
 <div class="app">
 	{#if app.showCellTypeMenu}<CellTypeMenu />{/if}
 	{#if !app.presentationMode}<TopBar />{/if}
@@ -36,19 +86,60 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 	{#if app.showGoToMenu}<GoTo />{/if}
 	{#if app.showFileMenu}<FileMenu />{/if}
 	{#if app.showFormulaDocs}<FormulaDocs />{/if}
+</div>
+```
 
+## !!steps The grid and the editor share the main row
+
+The `main` div is the flexible middle of the column — it absorbs whatever
+height the bars leave behind. Inside it, `GridCanvas` and the optional
+`CodeEditor` sit side by side as flex children, which is what produces the
+familiar split view when you open a code cell.
+
+`GridCanvas` is always mounted: the PixiJS application it owns is expensive to
+create, and tearing it down whenever the editor opened would throw away the
+whole scene graph.
+
+```svelte ! +page.svelte
+<div class="app">
 	<div class="main">
 		<GridCanvas />
+		// !mark
 		{#if app.showCodeEditor}<CodeEditor />{/if}
 	</div>
+</div>
+```
 
+## !!steps Presentation mode strips the chrome
+
+The same flag that hid `TopBar` also removes the sheet tabs and the status bar,
+leaving the grid alone on screen. In their place a transient hint tells the
+user how to get back out.
+
+```svelte ! +page.svelte
+<div class="app">
 	{#if !app.presentationMode}<SheetBar />{/if}
 	{#if !app.presentationMode}<BottomBar />{/if}
+	// !mark(1:3)
 	{#if app.presentationMode}
 		<div class="presentation-hint">Press Esc to exit presentation mode</div>
 	{/if}
 </div>
+```
 
+## !!steps A column that never scrolls
+
+The layout is a two-level flexbox. The outer `.app` is a full-viewport column,
+so the bars take their natural heights and `.main` takes the rest via
+`flex: 1`. `overflow: hidden` appears at both levels, reinforcing what
+[+layout.svelte](/docs/src/routes/+layout.svelte) established for the
+document: this app never scrolls in the browser sense.
+
+`position: relative` on `.main` is what the absolutely positioned cell editor
+([CellInput.svelte](/docs/src/lib/components/CellInput.svelte)) resolves its
+coordinates against.
+
+```svelte ! +page.svelte
 <style>
 	.app {
 		width: 100%;
@@ -63,6 +154,23 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		overflow: hidden;
 		position: relative;
 	}
+</style>
+```
+
+## !!steps A hint that fades itself out
+
+The presentation hint is centered along the bottom edge and made
+`pointer-events: none` so it can never intercept a click meant for the grid
+beneath it.
+
+Its animation does the dismissing: `fade-out` holds full opacity for the first
+75% of a four-second run, then fades over the last quarter, with `forwards`
+keeping the final transparent state. No timer, no state, no cleanup — the hint
+is simply gone after four seconds while the element stays in the DOM for as
+long as presentation mode lasts.
+
+```svelte ! +page.svelte
+<style>
 	.presentation-hint {
 		position: fixed;
 		bottom: 1rem;
@@ -86,4 +194,14 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		}
 	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+The components assembled here are documented individually under
+`src/lib/components/` — start with
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), which mounts
+the PixiJS engine and forwards input events, or
+[TopBar.svelte](/docs/src/lib/components/TopBar.svelte) for the menu bar. The
+flags read throughout this page all live in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts).

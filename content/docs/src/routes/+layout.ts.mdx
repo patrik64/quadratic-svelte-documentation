@@ -1,16 +1,75 @@
 ---
 title: "+layout.ts"
-description: "Client-only app: the grid renders to canvas and state lives in the browser."
+description: "Three lines of route configuration that turn the whole app into a prerendered, client-only SPA"
 source: "src/routes/+layout.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The smallest file in the project, and one of the most consequential. A
+SvelteKit `+layout.ts` exports configuration that applies to its route **and
+every route beneath it** — and since this one sits at the root of `src/routes`,
+its two exports decide how the entire application is built and served.
 
-````ts +layout.ts -n
+Together they say: render nothing on the server, but still emit a static HTML
+shell at build time. That is exactly the shape of a single-page app, which is
+what a canvas spreadsheet has to be.
+
+<Scrollycoding>
+
+## !!steps The whole file
+
+Two exported constants and a comment explaining them. SvelteKit reads these
+names specifically — `ssr` and `prerender` are part of its page-options API,
+not ordinary variables — so declaring them here reconfigures the build.
+
+```ts ! +layout.ts
 // Client-only app: the grid renders to canvas and state lives in the browser.
 export const ssr = false;
 export const prerender = true;
-````
+```
+
+## !!steps No server rendering
+
+Disabling SSR is not a preference here, it is a requirement. The grid draws
+into a WebGL/canvas surface through PixiJS
+([PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts)), which needs a real DOM
+and a GPU context — neither exists in Node during a server render. The
+application state in [state.svelte.ts](/docs/src/lib/state.svelte.ts) is
+likewise browser-resident, and files are loaded from IndexedDB by
+[gridFile.ts](/docs/src/lib/files/gridFile.ts).
+
+With `ssr = false`, SvelteKit ships the page shell and lets the client mount
+everything.
+
+```ts ! +layout.ts
+// Client-only app: the grid renders to canvas and state lives in the browser.
+// !mark
+export const ssr = false;
+export const prerender = true;
+```
+
+## !!steps Still prerendered
+
+`prerender = true` looks contradictory next to `ssr = false`, but the two
+options answer different questions. `ssr` asks *should components render on
+the server*; `prerender` asks *should this route be emitted as a static file
+at build time*. Answering no and yes gives a static HTML shell with no
+server-rendered markup inside it — the classic SPA artifact.
+
+That is what makes the app deployable as pure static hosting: the project uses
+`@sveltejs/adapter-static` with `fallback: 'index.html'` (configured in
+`vite.config.ts`), so every URL serves the same prerendered shell and the
+client router takes over.
+
+```ts ! +layout.ts
+// Client-only app: the grid renders to canvas and state lives in the browser.
+export const ssr = false;
+// !mark
+export const prerender = true;
+```
+
+</Scrollycoding>
+
+The shell these options produce is defined by
+[+layout.svelte](/docs/src/routes/+layout.svelte), and the application it
+mounts is [+page.svelte](/docs/src/routes/+page.svelte).

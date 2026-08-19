@@ -1,28 +1,76 @@
 ---
 title: "+layout.svelte"
-description: "The +layout Svelte component."
+description: "The root layout: global stylesheet, document title, and the full-height non-scrolling page the grid needs"
 source: "src/routes/+layout.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The root layout wraps every route in the app. It has almost no logic — its job
+is to establish the document: pull in the global stylesheet, set the title, and
+lock the page to the viewport so the canvas underneath can own all scrolling
+itself.
 
-````svelte +layout.svelte -n
+That last part matters more than it sounds. A spreadsheet pans and zooms its
+own infinite surface; if the browser were also free to scroll the page, the two
+would fight.
+
+<Scrollycoding>
+
+## !!steps Importing the stylesheet and the children snippet
+
+The layout imports [app.css](/docs/src/app.css) once here, which is how the
+CSS custom properties used throughout the app (`--bg`, `--text`, the panel and
+grid colors) get defined for every route.
+
+The `children` prop is Svelte 5's replacement for slots: layouts receive the
+nested route as a `Snippet` through `$props()` rather than through a `<slot />`
+element.
+
+```svelte ! +layout.svelte
 <script lang="ts">
 	import '../app.css';
 	import type { Snippet } from 'svelte';
 
+	// !mark
 	let { children }: { children: Snippet } = $props();
 </script>
+```
 
+## !!steps The document title
+
+`svelte:head` appends to the document head. Because this lives in the root
+layout, the title applies to the whole application — there is only one page in
+practice, so no route ever overrides it.
+
+```svelte ! +layout.svelte
 <svelte:head>
 	<title>Quadratic Svelte — The data science spreadsheet</title>
 </svelte:head>
+```
 
+## !!steps Rendering the route
+
+One line of markup: call the snippet. Everything the user actually sees —
+the grid, the bars, the menus — arrives through here from
+[+page.svelte](/docs/src/routes/+page.svelte).
+
+```svelte ! +layout.svelte
 {@render children()}
+```
 
+## !!steps Locking the page to the viewport
+
+The global block is where the layout does its real work. `height: 100%` on
+both `html` and `body`, plus `overflow: hidden`, produce a document that
+exactly fills the window and never scrolls — panning is handled by the PixiJS
+viewport in [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts), not by the
+browser.
+
+The colors come from the variables defined in [app.css](/docs/src/app.css),
+and the font stack leads with Open Sans to match the cell text measured in
+[measureText.ts](/docs/src/lib/grid/pixi/measureText.ts).
+
+```svelte ! +layout.svelte
 <style>
 	:global(html, body) {
 		margin: 0;
@@ -38,8 +86,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			'Segoe UI',
 			sans-serif;
 	}
+</style>
+```
+
+## !!steps Reaching through the wrapper element
+
+Styles in a Svelte component are scoped by default, so `:global(...)` is
+required to reach `html` and `body` at all. This second rule handles the
+element SvelteKit renders around the app: the height chain has to be unbroken
+from `html` down to the app container, or `height: 100vh` inside
+[+page.svelte](/docs/src/routes/+page.svelte) would have nothing to sit in.
+
+```svelte ! +layout.svelte
+<style>
 	:global(#svelte, body > div) {
 		height: 100%;
 	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+The build-time behavior of this shell — prerendered, client-rendered only — is
+set next door in [+layout.ts](/docs/src/routes/+layout.ts).
