@@ -1,28 +1,41 @@
 ---
 title: "CellTypeMenu.svelte"
-description: "The CellTypeMenu Svelte component."
+description: "The language picker opened by slash — a filtered list with keyboard navigation that skips disabled entries"
 source: "src/lib/components/CellTypeMenu.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Press `/` on an empty cell and this dialog asks which kind of code cell you
+want. It is a small searchable list, but the interaction details are what make
+it feel finished: the search field takes focus immediately, arrow keys move a
+selection that steps over unavailable options, and Enter commits.
 
-````svelte CellTypeMenu.svelte -n
+The alternative route matters for understanding it. Typing `=` on an empty cell
+skips this menu and opens a formula directly, so this dialog is specifically the
+*undecided* path — which is why Formula appears here as one option among
+several rather than as a default.
+
+<Scrollycoding>
+
+## !!steps Options as data, including one that cannot be picked
+
+The four options are a plain array, so the list, its icons and its keyboard
+behavior all derive from one place.
+
+The interesting entry is the last. Rather than hide SQL until it exists, it
+ships as a permanently `disabled` row with a `Coming soon` chip — advertising
+the roadmap in the place a user would look for it. Two optional fields exist
+solely to support that: `disabled`, which every interaction path checks, and
+`chip`. Its `mode` is absent, which is a second, type-level guarantee that it
+cannot open an editor.
+
+The colors are the CSS variables from [app.css](/docs/src/app.css), the same
+ones the canvas uses for code-cell markers via
+[colors.ts](/docs/src/lib/grid/colors.ts), so a Python cell is the same blue
+everywhere.
+
+```svelte ! CellTypeMenu.svelte
 <script lang="ts">
-	import { app } from '../state.svelte';
-	import Modal from './Modal.svelte';
-
-	interface CellTypeOption {
-		name: string;
-		mode?: 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
-		color: string;
-		description: string;
-		disabled?: boolean;
-		chip?: string;
-	}
-
 	const OPTIONS: CellTypeOption[] = [
 		{
 			name: 'Python',
@@ -30,27 +43,37 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			color: 'var(--python)',
 			description: 'Script with Pandas, NumPy, Micropip, and more.'
 		},
-		{
-			name: 'Formula',
-			mode: 'FORMULA',
-			color: 'var(--formula)',
-			description: 'Classic spreadsheet logic like SUM, AVERAGE, and more.'
-		},
-		{
-			name: 'JavaScript',
-			mode: 'JAVASCRIPT',
-			color: 'var(--javascript)',
-			description: 'Script with modern JavaScript; return a value to the sheet.'
-		},
+		// ...
 		{
 			name: 'SQL Query',
 			color: 'var(--faint-2)',
 			description: 'Import your data with queries.',
+			// !mark(1:2)
 			disabled: true,
 			chip: 'Coming soon'
 		}
 	];
+</script>
+```
 
+## !!steps Filtering, and resetting the cursor when it changes
+
+`filtered` is a case-insensitive substring match over the option names,
+recomputed whenever the query changes.
+
+The two effects handle the details a list like this usually gets wrong. The
+first focuses the search box on mount, so the dialog is typeable the instant it
+appears. The second resets `selectedIndex` to zero **whenever the search text
+changes** — `void search` is the explicit dependency read that makes the effect
+fire, the same pattern used for the redraw counter in
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte).
+
+Without that reset, narrowing the list while the selection sat at index 3 would
+leave it pointing past the end, or worse, silently at a different option than
+the highlighted one.
+
+```svelte ! CellTypeMenu.svelte
+<script lang="ts">
 	let search = $state('');
 	let selectedIndex = $state(0);
 	let searchEl: HTMLInputElement | undefined = $state();
@@ -63,33 +86,95 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		searchEl?.focus();
 	});
 	$effect(() => {
+		// !mark(1:2)
 		void search;
 		selectedIndex = 0;
 	});
+</script>
+```
 
-	function close(): void {
-		app.showCellTypeMenu = false;
-	}
+## !!steps Choosing writes four pieces of state
 
+Selecting an option is a single transition in the store: record the language,
+pin the cell being edited by **copying** the cursor position, close this dialog
+and open the editor.
+
+The copy matters for the same reason it does in
+[CellInput.svelte](/docs/src/lib/components/CellInput.svelte) — `editorCell` has
+to stay where the user invoked the menu, not follow the cursor if something
+moves it later.
+
+The guard is the first line, and it is deliberately redundant with the markup:
+even though disabled rows are styled as unclickable, they are still real
+`button` elements, so a click or an Enter press could reach here. Checking both
+`disabled` and the absence of `mode` closes that off in one place rather than
+trusting every call site.
+
+```svelte ! CellTypeMenu.svelte
+<script lang="ts">
 	function choose(option: CellTypeOption): void {
+		// !mark
 		if (option.disabled || !option.mode) return;
 		app.editorMode = option.mode;
+		// !mark
 		app.editorCell = { ...app.cursorPosition };
 		app.showCellTypeMenu = false;
 		app.showCodeEditor = true;
 	}
+</script>
+```
 
+## !!steps Stepping over the unavailable option
+
+Arrow navigation cannot simply add one and wrap, because that would park the
+highlight on `SQL Query`, where Enter does nothing and the dialog appears
+frozen.
+
+So `moveSelection` keeps advancing in the requested direction until it lands on
+an enabled option. The modulo arithmetic — adding `filtered.length` before the
+remainder — makes it wrap correctly in both directions, including from index 0
+upwards where a plain `%` would give a negative.
+
+The loop is bounded by the list length, which is the safeguard that matters: if
+*every* option were disabled it stops after one full pass instead of spinning
+forever. The selection stays where it was, which is the right outcome for a list
+with nothing to choose.
+
+```svelte ! CellTypeMenu.svelte
+<script lang="ts">
 	function moveSelection(delta: number): void {
 		if (filtered.length === 0) return;
 		let i = selectedIndex;
+		// !mark(1:4)
 		for (let step = 0; step < filtered.length; step++) {
 			i = (i + delta + filtered.length) % filtered.length;
 			if (!filtered[i].disabled) break;
 		}
 		selectedIndex = i;
 	}
+</script>
+```
 
+## !!steps Keys handled locally, not globally
+
+`stopPropagation` on the first line keeps every keystroke away from the grid's
+global handler in [keyboard.ts](/docs/src/lib/grid/keyboard.ts) — otherwise
+typing a search query would also be moving the cursor around the sheet behind
+the dialog.
+
+The arrows call `preventDefault` so they scroll the selection rather than the
+search field's caret, and Enter is guarded with a lookup that may find nothing:
+when the filter has emptied the list, `filtered[selectedIndex]` is `undefined`
+and pressing Enter simply does nothing.
+
+Escape closes, matching the backdrop click that
+[Modal.svelte](/docs/src/lib/components/Modal.svelte) wires to the same
+`close`.
+
+```svelte ! CellTypeMenu.svelte
+<script lang="ts">
 	function onKeyDown(e: KeyboardEvent): void {
+		// !mark
 		e.stopPropagation();
 		if (e.key === 'Escape') close();
 		else if (e.key === 'ArrowDown') {
@@ -101,22 +186,30 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		} else if (e.key === 'Enter') {
 			e.preventDefault();
 			const option = filtered[selectedIndex];
+			// !mark
 			if (option) choose(option);
 		}
 	}
 </script>
+```
 
-<Modal onclose={close}>
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div onkeydown={onKeyDown}>
-		<input
-			bind:this={searchEl}
-			bind:value={search}
-			class="search"
-			placeholder="Choose a cell type…"
-			spellcheck="false"
-		/>
-		<div class="list">
+## !!steps Mouse and keyboard sharing one selection
+
+The list renders inside [Modal.svelte](/docs/src/lib/components/Modal.svelte),
+which supplies the backdrop and the dialog box. Keying the `each` by
+`option.name` rather than index keeps the rows stable as the filter changes.
+
+The unifying idea is that hovering **moves the same `selectedIndex`** the arrow
+keys move, rather than applying a separate hover style. That means the mouse and
+the keyboard can never disagree about which row Enter would activate — a
+divergence that is easy to introduce and confusing to use. The hover handler
+carries the same disabled check, so passing over `SQL Query` leaves the
+highlight where it was.
+
+The `{:else}` branch of the `each` block covers the empty-filter case with a
+plain message.
+
+```svelte ! CellTypeMenu.svelte
 			{#each filtered as option, i (option.name)}
 				<button
 					class="option"
@@ -139,24 +232,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			{:else}
 				<div class="empty">No matches</div>
 			{/each}
-		</div>
-	</div>
-</Modal>
+```
 
+## !!steps Styling a row that has to behave like a list item
+
+Each row is a `button` for accessibility and keyboard reachability, so the rule
+strips the entire native appearance — background, border, inherited font,
+left-aligned text — leaving something that reads as a list item while remaining
+a real control.
+
+`selected` is a background rather than an outline so it reads the same whether
+it arrived from the keyboard or the mouse, and `disabled` swaps the pointer back
+to the default arrow and dims the row: two independent signals that clicking
+will do nothing.
+
+The icon is a colored square holding the first letter of the option name —
+`option.name.slice(0, 1)` in the markup above — with `flex-shrink: 0` so it
+keeps its size when a long description competes for width.
+
+```svelte ! CellTypeMenu.svelte
 <style>
-	.search {
-		width: 100%;
-		border: none;
-		outline: none;
-		padding: 0.9rem 1rem;
-		font-size: 0.95rem;
-		border-bottom: 1px solid var(--border-light);
-		box-sizing: border-box;
-	}
-	.list {
-		overflow-y: auto;
-		padding: 0.25rem 0;
-	}
 	.option {
 		display: flex;
 		align-items: center;
@@ -176,43 +271,20 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		cursor: default;
 		opacity: 0.6;
 	}
-	.icon {
-		width: 28px;
-		height: 28px;
-		border-radius: 4px;
-		color: white;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		font-weight: 700;
-		flex-shrink: 0;
-	}
-	.text {
-		display: flex;
-		flex-direction: column;
-		min-width: 0;
-	}
-	.name {
-		font-weight: 600;
-		font-size: 0.85rem;
-	}
-	.desc {
-		color: var(--muted);
-		font-size: 0.75rem;
-	}
-	.chip {
-		margin-left: auto;
-		font-size: 0.65rem;
-		border: 1px solid var(--border);
-		border-radius: 10px;
-		padding: 2px 8px;
-		color: var(--muted);
-		white-space: nowrap;
-	}
-	.empty {
-		padding: 0.75rem 1rem;
-		color: var(--muted);
-		font-size: 0.85rem;
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+The dialog is rendered by [+page.svelte](/docs/src/routes/+page.svelte) whenever
+`app.showCellTypeMenu` is set, which happens in one place: the `/` handler in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts), and only when the cell is empty —
+an existing code cell reopens in its own language, and an existing value opens
+the plain editor instead. That handler presets `editorMode` to `PYTHON` before
+the menu appears, so dismissing with Escape leaves the store in a coherent state
+rather than an unset one.
+
+Choosing an option hands off to
+[CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte), which reads
+`editorMode` and `editorCell` to decide what it is editing and which runtime
+will evaluate it.
