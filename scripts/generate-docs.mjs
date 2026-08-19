@@ -150,9 +150,12 @@ ${fence}
   return existed ? 'updated' : 'created';
 }
 
-/** Delete generated pages whose source file no longer exists. */
+/** Delete generated pages whose source file no longer exists, and report
+ * hand-written ones — those are never deleted automatically, since the prose
+ * may be worth moving rather than losing. */
 function pruneStale(validOutputs) {
   let pruned = 0;
+  const orphans = [];
   const mdxFiles = [];
   (function collect(dir) {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -163,12 +166,15 @@ function pruneStale(validOutputs) {
   })(CONTENT);
   for (const mdxPath of mdxFiles) {
     if (validOutputs.has(mdxPath)) continue;
-    if (/^generated:\s*true$/m.test(readFrontmatter(mdxPath))) {
+    const fm = readFrontmatter(mdxPath);
+    if (/^generated:\s*true$/m.test(fm)) {
       fs.rmSync(mdxPath);
       pruned++;
+    } else if (/^source:/m.test(fm)) {
+      orphans.push(path.relative(CONTENT, mdxPath));
     }
   }
-  return pruned;
+  return { pruned, orphans };
 }
 
 /** Rewrite meta.json in every content folder: subfolders first, then pages. */
@@ -191,8 +197,12 @@ function writeMeta(dir, isRoot) {
   const meta = { title: path.basename(dir), pages: [...folders, ...pages] };
   if (isRoot) {
     // fixed order for the hand-written pages, then the mirrored tree
-    const rest = meta.pages.filter((p) => !['architecture', 'src', 'quadratic-core', 'scripts'].includes(p));
-    meta.pages = ['index', 'architecture', 'src', 'quadratic-core', 'scripts', ...rest.filter((p) => p !== 'index')];
+    // `index` is never collected above (it is the folder's own page) but must
+    // still lead the sidebar; the others appear only if their file exists.
+    const fixed = ['index', 'architecture', 'findings', 'src', 'quadratic-core', 'scripts'];
+    const rest = meta.pages.filter((p) => !fixed.includes(p));
+    const lead = fixed.filter((p) => p === 'index' || meta.pages.includes(p));
+    meta.pages = [...lead, ...rest];
     delete meta.title;
   }
   if (path.basename(dir) === 'src' && path.dirname(dir) === CONTENT) meta.defaultOpen = true;
@@ -208,8 +218,15 @@ for (const includeDir of INCLUDE_DIRS) {
     counts[generatePage(relPath)]++;
   }
 }
-const pruned = pruneStale(validOutputs);
+const { pruned, orphans } = pruneStale(validOutputs);
 writeMeta(CONTENT, true);
 console.log(
   `docs: ${counts.created} created, ${counts.updated} regenerated, ${counts.kept} hand-written kept, ${pruned} stale pruned`,
 );
+if (orphans.length > 0) {
+  console.log(
+    `\n${orphans.length} hand-written page(s) document a source file that no longer exists.\n` +
+      'They were kept — move or delete them by hand:',
+  );
+  for (const o of orphans.sort()) console.log(`  ${o}`);
+}

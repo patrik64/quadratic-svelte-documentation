@@ -1,0 +1,142 @@
+---
+title: Findings
+description: Discrepancies, dead code and test gaps noticed while documenting the codebase
+---
+
+Writing a walkthrough for every file meant reading all of it, and reading all
+of it turned up things worth recording. Each entry links to the page that
+explains it in context.
+
+Nothing here is a judgement about the code overall — most of these are the
+ordinary residue of a port, and several are deliberate. They are grouped by how
+confident the reading is.
+
+## Behavior that contradicts its own documentation
+
+These are the ones most likely to be real defects, because the code and the
+comment beside it disagree.
+
+- **`OR` returns `TRUE` for every input.** The fold is seeded with `true`
+  rather than `false`, so `flat_iter_bools(...).fold(true, |a, b| a | b)` can
+  never produce `FALSE` — including the empty case, which its own doc string
+  says returns `FALSE`. `AND` and `XOR` beside it seed correctly. See
+  [logic.rs](/docs/quadratic-core/src/formulas/functions/logic.rs).
+
+- **`ASIN`'s documented range is wrong.** The inverse arm of the
+  trigonometry macro declares `0 to π` for `ASIN`, while `f64::asin` — and the
+  file's own test table — give `-π/2` to `π/2`. See
+  [trigonometry.rs](/docs/quadratic-core/src/formulas/functions/trigonometry.rs).
+
+- **The theme comment describes behavior that does not exist.** The header of
+  [app.css](/docs/src/app.css) says the theme defaults to
+  `prefers-color-scheme`, but
+  [state.svelte.ts](/docs/src/lib/state.svelte.ts) reads only the stored value
+  and falls back to `'light'`. There is no media query anywhere.
+
+- **Palette entries that may not render.** `TEXT_COLORS` and `FILL_COLORS` in
+  [TopBar.svelte](/docs/src/lib/components/TopBar.svelte) contain CSS custom
+  property references such as `var(--error)`. Those strings are stored verbatim
+  on the cell format, and
+  [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) passes them straight to
+  PixiJS, which resolves no custom properties. Worth confirming in the running
+  app before treating as a defect.
+
+## Deliberate, but surprising
+
+Each of these is explained by a comment in the source, so they are recorded
+here as behavior to know rather than as problems.
+
+- **`VLOOKUP` and `HLOOKUP` accept `is_sorted` and ignore it.** The argument is
+  read into `_is_sorted` with the comment "accepted for compatibility; exact
+  match is used" — so there is no binary search and no approximate mode on
+  those two. See
+  [lookup.rs](/docs/quadratic-core/src/formulas/functions/lookup.rs).
+
+- **`⌘S` saves nothing.** The handler swallows the key with the comment
+  "swallow browser save", suppressing the browser's dialog without triggering
+  the app's own download, which is only reachable from the File menu. See
+  [keyboard.ts](/docs/src/lib/grid/keyboard.ts).
+
+## Inconsistencies and unreachable code
+
+- **`⌘Y` does not redo on macOS.** The redo branch tests `e.ctrlKey`
+  specifically rather than the platform modifier used elsewhere in the same
+  file — [keyboard.ts](/docs/src/lib/grid/keyboard.ts).
+
+- **An Escape test with no effect.** In `keyboardViewport` both remaining paths
+  of the Escape branch return `false`, so its
+  `anyModalOpen() || app.showCodeEditor` condition changes nothing —
+  [keyboard.ts](/docs/src/lib/grid/keyboard.ts).
+
+- **`ATAN2` is inserted at the wrong index.** `index_of_atan` is `5` while
+  `ATAN` actually sits at 7 once `DEGREES` and `RADIANS` occupy the first two
+  slots. Harmless, since the registry keys by name, but it affects the order
+  functions appear in the reference —
+  [trigonometry.rs](/docs/quadratic-core/src/formulas/functions/trigonometry.rs).
+
+- **A macro arm that would not compile.** One `jsexpr!` arm is missing its
+  terminating semicolon; it survives because macro bodies are only checked on
+  expansion and no call site reaches that arm —
+  [util.rs](/docs/quadratic-core/src/util.rs).
+
+- **`EndOfFile` has inverted logic and no users.** Its `prefix_matches` returns
+  true at end of input while `consume_match` errors there; nothing in the crate
+  references it, and the real EOF check is `Parser::ok_if_not_eof` —
+  [combinators.rs](/docs/quadratic-core/src/formulas/parser/rules/combinators.rs).
+
+- **`CellRefCoord` cannot round-trip a negative absolute.** `Display` writes
+  `n3` while `from_str` delegates to `i64::from_str`, which expects `-3` —
+  [cell_ref.rs](/docs/quadratic-core/src/formulas/cell_ref.rs).
+
+- **The sheet tab bar diverges from the command palette.** The `＋` button in
+  [SheetBar.svelte](/docs/src/lib/components/SheetBar.svelte) inlines its own
+  add logic, and its menu calls the controller directly — so unlike the
+  palette's equivalents, those paths do not clear `app.multiCursor`.
+
+- **Exports with no callers:** `close()` on
+  [DropdownMenu.svelte](/docs/src/lib/components/DropdownMenu.svelte),
+  `wrappedTextStyle` in
+  [measureText.ts](/docs/src/lib/grid/pixi/measureText.ts),
+  `array_mapped_get_cell` in [ctx.rs](/docs/quadratic-core/src/formulas/ctx.rs),
+  `provideHover` in [lsp/mod.rs](/docs/quadratic-core/src/formulas/lsp/mod.rs),
+  and `isoOf` in
+  [generate-examples.mjs](/docs/scripts/generate-examples.mjs).
+
+- **Schema fields nothing reads.** `dependent_cells` is only ever deleted, and
+  `order` is written on export but never consulted on import, which
+  reconstructs sheets in array order. Both are carried for `.grid`
+  compatibility — [types.ts](/docs/src/lib/core/types.ts).
+
+## Formatting asymmetries
+
+- **Percentages do not align.** `NUMBER` and `CURRENCY` pass `decimalPlaces` as
+  both the minimum and maximum fraction digits, giving a fixed width, while
+  `PERCENTAGE` fixes the minimum at `0` and uses the setting only as a ceiling
+  — so a column can show `25%` beside `33.3%`. See
+  [cellTextFormatter.ts](/docs/src/lib/core/cellTextFormatter.ts).
+
+- **Shortcut glyphs are only half platform-aware.** The command palette builds
+  hints from the adaptive `Cmd` symbol but writes `⇧`, `⌥` and the arrows
+  literally, so a Windows user sees `Ctrl+⇧Z` —
+  [CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte).
+
+## Test gaps
+
+- **The circular-reference guard is untested.** `MAX_UPDATES_PER_CELL` is the
+  only thing preventing a cyclic dependency from looping forever, and no test
+  anywhere exercises it —
+  [updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts).
+
+- **`May` is never tested in fill series.** It is the one string appearing in
+  both the long and short month tables, so it is exactly where an ambiguity
+  would surface — [series.test.ts](/docs/src/lib/core/series.test.ts).
+
+- **Spill coverage is one-dimensional.** The spill suite exercises only 1-D
+  arrays through JavaScript cells; 2-D spills, formula and Python cells, and
+  cross-sheet propagation have no test —
+  [updateCellAndDCells.spill.test.ts](/docs/src/lib/core/updateCellAndDCells.spill.test.ts).
+
+- **`valueLiteral`'s quote fallbacks are unreachable from the fixtures.** A
+  value containing a double quote, or containing both quote characters, is
+  never constructed —
+  [sheetRefs.test.ts](/docs/src/lib/formulas/sheetRefs.test.ts).

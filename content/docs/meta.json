@@ -2,6 +2,7 @@
   "pages": [
     "index",
     "architecture",
+    "findings",
     "src",
     "quadratic-core",
     "scripts"
