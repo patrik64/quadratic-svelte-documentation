@@ -1,32 +1,68 @@
 ---
 title: "GoTo.svelte"
-description: "The GoTo Svelte component."
+description: "Jump to a cell or range — an input where every possible string is valid, previewed live instead of validated"
 source: "src/lib/components/GoTo.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Ninety-nine lines, and the whole design rests on one decision: **there is no
+invalid input**. Whatever you type maps to some pair of coordinates, so the
+dialog never shows an error, never disables its button, and never has to explain
+a format.
 
-````svelte GoTo.svelte -n
+Instead of validating, it previews. The button always reads back exactly where
+Enter will take you, which teaches the syntax by demonstration — type another
+number and watch the target change.
+
+<Scrollycoding>
+
+## !!steps Pulling numbers out of anything
+
+The parse is a single global regex for signed integers, applied to the raw
+input. Everything that is not part of a number — commas, spaces, parentheses,
+stray words — is simply not matched, so `0, 0`, `0 0` and `go to 0 0` are all
+the same input.
+
+The comment names the original this follows, Quadratic's
+`getCoordinatesFromUserInput`. Note what it does *not* accept: this is a
+coordinate box, not an A1 box. Typing `B7` matches only the `7`, giving column
+7 — the A1 helpers in [a1.ts](/docs/src/lib/core/a1.ts) are not consulted here.
+
+With no numbers at all, the answer is the origin, which is what makes an empty
+field a meaningful state rather than a blocked one.
+
+```svelte ! GoTo.svelte
 <script lang="ts">
-	import { app, gotoCell } from '../state.svelte';
-	import Modal from './Modal.svelte';
-
-	let value = $state('');
-	let inputEl: HTMLInputElement | undefined = $state();
-
-	$effect(() => {
-		inputEl?.focus();
-	});
-
 	// any string maps to valid coordinates (Quadratic's getCoordinatesFromUserInput)
 	const coords = $derived.by(() => {
+		// !mark
 		const matches = value.match(/-?\d+/g)?.map(Number) ?? [];
+		// !mark(1:2)
 		if (matches.length === 0) return [{ x: 0, y: 0 }];
 		if (matches.length === 1) return [{ x: matches[0], y: 0 }];
 		if (matches.length === 2) return [{ x: matches[0], y: matches[1] }];
+	});
+</script>
+```
+
+## !!steps Three numbers describe a row
+
+The three-number case is the one that repays a second look. Given `x0`, `y0`
+and one more value, it builds two corners that **share the same `y`** — the
+third number becomes a second x.
+
+So `2, 3, 8` selects the horizontal strip from column 2 to column 8 along row 3.
+It is a shorthand for the common case of selecting part of a row, reached by
+typing one number fewer than a full range needs.
+
+Four or more numbers form the general case, two complete corners, with any
+extras beyond the fourth ignored. The equality check collapses a degenerate
+range — the same cell twice — back to a single cell, so `1, 1, 1, 1` selects one
+cell rather than a one-cell "range" that would light up as a selection.
+
+```svelte ! GoTo.svelte
+<script lang="ts">
+		// !mark(1:5)
 		if (matches.length === 3)
 			return [
 				{ x: matches[0], y: matches[1] },
@@ -36,33 +72,53 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			{ x: matches[0], y: matches[1] },
 			{ x: matches[2], y: matches[3] }
 		];
+		// !mark
 		return pair[0].x === pair[1].x && pair[0].y === pair[1].y ? [pair[0]] : pair;
 	});
+</script>
+```
 
-	function close(): void {
-		app.showGoToMenu = false;
-	}
+## !!steps Submitting whatever the preview showed
 
+Because `coords` already holds the answer, submitting is just destructuring:
+one corner means a cell, two mean a range.
+
+`gotoCell` in [state.svelte.ts](/docs/src/lib/state.svelte.ts) does the rest —
+it moves the cursor, builds the multi-cursor selection with its corners
+normalized by `Math.min`/`Math.max`, and scrolls the result into view. That
+normalization is why this component can pass its two corners in whatever order
+the user typed them: `5, 5, 0, 0` selects the same block as `0, 0, 5, 5`.
+
+Passing no range explicitly clears any existing selection, so jumping to a
+single cell also collapses whatever was selected before.
+
+```svelte ! GoTo.svelte
+<script lang="ts">
 	function submit(): void {
 		const [first, second] = coords;
+		// !mark(1:2)
 		if (second) gotoCell(first.x, first.y, { x1: second.x, y1: second.y });
 		else gotoCell(first.x, first.y);
 		close();
 	}
-
-	function onKeyDown(e: KeyboardEvent): void {
-		e.stopPropagation();
-		if (e.key === 'Escape') close();
-		else if (e.key === 'Enter') {
-			e.preventDefault();
-			submit();
-		}
-	}
 </script>
+```
 
-<Modal onclose={close}>
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div onkeydown={onKeyDown}>
+## !!steps The preview that replaces validation
+
+The button is the whole user interface for understanding the format. It restates
+the parsed coordinates in full, switching wording between cell and range, so the
+consequence of Enter is visible before pressing it.
+
+That is what lets the component skip an error state entirely: there is nothing
+to warn about when the outcome is always shown. A user who types nonsense sees
+`Go to cell: (0, 0)` and immediately understands the field wants numbers — no
+message required.
+
+The placeholder does the same job for an empty field, demonstrating both forms
+rather than describing them.
+
+```svelte ! GoTo.svelte
 		<input
 			bind:this={inputEl}
 			bind:value
@@ -78,19 +134,27 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			{/if}
 			<span class="arrow">→</span>
 		</button>
-	</div>
-</Modal>
+```
 
+## !!steps A button styled as the primary action
+
+The row is given the accent-tinted background rather than the transparent
+treatment used for list items in
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) — there
+is only one thing to click here, so it reads as a confirmation bar rather than
+an option among many.
+
+`space-between` pushes the arrow to the right edge, and the muted arrow acts as
+a direction cue without competing with the coordinates. The input above it
+carries the same borderless, full-width styling every search field in the app
+uses, keeping the dialogs visually consistent.
+
+The placeholder's negative example, `0, 0, -5, -5`, quietly advertises something
+the app supports and most spreadsheets do not: coordinates extend in all four
+directions from the origin.
+
+```svelte ! GoTo.svelte
 <style>
-	.search {
-		width: 100%;
-		border: none;
-		outline: none;
-		padding: 0.9rem 1rem;
-		font-size: 0.95rem;
-		border-bottom: 1px solid var(--border-light);
-		box-sizing: border-box;
-	}
 	.row {
 		display: flex;
 		align-items: center;
@@ -108,4 +172,17 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		color: var(--muted);
 	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Opened from `⌘G`, from the command palette, and from the cursor and selection
+readouts in [BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) —
+which is a nice pairing, since those readouts display coordinates in exactly the
+format this dialog parses.
+
+It renders inside [Modal.svelte](/docs/src/lib/components/Modal.svelte), and its
+keydown handler follows the same convention as the other dialogs: stop
+propagation so the grid's global handler in
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts) does not act on typing, Escape to
+dismiss, Enter to commit.
