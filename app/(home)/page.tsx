@@ -20,7 +20,7 @@ export default function HomePage() {
   return (
     <main className="flex flex-1 flex-col items-center justify-center px-6 py-16 text-center">
       <h1 className="mb-4 max-w-2xl text-4xl font-bold tracking-tight">
-        The quadratic-svelte codebase, explained file by file
+        The quadratic-svelte codebase documentation
       </h1>
       <p className="mb-8 max-w-xl text-fd-muted-foreground">
         Annotated source documentation for{' '}
