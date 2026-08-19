@@ -104,7 +104,6 @@ whole scene graph.
 <div class="app">
 	<div class="main">
 		<GridCanvas />
-		// !mark
 		{#if app.showCodeEditor}<CodeEditor />{/if}
 	</div>
 </div>
@@ -120,7 +119,6 @@ user how to get back out.
 <div class="app">
 	{#if !app.presentationMode}<SheetBar />{/if}
 	{#if !app.presentationMode}<BottomBar />{/if}
-	// !mark(1:3)
 	{#if app.presentationMode}
 		<div class="presentation-hint">Press Esc to exit presentation mode</div>
 	{/if}

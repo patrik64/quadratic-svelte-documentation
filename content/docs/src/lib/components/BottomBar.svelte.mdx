@@ -1,15 +1,36 @@
 ---
 title: "BottomBar.svelte"
-description: "The BottomBar Svelte component."
+description: "The status bar — cursor position, a Sum/Avg/Count summary over the selection, autosave errors and Python status"
 source: "src/lib/components/BottomBar.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The thin strip along the bottom of the window. It shows where the cursor is,
+summarizes whatever is selected, and surfaces two pieces of background state
+the user would otherwise have no way to see: whether autosave is failing and
+whether the Python runtime has finished loading.
 
-````svelte BottomBar.svelte -n
+It is a read-only view with one exception — the position readouts are buttons
+that open the go-to dialog.
+
+<Scrollycoding>
+
+## !!steps Subscribing to a non-reactive model
+
+The odd-looking `void app.redraw;` is the most important line in the file. The
+spreadsheet model — [Sheet.ts](/docs/src/lib/core/Sheet.ts) and the maps inside
+it — is a plain class, deliberately not wrapped in Svelte's reactive proxies,
+because making every cell reactive would be ruinous on a sheet with thousands
+of entries.
+
+That leaves derived values with nothing to depend on. So
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) keeps a `redraw` counter that
+is bumped after any non-reactive mutation, and reading it here registers a
+dependency. The `void` operator makes the intent explicit: the value is never
+used, the *read* is the whole point. Without that line the summary would
+silently freeze after the first calculation.
+
+```svelte ! BottomBar.svelte
 <script lang="ts">
 	import { pythonStatus } from '../python/pythonRunner';
 	import { app, sheetController } from '../state.svelte';
@@ -18,10 +39,29 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 
 	// Sum / Avg / Count over the selection, like the modern SheetBar summary
 	const summary = $derived.by(() => {
+		// !mark
 		void app.redraw;
 		if (!app.multiCursor) return undefined;
 		const o = app.multiCursor.originPosition;
 		const t = app.multiCursor.terminalPosition;
+</script>
+```
+
+## !!steps Summarizing the selection
+
+The selection rectangle is normalized with `Math.min` and `Math.max` before
+querying, so dragging up-and-left works the same as down-and-right.
+
+Two filters shape the result. Empty cells are dropped, and the whole summary is
+suppressed unless at least **two** non-empty cells remain — a single selected
+cell already shows its value on the grid, so summarizing it would be noise.
+Then the numeric subset is taken separately: `count` reports every non-empty
+cell, while `sum` and `avg` describe only those that parse as numbers, and both
+are left `undefined` when the selection is entirely text. That is why a
+selection of labels shows a count and nothing else.
+
+```svelte ! BottomBar.svelte
+<script lang="ts">
 		const cells = sheetController.sheet.getCellsInRect({
 			left: Math.min(o.x, t.x),
 			top: Math.min(o.y, t.y),
@@ -29,16 +69,34 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			bottom: Math.max(o.y, t.y)
 		});
 		const nonEmpty = cells.filter((c) => c.value !== '');
+		// !mark
 		if (nonEmpty.length < 2) return undefined;
 		const numbers = nonEmpty.map((c) => Number(c.value)).filter((n) => !Number.isNaN(n));
 		const fmt = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 2 });
 		const sum = numbers.reduce((a, b) => a + b, 0);
 		return {
+			// !mark(1:2)
 			sum: numbers.length > 0 ? fmt(sum) : undefined,
 			avg: numbers.length > 0 ? fmt(sum / numbers.length) : undefined,
 			count: nonEmpty.length
 		};
 	});
+</script>
+```
+
+## !!steps When the cursor cell was last touched
+
+`cursorCell` reads the cell under the cursor, using the same `app.redraw`
+subscription so it refreshes after an edit.
+
+`timeAgo` renders its `last_modified` stamp as a coarse relative time,
+descending through seconds, minutes, hours and days and stopping there — no
+weeks or months. Each branch handles its own pluralization with a ternary on
+the count. Note it is computed once when the component renders rather than on a
+timer, so the label ages only when something else re-renders the bar.
+
+```svelte ! BottomBar.svelte
+<script lang="ts">
 	const cursorCell = $derived.by(() => {
 		void app.redraw;
 		return sheetController.sheet.getCell(app.cursorPosition.x, app.cursorPosition.y);
@@ -48,6 +106,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
 		if (seconds < 60) return 'less than a minute ago';
 		const minutes = Math.floor(seconds / 60);
+		// !mark
 		if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
 		const hours = Math.floor(minutes / 60);
 		if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
@@ -55,7 +114,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		return `${days} day${days === 1 ? '' : 's'} ago`;
 	}
 </script>
+```
 
+## !!steps Positions that are also shortcuts
+
+The left group reads out the cursor and, when a range is selected, its two
+corners. Both are `button` elements rather than text: clicking either opens the
+go-to dialog ([GoTo.svelte](/docs/src/lib/components/GoTo.svelte)), turning the
+readout into the control for changing it. The `link` class later strips the
+button chrome so they still look like status text.
+
+The bar also swallows right-clicks with `preventDefault`, so the browser menu
+never appears over it. The modification line is prefixed with a hard-coded
+"You" — a single-user stand-in where the original client would name a
+collaborator.
+
+```svelte ! BottomBar.svelte
 <div class="bottombar" oncontextmenu={(e) => e.preventDefault()}>
 	<div class="left">
 		<button class="stat link" onclick={() => (app.showGoToMenu = true)}>
@@ -71,6 +145,26 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			<span class="stat">You, {timeAgo(cursorCell.last_modified)}</span>
 		{/if}
 	</div>
+</div>
+```
+
+## !!steps Background state made visible
+
+The right group is where the bar earns its keep. The summary renders `Sum` and
+`Avg` only when they exist, with `Count` always present — the inline `{#if}`
+inside the text is what produces "Count: 4" alone for a text selection.
+
+Below it are the two pieces of invisible state. An autosave failure is not
+something the user can otherwise notice, so it appears here in the error color
+with the actual message in a `title` tooltip and, more usefully, an instruction
+for rescuing the work. The Python status covers all three states from the store
+in [pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts) — loading, ready
+with a version number, or failed — because Pyodide takes seconds to download
+and a Python cell that appears to do nothing is otherwise indistinguishable
+from a broken one. The `$` prefix is Svelte's store subscription, since
+`pythonStatus` is a classic writable store rather than a rune.
+
+```svelte ! BottomBar.svelte
 	<div class="right">
 		{#if summary}
 			<span class="stat summary">
@@ -91,8 +185,21 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		{/if}
 		<span class="stat">quadratic is svelte</span>
 	</div>
-</div>
+```
 
+## !!steps Styling a status strip
+
+A fixed `1.5rem` row split by `space-between`, drawn from the same CSS custom
+properties as the rest of the shell ([app.css](/docs/src/app.css)) so it follows
+the theme. `user-select: none` keeps a drag across the grid from accidentally
+selecting the status text, and `white-space: nowrap` on every stat stops the
+readouts from wrapping as the window narrows.
+
+The detail worth copying is `font-variant-numeric: tabular-nums` on the
+summary: it forces fixed-width digits so the sum does not jitter horizontally
+as the numbers change while dragging a selection.
+
+```svelte ! BottomBar.svelte
 <style>
 	.bottombar {
 		display: flex;
@@ -107,39 +214,23 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		user-select: none;
 		backdrop-filter: blur(1px);
 	}
-	.left,
-	.right {
-		display: flex;
-		align-items: center;
-		gap: 1rem;
-	}
 	.stat {
 		white-space: nowrap;
-	}
-	.stat.error {
-		color: var(--error);
 	}
 	.stat.summary {
 		color: var(--accent);
 		font-variant-numeric: tabular-nums;
 	}
-	button.link {
-		background: none;
-		border: none;
-		font: inherit;
-		color: inherit;
-		cursor: pointer;
-		padding: 0;
-	}
-	button.link:hover {
-		text-decoration: underline;
-	}
-	.beta {
-		background: #8ecb89;
-		color: white;
-		padding: 2px 5px;
-		border-radius: 2px;
-		font-size: 0.65rem;
-	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+The bar is mounted by [+page.svelte](/docs/src/routes/+page.svelte), which hides
+it along with the other chrome in presentation mode. Its counterpart above the
+grid is [TopBar.svelte](/docs/src/lib/components/TopBar.svelte), and the sheet
+tabs sit between them in
+[SheetBar.svelte](/docs/src/lib/components/SheetBar.svelte).
+
+One loose end: the `.beta` rule at the end of the stylesheet has no matching
+element — nothing in the markup carries that class.
