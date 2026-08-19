@@ -1,28 +1,39 @@
 ---
 title: "sheetRefs.test.ts"
-description: "Unit tests for sheetRefs.ts."
+description: "Vitest coverage for cross-sheet references — detection against real sheets, literal inlining, and mask round-trips"
 source: "src/lib/formulas/sheetRefs.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Three suites, one per export of
+[sheetRefs.ts](/docs/src/lib/formulas/sheetRefs.ts). What makes them readable is
+that they use a **real `Sheet`** rather than a mocked resolver — the module's
+contract is about producing formula source, so the tests assert on exact output
+strings.
 
-````ts sheetRefs.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { Sheet } from '../core/Sheet';
-import type { Cell } from '../core/types';
-import { findSheetRefs, maskSheetRefs, substituteSheetRefs } from './sheetRefs';
+<Scrollycoding>
 
-function textCell(x: number, y: number, value: string): Cell {
-	return { x, y, type: 'TEXT', value, last_modified: '' };
-}
+## !!steps Both name spellings, and normalized corners
 
+The first test covers the two ways a sheet can be named at once: a bare
+identifier and a quoted name containing a space, asserting both are found in a
+single expression.
+
+The second pins the corner normalization. `Data!B2:A0` is written
+bottom-right-first, and the expectation states the rectangle in
+minimum-to-maximum order — so a user dragging a range backwards produces the
+same result as dragging it forwards.
+
+`toMatchObject` is used rather than `toEqual` throughout, letting each
+assertion name only the fields it cares about instead of restating the whole
+`SheetRef`.
+
+```ts ! sheetRefs.test.ts
 describe('findSheetRefs', () => {
 	it('finds plain and quoted sheet names', () => {
 		const refs = findSheetRefs("Sheet2!A0 + 'My Sheet'!B1");
 		expect(refs).toHaveLength(2);
+		// !mark(1:2)
 		expect(refs[0]).toMatchObject({ sheetName: 'Sheet2', x0: 0, y0: 0, x1: 0, y1: 0 });
 		expect(refs[1]).toMatchObject({ sheetName: 'My Sheet', x0: 1, y0: 1 });
 	});
@@ -31,10 +42,28 @@ describe('findSheetRefs', () => {
 		const [ref] = findSheetRefs('SUM(Data!B2:A0)');
 		expect(ref).toMatchObject({ sheetName: 'Data', x0: 0, y0: 0, x1: 1, y1: 2 });
 	});
+```
 
+## !!steps Text that only looks like a reference
+
+The string-literal test is the one guarding the subtle comparison in
+`inString`. Its second case is the sharper of the two: `Sheet9!A0` sits inside
+quotes as an argument, `Sheet2!B3` does not, and only the latter may be found.
+
+A test asserting merely that *something* was skipped would pass even if the
+scanner were too aggressive; requiring exactly one result, and naming which,
+catches a rule that suppresses too much as well as one that suppresses too
+little.
+
+The `$`-pinned case confirms the pattern tolerates absolute markers and that
+they are stripped before parsing — `$A$1` resolves to the same coordinates as
+`A1`.
+
+```ts ! sheetRefs.test.ts
 	it('ignores refs inside string literals', () => {
 		expect(findSheetRefs('"Sheet2!A0"')).toHaveLength(0);
 		const refs = findSheetRefs('CONCAT("Sheet9!A0", Sheet2!B3)');
+		// !mark(1:2)
 		expect(refs).toHaveLength(1);
 		expect(refs[0].sheetName).toBe('Sheet2');
 	});
@@ -44,30 +73,48 @@ describe('findSheetRefs', () => {
 		expect(ref).toMatchObject({ x0: 0, y0: 1 });
 	});
 });
+```
 
-describe('substituteSheetRefs', () => {
-	function makeSheet(name: string): Sheet {
-		const sheet = new Sheet();
-		sheet.name = name;
-		sheet.setCell(textCell(0, 0, '42'));
-		sheet.setCell(textCell(1, 0, 'label'));
-		sheet.setCell(textCell(0, 1, 'true'));
-		return sheet;
-	}
+## !!steps Every literal form, in one test
 
+The fixture sheet is built with three cells chosen to exercise each branch of
+`valueLiteral`, and the assertions then read as a specification of the
+conversion: a numeric cell inlines bare so arithmetic still works, text gains
+quotes, `'true'` is upcased to the `TRUE` the engine recognizes, and a cell
+that was never set becomes `""` rather than disappearing.
+
+That last case matters because dropping an empty cell would leave a syntax hole
+in the formula.
+
+```ts ! sheetRefs.test.ts
 	it('inlines single cells as literals', () => {
 		const sheet = makeSheet('Data');
 		const resolve = (n: string) => (n === 'Data' ? sheet : undefined);
+		// !mark(1:4)
 		expect(substituteSheetRefs('Data!A0 * 2', resolve).code).toBe('42 * 2');
 		expect(substituteSheetRefs('Data!B0', resolve).code).toBe('"label"');
 		expect(substituteSheetRefs('Data!A1', resolve).code).toBe('TRUE');
 		expect(substituteSheetRefs('Data!C5', resolve).code).toBe('""');
 	});
+```
 
+## !!steps Ranges, and the deliberate non-substitution
+
+The range test is the most informative line in the file: `SUM(Data!A0:B1)`
+becomes `SUM({42, "label"; TRUE, ""})`, showing the array-literal syntax
+complete with comma-separated columns, a semicolon between rows, and the empty
+fourth cell holding its place so the block stays rectangular.
+
+The last test asserts that an unknown sheet name comes back **unchanged** —
+encoding the decision to let the engine report the error against the original
+text, rather than substituting a placeholder or throwing here.
+
+```ts ! sheetRefs.test.ts
 	it('inlines ranges as array literals', () => {
 		const sheet = makeSheet('Data');
 		const resolve = (n: string) => (n === 'Data' ? sheet : undefined);
 		expect(substituteSheetRefs('SUM(Data!A0:B1)', resolve).code).toBe(
+			// !mark
 			'SUM({42, "label"; TRUE, ""})'
 		);
 	});
@@ -77,19 +124,47 @@ describe('substituteSheetRefs', () => {
 		expect(code).toBe('Nope!A0 + 1');
 	});
 });
+```
 
+## !!steps Masking, then surviving an edit
+
+The first masking test checks both directions: placeholders appear in index
+order and numbered from zero, and unmasking the untouched string reproduces the
+original exactly.
+
+The second is the one that actually models the use case. Masking exists so the
+Rust adjust and relocate passes can rewrite a formula without touching
+cross-sheet references, so this test *simulates* such a pass by editing the
+masked text — changing `A0` to `A5` — and then unmasking. The reference emerges
+verbatim while the ordinary reference beside it keeps its edit, which is
+precisely the guarantee
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts) depends on.
+
+```ts ! sheetRefs.test.ts
 describe('maskSheetRefs', () => {
 	it('masks refs as placeholders and unmasks them verbatim', () => {
 		const source = "Sheet2!A0 + 'My Sheet'!B1:C2 + 1";
 		const { masked, unmask } = maskSheetRefs(source);
+		// !mark
 		expect(masked).toBe('"__XREF0__" + "__XREF1__" + 1');
 		expect(unmask(masked)).toBe(source);
 	});
 
 	it('survives text edits around the placeholders', () => {
 		const { masked, unmask } = maskSheetRefs('A0 + Sheet2!B1');
+		// !mark(1:2)
 		const adjusted = masked.replace('A0', 'A5');
 		expect(unmask(adjusted)).toBe('A5 + Sheet2!B1');
 	});
 });
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. Because the substitution suite constructs a real
+[Sheet](/docs/src/lib/core/Sheet.ts), these tests also exercise `getCell`
+against genuinely absent cells rather than a stub that always answers.
+
+Not covered here: `valueLiteral`'s quote-selection fallbacks — a value
+containing a double quote, or containing both quote characters — are reachable
+only through cell values none of these fixtures use.

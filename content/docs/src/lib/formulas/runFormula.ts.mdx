@@ -1,58 +1,64 @@
 ---
 title: "runFormula.ts"
-description: "Glue to the Rust/WASM formula engine (quadratic-core), port of the original's src/grid/computations/formulas/runFormula.ts."
+description: "The bridge to the Rust/WASM formula engine — one-time init, cached docs and completions, and the grid accessor it calls back into"
 source: "src/lib/formulas/runFormula.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Everything the TypeScript side knows about formulas passes through this file.
+It loads the WebAssembly build of
+[quadratic-core](/docs/quadratic-core/src/lib.rs), wraps its six exported
+functions, and — for evaluation — hands the engine a callback so it can read the
+sheet while it computes.
 
-````ts runFormula.ts -n
-// Glue to the Rust/WASM formula engine (quadratic-core), port of the
-// original's src/grid/computations/formulas/runFormula.ts.
+The engine is sheet-unaware by design, which shapes two of the wrappers here:
+they mask cross-sheet references before delegating, a job handled by
+[sheetRefs.ts](/docs/src/lib/formulas/sheetRefs.ts).
 
-import init, {
-	adjust_formula,
-	relocate_formula,
-	eval_formula,
-	formula_docs,
-	provideCompletionItems,
-	hello
-} from '../../../quadratic-core/pkg/quadratic_core.js';
-import wasmUrl from '../../../quadratic-core/pkg/quadratic_core_bg.wasm?url';
+<Scrollycoding>
 
-export interface FormulaDoc {
-	category: string;
-	name: string;
-	usages: string[];
-	examples: string[];
-	doc: string;
-}
+## !!steps Loading the wasm exactly once
 
-export interface RunFormulaResult {
-	cells_accessed: [number, number][];
-	success: boolean;
-	error_span: [number, number] | null;
-	error_msg: string | null;
-	output_value: string | null;
-	array_output: string[][] | null;
-}
+`initPromise` memoizes initialization, so however many cells recalculate at
+once, the module is fetched and instantiated a single time — every later caller
+awaits the same promise.
 
+The comment explains the explicit `module_or_path`. Left to its default,
+wasm-bindgen guesses a URL relative to the JS file, which does not survive
+Vite's dev server or its build hashing. Importing the binary with `?url` gives
+Vite an asset it tracks and rewrites, and passing that through makes the path
+correct in both modes. The trailing `hello()` is the core's own smoke call,
+confirming the module really did instantiate.
+
+```ts ! runFormula.ts
 let initPromise: Promise<void> | undefined;
 
 export function loadFormulaCore(): Promise<void> {
 	if (!initPromise) {
 		// explicit asset URL so Vite serves/bundles the wasm in dev and build
+		// !mark
 		initPromise = init({ module_or_path: wasmUrl }).then(() => hello());
 	}
 	return initPromise;
 }
+```
 
-/** Rewrites A1 refs in a formula after a row/column shift (Rust core).
- * Sheet-qualified refs are masked first — they point at another sheet, so
- * this sheet's shifts must not rewrite them. */
+## !!steps Masking foreign references before rewriting
+
+`adjustFormula` and `relocateFormula` both delegate the actual A1 rewriting to
+Rust — `adjust_formula` for a row or column insertion, `relocate_formula` for a
+copy, where relative refs follow and `$`-pinned ones do not.
+
+Neither can be handed the raw formula. The engine's `CellRef` has no notion of
+which sheet a reference belongs to, so a shift on *this* sheet would happily
+rewrite the coordinates of a `Sheet2!A1` that should not move at all. Masking
+replaces those references with inert placeholders first and restores them
+afterwards.
+
+The dynamic `import('./sheetRefs')` keeps that module out of the critical path
+for callers that only evaluate.
+
+```ts ! runFormula.ts
 export async function adjustFormula(
 	code: string,
 	cell: { x: number; y: number },
@@ -62,41 +68,30 @@ export async function adjustFormula(
 ): Promise<string> {
 	await loadFormulaCore();
 	const { maskSheetRefs } = await import('./sheetRefs');
+	// !mark(1:2)
 	const { masked, unmask } = maskSheetRefs(code);
 	return unmask(adjust_formula(masked, cell.x, cell.y, axis === 'x', at, delta));
 }
+```
 
-/** Rewrites A1 refs for a copy (fill/paste): relative follow, $ stays.
- * Sheet-qualified refs are masked and kept verbatim (Excel keeps them
- * pointing at the same foreign cells on copy). */
-export async function relocateFormula(
-	code: string,
-	from: { x: number; y: number },
-	to: { x: number; y: number }
-): Promise<string> {
-	await loadFormulaCore();
-	const { maskSheetRefs } = await import('./sheetRefs');
-	const { masked, unmask } = maskSheetRefs(code);
-	return unmask(relocate_formula(masked, from.x, from.y, to.x, to.y));
-}
+## !!steps Borrowing an editor protocol
 
-/** Monaco-shaped completion item from the core's LSP module. */
-export interface FormulaCompletion {
-	label: string;
-	detail?: string;
-	insertText?: string;
-	insertTextRules?: number;
-	documentation?: string | { value: string };
-	kind?: number;
-}
+Completions come from the core's LSP module, which returns items already shaped
+for Monaco — labels, snippet insert text, documentation. The four `undefined`
+arguments stand in for a text model, a position and the rest of the
+`provideCompletionItems` signature; the comment records that the core ignores
+them, since it returns the same full list regardless of context.
 
-let completionsCache: FormulaCompletion[] | undefined;
+The result is cached and sorted once, alphabetically, rather than on every
+keystroke. [CodeEditor.svelte](/docs/src/lib/components/CodeEditor.svelte)
+filters that sorted list by prefix, so the ordering work happens a single time
+per session.
 
-/** Completion items for every formula function, from the Rust core's LSP
- * module (the Monaco text-model arguments are unused by the core). */
+```ts ! runFormula.ts
 export async function getFormulaCompletions(): Promise<FormulaCompletion[]> {
 	if (!completionsCache) {
 		await loadFormulaCore();
+		// !mark
 		const list = provideCompletionItems(undefined, undefined, undefined, undefined) as {
 			suggestions: FormulaCompletion[];
 		};
@@ -115,22 +110,31 @@ export async function getFormulaDocs(): Promise<FormulaDoc[]> {
 	}
 	return docsCache;
 }
+```
 
-export async function runFormula(
-	formula_code: string,
-	pos: { x: number; y: number },
-	getCellValue: (x: number, y: number) => string | undefined
-): Promise<RunFormulaResult> {
-	await loadFormulaCore();
+## !!steps A callback the engine reads the sheet through
 
-	// Same contract as the original's GetCellsDB: an async rect accessor
-	// returning the existing cells with their values. The core awaits it and
-	// reads `[0].value`; an empty array means the cell is empty.
+Evaluation inverts the usual direction: rather than gathering inputs up front,
+the JavaScript side passes a rectangle accessor and the **Rust engine calls
+back into it** as evaluation reaches each reference. That is what lets the core
+stay ignorant of how cells are stored.
+
+The contract is spelled out in the comment and is easy to get subtly wrong.
+Empty cells are *omitted* rather than returned as empty strings, because the
+core reads `[0].value` and treats an empty array as "this cell is empty" — push
+a blank entry and an empty cell would evaluate as an empty string instead.
+
+The accessor is `async` because the original client's version fetched from a
+database; here it resolves immediately, but the signature is preserved so the
+vendored engine needs no change.
+
+```ts ! runFormula.ts
 	const gridAccessor = async (x0: number, y0: number, x1: number, y1: number) => {
 		const cells: { x: number; y: number; value: string }[] = [];
 		for (let y = y0; y <= y1; y++) {
 			for (let x = x0; x <= x1; x++) {
 				const value = getCellValue(x, y);
+				// !mark
 				if (value !== undefined && value !== '') cells.push({ x, y, value });
 			}
 		}
@@ -140,4 +144,13 @@ export async function runFormula(
 	const output = await eval_formula(formula_code, pos.x, pos.y, gridAccessor);
 	return output as RunFormulaResult;
 }
-````
+```
+
+</Scrollycoding>
+
+The result mirrors what
+[lib.rs](/docs/quadratic-core/src/lib.rs) builds on the Rust side, including
+`error_span` — the byte range the editor underlines — and `cells_accessed`,
+which [updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts)
+records as dependency edges. The cached docs are rendered by
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte).

@@ -1,44 +1,59 @@
 ---
 title: "sheetRefs.ts"
-description: "Cross-sheet references (`Sheet2!A1`, `'My Sheet'!A0:B2`) for formulas. The vendored Rust engine's CellRef is Copy and sheet-unaware; rather than refactor the…"
+description: "Cross-sheet references, added in TypeScript by inlining values as literals — because the vendored Rust engine is sheet-unaware"
 source: "src/lib/formulas/sheetRefs.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+`Sheet2!A1` is a feature the formula engine does not have. The vendored Rust
+crate's `CellRef` is `Copy` and carries no sheet identity, so supporting
+cross-sheet references properly would mean threading a sheet through the whole
+evaluator.
 
-````ts sheetRefs.ts -n
-// Cross-sheet references (`Sheet2!A1`, `'My Sheet'!A0:B2`) for formulas.
-//
-// The vendored Rust engine's CellRef is Copy and sheet-unaware; rather than
-// refactor the crate, qualified refs are resolved here at evaluation time:
-// single cells inline as literals and ranges as `{a, b; c, d}` array
-// literals (which the engine parses natively). The formula's stored text is
-// never changed — substitution happens on the way into eval only.
+This file takes the cheaper route: resolve those references **in TypeScript,
+before evaluation**, by replacing each one with the values it points at. A
+single cell becomes a literal, a range becomes an array literal — a syntax the
+engine already parses. The formula's stored text is never modified; the
+substitution exists only on the way into `eval`.
 
-import { parseCellRef } from '../core/a1';
-import type { Sheet } from '../core/Sheet';
+<Scrollycoding>
 
-export interface SheetRef {
-	sheetName: string;
-	start: number; // span in the source, inclusive
-	end: number; // exclusive
-	x0: number;
-	y0: number;
-	x1: number;
-	y1: number;
-}
+## !!steps Two ways to name a sheet
 
+The pattern accepts both spellings: a quoted name, which may contain spaces,
+and a bare identifier. Each is captured in its own group, so the caller can
+take whichever matched.
+
+`CELL` is reused for both ends of a range and deliberately tolerant — it allows
+`$` anywhere it can legally appear and the lowercase `n` prefix that marks
+negative coordinates in this project's A1 dialect, as described in
+[a1.ts](/docs/src/lib/core/a1.ts). Being permissive here is safe because the
+match is validated by an actual parser two steps later.
+
+```ts ! sheetRefs.ts
 const CELL = String.raw`\$?n?[A-Za-z]+\$?n?\d+`;
 const REF_RE = new RegExp(
 	// 'Quoted Name'!A1[:B2]  or  Plain_Name!A1[:B2]
+	// !mark
 	String.raw`(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))!(${CELL})(?::(${CELL}))?`,
 	'g'
 );
+```
 
-/** Spans of string literals, so refs inside quotes are left alone. */
+## !!steps Knowing what is inside a string
+
+A formula like `CONCAT("Sheet9!A0", Sheet2!B3)` contains two things that look
+alike, and only the second is a reference. So string literals are located
+first, by a small scanner that walks the source and pairs quotes, treating an
+unterminated quote as running to the end.
+
+The subtlety is in `inString`, which tests **strictly** inside the span with
+`>` and `<` rather than `>=`. A quoted sheet name's match begins at its own
+opening quote, so an inclusive test would classify every `'My Sheet'!A1` as
+being inside a string and skip it. The comment says exactly this — one of those
+comparisons that looks like an off-by-one until you know why.
+
+```ts ! sheetRefs.ts
 function stringSpans(source: string): [number, number][] {
 	const spans: [number, number][] = [];
 	let i = 0;
@@ -56,12 +71,27 @@ function stringSpans(source: string): [number, number][] {
 	}
 	return spans;
 }
-
-/** Finds sheet-qualified references outside string literals. */
-export function findSheetRefs(source: string): SheetRef[] {
-	const spans = stringSpans(source);
+// ...
+	// !mark
 	const inString = (at: number) => spans.some(([s, e]) => at > s && at < e);
-	const out: SheetRef[] = [];
+```
+
+## !!steps Validating and normalizing each match
+
+The regex only proves a reference is *shaped* correctly; `parseCellRef` from
+[a1.ts](/docs/src/lib/core/a1.ts) decides whether it addresses a real cell. The
+`$` characters are stripped before parsing, since pinning affects how a
+reference is rewritten on copy, not where it points.
+
+A half-valid range — a good first corner and an unparseable second — is
+discarded rather than silently treated as a single cell.
+
+The corners are then normalized with `Math.min` and `Math.max`, so
+`Data!B2:A0` describes the same rectangle as `Data!A0:B2`. Each result also
+carries its `start` and `end` offsets in the source, which is what makes the
+two consumers below possible.
+
+```ts ! sheetRefs.ts
 	for (const m of source.matchAll(REF_RE)) {
 		// skip refs inside string literals; a quoted sheet name's own span
 		// starts AT the match, so `inString` (strictly inside) spares it
@@ -69,44 +99,71 @@ export function findSheetRefs(source: string): SheetRef[] {
 		const a = parseCellRef(m[3].replace(/\$/g, ''));
 		if (!a) continue;
 		const b = m[4] ? parseCellRef(m[4].replace(/\$/g, '')) : undefined;
+		// !mark
 		if (m[4] && !b) continue;
 		out.push({
 			sheetName: m[1] ?? m[2],
 			start: m.index,
 			end: m.index + m[0].length,
+			// !mark(1:4)
 			x0: Math.min(a.x, b?.x ?? a.x),
 			y0: Math.min(a.y, b?.y ?? a.y),
 			x1: Math.max(a.x, b?.x ?? a.x),
 			y1: Math.max(a.y, b?.y ?? a.y)
 		});
 	}
-	return out;
-}
+```
 
-/** Renders one cell value as a formula literal. */
+## !!steps Rendering a value the engine will parse back
+
+Each referenced value has to re-enter the formula as source text, so its type
+must survive the round trip: numbers unquoted, booleans as the bare `TRUE` and
+`FALSE` the engine recognizes, everything else quoted. An empty or missing cell
+becomes `""`.
+
+Quoting is where the care is. Since the engine accepts both quote characters,
+the function picks one the value does not contain — a string with a double
+quote is wrapped in single quotes and vice versa — which avoids escaping
+entirely. Only a value containing *both* falls through to the last line, which
+strips the double quotes rather than producing a formula that will not parse.
+
+```ts ! sheetRefs.ts
 function valueLiteral(raw: string | undefined): string {
 	if (raw === undefined || raw === '') return '""';
 	if (raw.trim() !== '' && !Number.isNaN(Number(raw))) return raw.trim();
 	if (/^(true|false)$/i.test(raw)) return raw.toUpperCase();
 	// pick a quote character the value doesn't contain; drop it otherwise
+	// !mark(1:3)
 	if (!raw.includes('"')) return `"${raw}"`;
 	if (!raw.includes("'")) return `'${raw}'`;
 	return `"${raw.replace(/"/g, '')}"`;
 }
+```
 
-/**
- * Replaces every sheet-qualified reference with the referenced values.
- * Unknown sheet names are left in place (the engine reports a parse error
- * at that span, which is the honest outcome).
- */
-export function substituteSheetRefs(
-	source: string,
-	resolveSheet: (name: string) => Sheet | undefined
-): { code: string; refs: SheetRef[] } {
+## !!steps Splicing from the end backwards
+
+Substitution walks the references **in reverse**, and that is the whole trick.
+Each replacement changes the length of the string, which would invalidate the
+offsets of every reference after it — going backwards means the spans still
+ahead of the cursor are untouched.
+
+A range becomes the engine's array-literal syntax: commas between columns,
+semicolons between rows, wrapped in braces. A single cell inlines as one
+literal.
+
+An unresolvable sheet name is deliberately left alone. The comment calls this
+the honest outcome: the engine then reports a parse error pointing at exactly
+that span, which is a better message than any this layer could invent — and it
+lands on the text the user actually typed, since the stored formula was never
+rewritten.
+
+```ts ! sheetRefs.ts
 	const refs = findSheetRefs(source);
 	let code = source;
+	// !mark
 	for (const ref of [...refs].reverse()) {
 		const sheet = resolveSheet(ref.sheetName);
+		// !mark
 		if (!sheet) continue;
 		let literal: string;
 		if (ref.x0 === ref.x1 && ref.y0 === ref.y1) {
@@ -124,23 +181,31 @@ export function substituteSheetRefs(
 		}
 		code = code.slice(0, ref.start) + literal + code.slice(ref.end);
 	}
-	return { code, refs };
-}
+```
 
-/**
- * Masks sheet-qualified refs as quoted placholders so the Rust
- * adjust/relocate passes (which are sheet-unaware) cannot rewrite their A1
- * parts; `unmask` restores them afterwards.
- */
-export function maskSheetRefs(source: string): {
-	masked: string;
-	unmask: (adjusted: string) => string;
-} {
+## !!steps Hiding references from a rewriter
+
+Masking solves the opposite problem. When a row is inserted or a formula is
+copied, the Rust passes rewrite every A1 reference they can see — including the
+`A1` half of `Sheet2!A1`, which points at another sheet and must not move.
+
+The placeholder is `"__XREF0__"`, and the **quotes are the point**: to the
+engine's parser it is an ordinary string literal, so there is nothing inside it
+resembling a reference to rewrite. Numbering by index lets `unmask` restore each
+original verbatim.
+
+Like substitution this walks backwards to keep offsets valid, with `unshift`
+compensating so `originals` still ends up in source order. Restoring works on
+whatever the rewriter returned, because the placeholders survive as intact
+tokens no matter how the surrounding references were adjusted.
+
+```ts ! sheetRefs.ts
 	const refs = findSheetRefs(source);
 	const originals: string[] = [];
 	let masked = source;
 	for (let i = refs.length - 1; i >= 0; i--) {
 		const ref = refs[i];
+		// !mark(1:2)
 		originals.unshift(source.slice(ref.start, ref.end));
 		masked = masked.slice(0, ref.start) + `"__XREF${i}__"` + masked.slice(ref.end);
 	}
@@ -150,4 +215,19 @@ export function maskSheetRefs(source: string): {
 			adjusted.replace(/"__XREF(\d+)__"/g, (_, n) => originals[Number(n)] ?? '')
 	};
 }
-````
+```
+
+</Scrollycoding>
+
+The two exports serve different callers. `substituteSheetRefs` runs on the way
+into evaluation, and `maskSheetRefs` wraps the adjust and relocate passes in
+[runFormula.ts](/docs/src/lib/formulas/runFormula.ts). `findSheetRefs` is also
+used by [state.svelte.ts](/docs/src/lib/state.svelte.ts) to rebuild cross-sheet
+dependency edges after a file loads, so editing a cell on one sheet recomputes
+the formulas on another that read it.
+
+One consequence of inlining values: the engine sees literals, not references,
+so a cross-sheet range contributes no `cells_accessed` entries of its own —
+which is precisely why those dependencies are tracked separately from
+`findSheetRefs`. The behavior is pinned down in
+[sheetRefs.test.ts](/docs/src/lib/formulas/sheetRefs.test.ts).
