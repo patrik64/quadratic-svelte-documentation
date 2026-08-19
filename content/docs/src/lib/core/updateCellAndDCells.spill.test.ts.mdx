@@ -1,29 +1,47 @@
 ---
 title: "updateCellAndDCells.spill.test.ts"
-description: "Spill semantics, exercised through JAVASCRIPT cells: the JS runner is a pure AsyncFunction wrapper, so the whole recompute pipeline runs in node without wasm…"
+description: "End-to-end spill semantics through JavaScript cells — blocking, un-spilling, contested cells, and undo across a block"
 source: "src/lib/core/updateCellAndDCells.spill.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Ten tests covering the hardest behavior in the app: what happens when an array
+result needs cells it does not own. They run the **whole pipeline** —
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts), the
+runtime, the dependency graph and the transaction system — rather than any
+piece in isolation.
 
-````ts updateCellAndDCells.spill.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { SheetController } from './SheetController';
-import type { Cell } from './types';
-import { updateCellAndDCells } from './updateCellAndDCells';
+The header comment explains why every test uses a JavaScript cell: that runner
+is a plain `AsyncFunction` wrapper, so the pipeline runs under Node without
+WebAssembly or Pyodide. It is the one runtime that makes end-to-end testing
+possible at all.
 
-// Spill semantics, exercised through JAVASCRIPT cells: the JS runner is a
-// pure AsyncFunction wrapper, so the whole recompute pipeline runs in node
-// without wasm or Pyodide.
+<Scrollycoding>
 
+## !!steps Helpers that mirror what the app does
+
+Three helpers stand in for the user's actions, and the comment on the first
+records why it is written the way it is: re-saving a same-type code cell
+**keeps its existing fields**, because `array_cells` carries spill ownership
+across re-runs.
+
+That spread is not incidental. Drop it and a re-run would arrive with no memory
+of what it previously owned, so the blocker check would treat its own old
+output as foreign and every second run would report a spill error. The helper
+mirrors `saveCellCode` in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) precisely so the tests
+exercise the real path.
+
+Each helper wraps its call in a transaction, matching the app and making the
+undo test possible later.
+
+```ts ! updateCellAndDCells.spill.test.ts
 async function runCode(sc: SheetController, x: number, y: number, code: string): Promise<void> {
 	// mirrors saveCellCode: re-saving a same-type code cell keeps its fields
 	// (array_cells carries spill ownership across re-runs)
 	const existing = sc.sheet.getCell(x, y);
 	const cell: Cell = {
+		// !mark
 		...(existing && existing.type === 'JAVASCRIPT' ? existing : {}),
 		x,
 		y,
@@ -36,37 +54,23 @@ async function runCode(sc: SheetController, x: number, y: number, code: string):
 	await updateCellAndDCells({ starting_cells: [cell], sheetController: sc });
 	sc.endTransaction();
 }
+```
 
-async function typeText(sc: SheetController, x: number, y: number, value: string): Promise<void> {
-	const cell: Cell = { x, y, type: 'TEXT', value, last_modified: '2026-01-01T00:00:00.000Z' };
-	sc.startTransaction();
-	await updateCellAndDCells({ starting_cells: [cell], sheetController: sc });
-	sc.endTransaction();
-}
+## !!steps Spilling, and refusing to spill
 
-async function deleteCell(sc: SheetController, x: number, y: number): Promise<void> {
-	const existing = sc.sheet.getCell(x, y);
-	if (!existing) return;
-	sc.startTransaction();
-	await updateCellAndDCells({
-		starting_cells: [existing],
-		sheetController: sc,
-		delete_starting_cells: true
-	});
-	sc.endTransaction();
-}
+The happy path asserts all three values landed and that the origin records
+owning three cells — `array_cells` being what every later behavior depends on.
 
-describe('spill', () => {
-	it('spills arrays onto empty cells', async () => {
-		const sc = new SheetController();
-		await runCode(sc, 0, 0, 'return [1, 2, 3];');
+The blocking test is the important one, and its assertions are exhaustive by
+design. The origin shows `#SPILL!` and reports failure, the error message names
+the blocker in A1 notation, `array_cells` is `undefined` because nothing is
+owned, the blocking cell **still holds its value**, and the cell beyond it was
+never written.
 
-		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
-		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
-		expect(sc.sheet.getCell(0, 2)?.value).toBe('3');
-		expect(sc.sheet.getCell(0, 0)?.array_cells).toHaveLength(3);
-	});
+That last pair is what "all-or-nothing" means concretely: the spill did not
+write the cells it could reach before hitting the obstruction.
 
+```ts ! updateCellAndDCells.spill.test.ts
 	it('blocks instead of overwriting a foreign cell', async () => {
 		const sc = new SheetController();
 		await typeText(sc, 0, 1, 'precious');
@@ -75,22 +79,60 @@ describe('spill', () => {
 		const origin = sc.sheet.getCell(0, 0);
 		expect(origin?.value).toBe('#SPILL!');
 		expect(origin?.evaluation_result?.success).toBe(false);
+		// !mark
 		expect(origin?.evaluation_result?.std_err).toContain('A1');
 		expect(origin?.array_cells).toBeUndefined();
+		// !mark(1:2)
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('precious');
 		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
 	});
+```
 
+## !!steps The blocker edge, and that it survives a rebuild
+
+This test verifies the mechanism rather than the outcome, and it is the one that
+explains the design.
+
+First it confirms the blocking coordinate appears in `cells_accessed` — a cell
+the computation never actually read, recorded as though it had. Then it calls
+`rebuildDependencies` and checks the graph edge exists.
+
+That second assertion is the point. Because the graph is regenerated from
+`cells_accessed`, smuggling blockers into that list makes the dependency
+survive undo, redo, a file reload and a row insertion — every path that rebuilds
+rather than maintains the graph. Without it, un-spilling would work until the
+first rebuild and then quietly stop.
+
+```ts ! updateCellAndDCells.spill.test.ts
 	it('records blockers in cells_accessed so the dep survives rebuilds', async () => {
 		const sc = new SheetController();
 		await typeText(sc, 0, 1, 'x');
 		await runCode(sc, 0, 0, 'return [1, 2];');
 
+		// !mark
 		expect(sc.sheet.getCell(0, 0)?.evaluation_result?.cells_accessed).toContainEqual([0, 1]);
 		sc.sheet.rebuildDependencies();
+		// !mark
 		expect(sc.sheet.getDependents(0, 1)).toContainEqual({ x: 0, y: 0 });
 	});
+```
 
+## !!steps Both directions of the same relationship
+
+These two tests are mirror images, and together they cover the behavior users
+actually notice.
+
+Deleting the blocker makes the spill complete **on its own** — no explicit
+un-blocking logic runs, the deletion simply propagates along the edge recorded
+in the previous test.
+
+Typing into a live spill does the reverse: the owner flips to `#SPILL!`, the
+typed value survives, and the rest of the now-stale spill is cleaned up. That
+one relies on the different mechanism, the `COMPUTED` lookup that finds the
+owner and queues it, since no dependency edge points from a spilled cell back
+to its origin.
+
+```ts ! updateCellAndDCells.spill.test.ts
 	it('un-spills automatically when the blocker is deleted', async () => {
 		const sc = new SheetController();
 		await typeText(sc, 0, 1, 'x');
@@ -98,6 +140,7 @@ describe('spill', () => {
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
 
 		await deleteCell(sc, 0, 1);
+		// !mark
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
 		expect(sc.sheet.getCell(0, 2)?.value).toBe('3');
@@ -108,35 +151,63 @@ describe('spill', () => {
 		await runCode(sc, 0, 0, 'return [1, 2, 3];');
 		await typeText(sc, 0, 1, 'mine now');
 
+		// !mark
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('mine now');
 		// the rest of the stale spill is cleaned up
 		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
 	});
+```
 
-	it('re-spills when a spilled COMPUTED cell is deleted directly', async () => {
-		const sc = new SheetController();
-		await runCode(sc, 0, 0, 'return [1, 2, 3];');
-		await deleteCell(sc, 0, 1);
+## !!steps Two origins contesting one cell
 
-		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
-		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
-	});
+The hardest scenario in the file: a second code cell whose *origin* sits on the
+first one's spilled output.
 
+The resolution is stated in the comment — A must block, B takes over. That
+follows from the blocker rule requiring a target to be `COMPUTED` **and** part
+of this cell's own previous spill: B's origin is not part of A's ownership from
+A's perspective once B has claimed it, so A can no longer write there.
+
+Then the release is checked. Deleting B restores A's full spill, confirming the
+contest leaves no permanent state — no ownership flag stuck on a cell, no
+orphaned entry in `array_cells`. That is the assertion that would catch a
+cleanup bug the earlier tests would miss.
+
+```ts ! updateCellAndDCells.spill.test.ts
 	it('two origins fight over a cell and release cleanly', async () => {
 		const sc = new SheetController();
 		await runCode(sc, 0, 0, 'return [1, 2];'); // spills (0,0),(0,1)
 		// B's origin lands on A's spill: A must block, B takes over
 		await runCode(sc, 0, 1, 'return [9];');
 
+		// !mark(1:2)
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('9');
 
 		await deleteCell(sc, 0, 1);
+		// !mark(1:2)
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
 	});
+```
 
+## !!steps Undo across a spill block
+
+Undo has to reverse not just a typed value but the entire cascade it caused —
+the owner flipping to `#SPILL!` and its spilled cells being cleared.
+
+Because every write went through `sc.execute` inside one transaction, a single
+`undo` restores all of it: the block is gone and all three values are back.
+Redo replays it symmetrically.
+
+The `rebuildDependencies` calls after each are the test being honest about the
+contract. The transaction system reverses cells, not the derived graph, so the
+app's own `undo` in [state.svelte.ts](/docs/src/lib/state.svelte.ts) rebuilds
+too — and the test does the same rather than pretending the controller handles
+it.
+
+```ts ! updateCellAndDCells.spill.test.ts
 	it('undo restores the pre-block state and redo re-blocks', async () => {
 		const sc = new SheetController();
 		await runCode(sc, 0, 0, 'return [1, 2, 3];');
@@ -144,6 +215,7 @@ describe('spill', () => {
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
 
 		sc.undo();
+		// !mark
 		sc.sheet.rebuildDependencies();
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('1');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('2');
@@ -151,15 +223,32 @@ describe('spill', () => {
 
 		sc.redo();
 		sc.sheet.rebuildDependencies();
+		// !mark
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('#SPILL!');
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('blocker');
 	});
+```
 
+## !!steps Two boundary cases that close the loop
+
+A single-element array occupies only its origin, so it has no cells to claim and
+cannot block — even with a populated neighbour. Without this test, an
+implementation that checked the neighbour before noticing the output was
+one-by-one would pass everything above.
+
+The shrinking case covers cleanup in the other direction. Re-running with a
+smaller result must clear the cells the previous result owned and nothing else.
+Asserting both freed cells are `undefined` rather than empty strings confirms
+they were deleted rather than blanked — which matters because a blanked cell
+would still block the next spill.
+
+```ts ! updateCellAndDCells.spill.test.ts
 	it('single-value output never blocks', async () => {
 		const sc = new SheetController();
 		await typeText(sc, 0, 1, 'neighbor');
 		await runCode(sc, 0, 0, 'return [42];');
 
+		// !mark
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('42');
 		expect(sc.sheet.getCell(0, 0)?.evaluation_result?.success).toBe(true);
 		expect(sc.sheet.getCell(0, 1)?.value).toBe('neighbor');
@@ -171,8 +260,23 @@ describe('spill', () => {
 		await runCode(sc, 0, 0, 'return [7];');
 
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('7');
+		// !mark(1:2)
 		expect(sc.sheet.getCell(0, 1)).toBeUndefined();
 		expect(sc.sheet.getCell(0, 2)).toBeUndefined();
 	});
-});
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. These are the project's only genuinely end-to-end tests:
+a real [SheetController.ts](/docs/src/lib/core/SheetController.ts), a real
+[Sheet.ts](/docs/src/lib/core/Sheet.ts), the real recompute pipeline and the
+real JavaScript runner, with nothing mocked.
+
+What that buys is coverage of interactions no unit test reaches — the
+`COMPUTED` owner lookup, blockers riding in `cells_accessed`, and undo across a
+cascade all involve at least three modules agreeing.
+
+Not covered here: 2-D spills, formula and Python cells, cross-sheet
+propagation, and the `MAX_UPDATES_PER_CELL` circular-reference guard — the last
+of which has no test anywhere.

@@ -1,59 +1,70 @@
 ---
 title: "updateCellAndDCells.ts"
-description: "Port of Quadratic's updateCellAndDCells: writes/deletes the starting cells, evaluates code cells, spills array output, and recomputes dependent cells transit…"
+description: "The recompute pipeline — a work queue over the dependency graph, three runtimes behind one interface, and spill with blocker detection"
 source: "src/lib/core/updateCellAndDCells.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Every edit that can change a computed value goes through here. It writes the
+cells you changed, evaluates any code among them, spills array results onto the
+grid, and then walks the dependency graph recomputing whatever read them —
+transitively, and across sheets.
 
-````ts updateCellAndDCells.ts -n
-import { getCellA1Notation } from './a1';
-import type { SheetController } from './SheetController';
-import { coordKey, isCodeCellType, type ArrayOutput, type Cell } from './types';
+The spill handling is the subtlest code in the project, because an array result
+has to claim cells it does not own, and must refuse rather than destroy
+someone else's data.
 
-// Port of Quadratic's updateCellAndDCells: writes/deletes the starting cells,
-// evaluates code cells, spills array output, and recomputes dependent cells
-// transitively via the dependency graph. The queue carries a sheet index so
-// cross-sheet formula dependents recompute against their own sheet.
+<Scrollycoding>
 
-export interface UpdateCellsOptions {
-	starting_cells: Cell[];
-	sheetController: SheetController;
-	delete_starting_cells?: boolean;
-}
+## !!steps A queue of sheet-qualified coordinates
 
+Work is a queue rather than recursion, which keeps the traversal iterative and
+makes the cycle guard straightforward.
+
+Each item carries a `sheetIndex`, so an entry names a cell on a *specific*
+sheet. That is what lets a formula on Sheet2 be recomputed because a cell on
+Sheet1 changed, without the queue ever losing track of which sheet each pending
+item belongs to.
+
+`MAX_UPDATES_PER_CELL` is the circular-reference guard. Rather than detecting
+cycles structurally, it counts how many times each cell has been recomputed in
+this pass and stops propagating past 25 — simple, and it terminates on any
+cycle regardless of shape.
+
+```ts ! updateCellAndDCells.ts
 interface QueueItem {
+	// !mark
 	sheetIndex: number;
 	x: number;
 	y: number;
 }
 
+// !mark
 const MAX_UPDATES_PER_CELL = 25; // circular-reference guard
 
 function itemKey(item: QueueItem): string {
 	return `${item.sheetIndex}:${coordKey(item.x, item.y)}`;
 }
+```
 
-export async function updateCellAndDCells(options: UpdateCellsOptions): Promise<void> {
-	const { starting_cells, sheetController: sc, delete_starting_cells } = options;
-	const sheet = sc.sheet;
-	const startSheetIndex = sc.currentSheetIndex;
+## !!steps Waking the owner of a cell you just overwrote
 
-	const queue: QueueItem[] = [];
-	const updateCounts = new Map<string, number>();
-	const startingKeys = new Set(
-		starting_cells.map((c) => `${startSheetIndex}:${coordKey(c.x, c.y)}`)
-	);
+Before writing anything, each starting cell is checked for landing on a
+`COMPUTED` cell — one produced by someone else's spill.
 
-	for (const cell of starting_cells) {
-		// a write or delete landing on a spilled COMPUTED cell must re-run its
-		// owner so the owner can re-spill (after a delete) or turn into a
-		// #SPILL! error (after a write) — the dependency graph cannot express
-		// this without the owner depending on its own output
+The comment explains why this cannot be left to the dependency graph: the owner
+would have to depend on **its own output**, which is not a relationship the
+graph can express. So the owner is found by searching for the code cell whose
+`array_cells` contains this coordinate, and queued explicitly.
+
+That one step produces two behaviors users see. Typing into a live spill flips
+its owner to `#SPILL!`, because re-running the owner now finds a blocker. And
+deleting a spilled cell makes the block re-fill, because re-running finds the
+space free again.
+
+```ts ! updateCellAndDCells.ts
 		const landedOn = sheet.getCell(cell.x, cell.y);
+		// !mark
 		if (landedOn?.type === 'COMPUTED') {
 			const owner = sheet
 				.getAllCells()
@@ -61,35 +72,35 @@ export async function updateCellAndDCells(options: UpdateCellsOptions): Promise<
 					(c) =>
 						isCodeCellType(c.type) &&
 						!(c.x === cell.x && c.y === cell.y) &&
+						// !mark
 						c.array_cells?.some(([ax, ay]) => ax === cell.x && ay === cell.y)
 				);
 			if (owner) queue.push({ sheetIndex: startSheetIndex, x: owner.x, y: owner.y });
 		}
+```
 
-		if (delete_starting_cells) {
-			const existing = sheet.getCell(cell.x, cell.y);
-			if (existing) {
-				deleteArrayCells(existing, sc, startSheetIndex, queue);
-				sc.execute({
-					type: 'setCell',
-					x: cell.x,
-					y: cell.y,
-					cell: undefined,
-					sheetIndex: startSheetIndex
-				});
-				sheet.setDependencies({ x: cell.x, y: cell.y }, []);
-				sc.setCrossSheetDeps({ sheetIndex: startSheetIndex, x: cell.x, y: cell.y }, []);
-			}
-		} else {
-			sc.execute({ type: 'setCell', x: cell.x, y: cell.y, cell, sheetIndex: startSheetIndex });
-		}
-		queue.push({ sheetIndex: startSheetIndex, x: cell.x, y: cell.y });
-	}
+## !!steps Draining the queue, propagating both ways
 
+The main loop pops an item, counts it against the cycle limit, and evaluates it
+if it holds code. Plain text needs no computation — the explicit empty branch
+documents that rather than leaving it implicit.
+
+Propagation then happens twice over. Same-sheet dependents come from the
+reverse index on [Sheet.ts](/docs/src/lib/core/Sheet.ts); cross-sheet
+dependents come from the rectangle index on
+[SheetController.ts](/docs/src/lib/core/SheetController.ts), looked up by sheet
+*name* rather than index since that is how a formula refers to it.
+
+Because dependents are appended to the same queue, the traversal is breadth-first
+and transitive — a change three formulas deep propagates without any recursive
+call.
+
+```ts ! updateCellAndDCells.ts
 	while (queue.length > 0) {
 		const item = queue.shift()!;
 		const key = itemKey(item);
 		const count = (updateCounts.get(key) ?? 0) + 1;
+		// !mark
 		if (count > MAX_UPDATES_PER_CELL) continue; // circular reference; stop propagating
 		updateCounts.set(key, count);
 
@@ -99,12 +110,11 @@ export async function updateCellAndDCells(options: UpdateCellsOptions): Promise<
 
 		if (cell && isCodeCellType(cell.type)) {
 			await computeCell(cell, sc, item.sheetIndex, queue);
-		} else if (cell && startingKeys.has(key) && cell.type === 'TEXT') {
-			// plain text write; nothing to compute
 		}
 
 		// propagate to same-sheet dependents, then to cross-sheet formula
 		// dependents registered against this sheet's name
+		// !mark(1:6)
 		for (const dep of itemSheet.getDependents(item.x, item.y)) {
 			queue.push({ sheetIndex: item.sheetIndex, ...dep });
 		}
@@ -112,35 +122,37 @@ export async function updateCellAndDCells(options: UpdateCellsOptions): Promise<
 			queue.push(dep);
 		}
 	}
-}
+```
 
-async function computeCell(
-	cell: Cell,
-	sc: SheetController,
-	sheetIndex: number,
-	queue: QueueItem[]
-): Promise<void> {
-	const sheet = sc.sheets[sheetIndex];
-	const getCellValue = (x: number, y: number) => sheet.getCell(x, y)?.value;
+## !!steps Three runtimes, normalized into one shape
 
-	let success: boolean;
-	let displayValue: string;
-	let arrayOutput: ArrayOutput | undefined;
-	let cellsAccessed: [number, number][] = [];
-	let stdOut: string | undefined;
-	let stdErr: string | undefined;
-	let errorSpan: [number, number] | null = null;
-	let imageOutput: string | undefined;
+`computeCell` branches by cell type, and every branch is a **dynamic import**.
+That is what keeps the WebAssembly core, and especially Pyodide, out of the
+initial bundle — a sheet with no Python cells never downloads it.
 
+Each runtime returns its own result interface, and the branches flatten them
+into the same set of local variables. From there the spill and write-back logic
+is language-agnostic, which is why adding a fourth runtime would mean adding one
+branch rather than touching anything below.
+
+The formula branch does extra work no other needs: cross-sheet references are
+substituted into literal values before evaluation, since the Rust engine is
+sheet-unaware, and the refs found are registered in the controller's cross-sheet
+index. That registration is what puts this cell on the queue when the *other*
+sheet changes.
+
+```ts ! updateCellAndDCells.ts
 	if (cell.type === 'FORMULA') {
 		// Rust/WASM quadratic-core engine, lazy-loaded on first evaluation.
 		// Sheet-qualified refs are resolved here (the engine is sheet-unaware)
 		// and registered in the controller's cross-sheet dependency graph.
+		// !mark
 		const { runFormula } = await import('../formulas/runFormula');
 		const { substituteSheetRefs } = await import('../formulas/sheetRefs');
 		const { code, refs } = substituteSheetRefs(cell.formula_code ?? '', (name) =>
 			sc.sheets.find((s) => s.name === name)
 		);
+		// !mark
 		sc.setCrossSheetDeps({ sheetIndex, x: cell.x, y: cell.y }, refs);
 		const result = await runFormula(code, { x: cell.x, y: cell.y }, getCellValue);
 		success = result.success;
@@ -149,59 +161,35 @@ async function computeCell(
 		cellsAccessed = result.cells_accessed;
 		stdErr = result.error_msg ?? undefined;
 		errorSpan = result.error_span;
-	} else if (cell.type === 'JAVASCRIPT') {
-		const { runJavascript } = await import('../javascript/javascriptRunner');
-		const result = await runJavascript(
-			cell.javascript_code ?? '',
-			{ x: cell.x, y: cell.y },
-			getCellValue
-		);
-		success = result.success;
-		displayValue = result.output_value ?? '';
-		arrayOutput = result.array_output ?? undefined;
-		cellsAccessed = result.cells_accessed;
-		stdOut = result.std_out;
-		stdErr = result.std_err;
-		imageOutput = result.image_output;
-	} else {
-		// PYTHON — lazy import keeps pyodide machinery out of the base flow
-		const { runPython } = await import('../python/pythonRunner');
-		const result = await runPython(cell.python_code ?? '', getCellValue);
-		success = result.success;
-		displayValue = result.output_value ?? '';
-		arrayOutput = result.array_output ?? undefined;
-		cellsAccessed = result.cells_accessed;
-		stdOut = result.std_out;
-		stdErr = result.std_err;
-		imageOutput = result.image_output;
 	}
+```
 
-	// -------- spill array output --------
-	const oldArrayCells = (cell.array_cells ?? []).filter(
-		([x, y]) => !(x === cell.x && y === cell.y)
-	);
-	const oldKeys = new Set(oldArrayCells.map(([x, y]) => coordKey(x, y)));
-	let newArrayCells: [number, number][] = [];
-	let originValue = displayValue;
-	const spillBlockers: [number, number][] = [];
-	let outputSize = '';
+## !!steps Planning the spill before performing it
 
-	if (success && arrayOutput && arrayOutput.length > 0) {
-		const rows2d: (string | number | boolean | null | undefined)[][] = Array.isArray(
-			arrayOutput[0]
-		)
-			? (arrayOutput as (string | number | boolean)[][])
-			: (arrayOutput as (string | number | boolean)[]).map((v) => [v]);
-		outputSize = `${Math.max(...rows2d.map((r) => r.length))}×${rows2d.length}`;
+The spill normalizes a 1-D result into a single column and a 2-D result into
+rows, then does something important: it **collects the writes without
+performing them**.
 
+That dry run is what makes blocker detection possible. Writing as it goes and
+checking afterwards would already have destroyed data; gathering the intended
+writes first leaves the decision reversible.
+
+The origin cell is treated separately — it holds the code, so it receives the
+first value rather than a `COMPUTED` cell. `null` and `undefined` entries are
+skipped entirely, so a ragged result leaves those positions untouched rather
+than writing empties.
+
+```ts ! updateCellAndDCells.ts
 		// dry-run first: collect the writes, then scan for blockers — a cell
 		// the previous spill didn't own must never be silently overwritten
+		// !mark
 		const writes: { x: number; y: number; value: string }[] = [];
 		let first = true;
 		for (let dy = 0; dy < rows2d.length; dy++) {
 			const row = rows2d[dy];
 			for (let dx = 0; dx < row.length; dx++) {
 				const v = row[dx];
+				// !mark
 				if (v === null || v === undefined) continue;
 				const x = cell.x + dx;
 				const y = cell.y + dy;
@@ -215,9 +203,27 @@ async function computeCell(
 				writes.push({ x, y, value: String(v) });
 			}
 		}
+```
 
+## !!steps What counts as a blocker
+
+The test is precise and worth reading closely: a target blocks unless it is
+`COMPUTED` **and** was part of *this cell's previous* spill.
+
+Both halves matter. Requiring `COMPUTED` means user data is never overwritten.
+Requiring membership in `oldKeys` means another origin's spilled output blocks
+too — two code cells cannot silently fight over the same region, each
+overwriting the other on alternate runs.
+
+If anything blocks, `newArrayCells` is emptied, which propagates through the
+rest of the function: nothing is written, everything previously spilled is
+cleaned up, and the origin becomes a `#SPILL!` error. The spill is all-or-nothing
+rather than partial.
+
+```ts ! updateCellAndDCells.ts
 		for (const w of writes) {
 			const existing = sheet.getCell(w.x, w.y);
+			// !mark
 			if (existing && !(existing.type === 'COMPUTED' && oldKeys.has(coordKey(w.x, w.y)))) {
 				spillBlockers.push([w.x, w.y]);
 			}
@@ -227,40 +233,73 @@ async function computeCell(
 			for (const w of writes) {
 				sc.execute({
 					type: 'setCell',
-					x: w.x,
-					y: w.y,
-					cell: {
-						x: w.x,
-						y: w.y,
-						type: 'COMPUTED',
-						value: w.value,
-						last_modified: new Date().toISOString()
-					},
+					// ...
 					sheetIndex
 				});
 				queue.push({ sheetIndex, x: w.x, y: w.y });
 			}
 		} else {
+			// !mark
 			newArrayCells = [];
 		}
-	}
+```
 
+## !!steps Cleaning up only what this cell owned
+
+Cells from the previous spill that the new one does not produce are deleted —
+but only if they are still `COMPUTED`.
+
+That guard is what makes a shrinking result behave: returning three values then
+one clears the two now-unused cells, while a cell the user has since typed into
+is left alone, because it is no longer `COMPUTED`.
+
+Each deletion is queued, so anything depending on a removed cell recomputes.
+
+The blocked case flows through the same code: with `newArrayCells` emptied,
+every previously spilled cell is stale and gets cleaned up, which is why a
+blocked spill leaves no partial remains behind.
+
+```ts ! updateCellAndDCells.ts
 	// delete stale spilled cells no longer produced (all of them when blocked)
 	const newKeys = new Set(newArrayCells.map(([x, y]) => coordKey(x, y)));
 	for (const [x, y] of oldArrayCells) {
 		if (!newKeys.has(coordKey(x, y))) {
 			const existing = sheet.getCell(x, y);
+			// !mark
 			if (existing?.type === 'COMPUTED') {
 				sc.execute({ type: 'setCell', x, y, cell: undefined, sheetIndex });
+				// !mark
 				queue.push({ sheetIndex, x, y });
 			}
 		}
 	}
+```
 
+## !!steps Blockers recorded as if they had been read
+
+Here is the neatest trick in the file. When a spill is blocked, the blocking
+coordinates are **appended to `cells_accessed`** — the list of cells this
+computation read.
+
+It did not read them, but recording them there means the dependency graph gains
+an edge from each blocker to this cell. Clearing a blocker then queues this cell
+through ordinary propagation, and the spill completes on its own. No special
+un-blocking path is needed.
+
+The comment names the second benefit: because `cells_accessed` is what
+`rebuildDependencies` regenerates the graph from, those edges survive undo,
+redo, a file reload and a row insertion — anywhere the graph is rebuilt rather
+than maintained.
+
+The error message names up to three blockers in A1 notation, so the user is
+told *where* the obstruction is rather than just that one exists.
+
+```ts ! updateCellAndDCells.ts
 	const blocked = spillBlockers.length > 0;
 	// blocker coords ride along in cells_accessed so the dependency edges
 	// survive rebuildDependencies (undo/redo/file load) and shiftAxis —
 	// clearing a blocker then re-runs this cell through normal propagation
+	// !mark
 	const accessedWithBlockers = blocked ? [...cellsAccessed, ...spillBlockers] : cellsAccessed;
 	const spillMessage = blocked
 		? `Spill error: ${outputSize} output would overwrite ${spillBlockers
@@ -268,12 +307,32 @@ async function computeCell(
 				.map(([x, y]) => getCellA1Notation(x, y))
 				.join(', ')}${spillBlockers.length > 3 ? '…' : ''}`
 		: undefined;
+```
 
+## !!steps Writing the result back as one cell
+
+The origin cell is rewritten with everything the run produced: its display
+value, the coordinates it now owns, and a full evaluation result.
+
+The value is a three-way choice — `#SPILL!` when blocked, the computed value on
+success, and an empty string on failure, since a failed computation shows
+nothing while its error lives in `std_err`.
+
+`array_cells` becomes `undefined` rather than an empty array when nothing
+spilled, keeping the stored cell minimal, and `success` is false when blocked
+even though the computation itself succeeded — because from the sheet's
+perspective the cell did not produce a usable result.
+
+The final `setDependencies` call registers the edges, blockers included.
+
+```ts ! updateCellAndDCells.ts
 	const updated: Cell = {
 		...cell,
+		// !mark
 		value: blocked ? '#SPILL!' : success ? originValue : '',
 		array_cells: newArrayCells.length > 0 ? newArrayCells : undefined,
 		evaluation_result: {
+			// !mark
 			success: success && !blocked,
 			std_out: stdOut,
 			std_err: blocked ? spillMessage : stdErr,
@@ -286,27 +345,17 @@ async function computeCell(
 		last_modified: new Date().toISOString()
 	};
 	sc.execute({ type: 'setCell', x: cell.x, y: cell.y, cell: updated, sheetIndex });
+```
 
-	sheet.setDependencies(
-		{ x: cell.x, y: cell.y },
-		accessedWithBlockers.map(([x, y]) => ({ x, y }))
-	);
-}
+</Scrollycoding>
 
-function deleteArrayCells(
-	cell: Cell,
-	sc: SheetController,
-	sheetIndex: number,
-	queue: QueueItem[]
-): void {
-	const sheet = sc.sheets[sheetIndex];
-	for (const [x, y] of cell.array_cells ?? []) {
-		if (x === cell.x && y === cell.y) continue;
-		const existing = sheet.getCell(x, y);
-		if (existing?.type === 'COMPUTED') {
-			sc.execute({ type: 'setCell', x, y, cell: undefined, sheetIndex });
-			queue.push({ sheetIndex, x, y });
-		}
-	}
-}
-````
+Every write goes through `sc.execute`, so the caller's open transaction collects
+them all — which is why editing one cell that cascades through ten formulas and
+a spill block is a single undo step. The callers are the editing functions in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), each of which opens a
+transaction around its call.
+
+The spill semantics described here are pinned down by
+[updateCellAndDCells.spill.test.ts](/docs/src/lib/core/updateCellAndDCells.spill.test.ts),
+which exercises the whole pipeline through JavaScript cells — the one runtime
+that needs neither WebAssembly nor Pyodide to run under Node.
