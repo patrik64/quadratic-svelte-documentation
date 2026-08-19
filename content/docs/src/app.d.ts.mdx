@@ -1,17 +1,61 @@
 ---
 title: "app.d.ts"
-description: "Ambient TypeScript declarations for the SvelteKit app."
+description: "SvelteKit's ambient type declarations — left as untouched scaffold, because a client-only app has no server types to fill in"
 source: "src/app.d.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Thirteen lines, every meaningful one commented out. This is the file SvelteKit
+generates for a new project and it has never been edited here — which is itself
+the interesting fact about it, and the reason it is worth one short page rather
+than a puzzled detour later.
 
-````ts app.d.ts -n
+It exists so that a project *can* describe the shapes SvelteKit passes through
+its server-side plumbing. This project has no server-side plumbing to describe.
+
+<Scrollycoding>
+
+## !!steps Augmenting a namespace SvelteKit owns
+
+`declare global` opens the global scope, and inside it `namespace App` is the
+specific namespace SvelteKit reserves for a project's own types. The framework
+declares its APIs in terms of these interfaces — a handler receives
+`App.Locals`, an error page receives `App.Error` — so filling them in here is
+how a project tells the framework what its own data looks like.
+
+Nothing is imported and nothing is exported: the file's entire effect is on the
+type checker, and it disappears at build time.
+
+```ts ! app.d.ts
 // See https://svelte.dev/docs/kit/types#app.d.ts
 // for information about these interfaces
+declare global {
+	namespace App {
+		// ...
+	}
+}
+```
+
+## !!steps Five interfaces with nothing to say
+
+Each commented line names a hook into a part of SvelteKit that this app never
+reaches. `Locals` carries per-request data set by server hooks; `Platform`
+describes what a deployment adapter injects, such as an edge runtime's
+bindings; `PageData` and `PageState` type what `load` functions return and what
+the client router holds; `Error` shapes the object handed to an error page.
+
+All five are dead here for the same reason, and it is declared one directory
+away: [+layout.ts](/docs/src/routes/+layout.ts) sets `ssr = false` and
+`prerender = true`, making this a static single-page app. There are no
+requests, so nothing populates `Locals`; there is no server at runtime, so no
+adapter fills `Platform`. Data is not loaded through `load` functions either —
+it lives in [state.svelte.ts](/docs/src/lib/state.svelte.ts) and is restored
+from IndexedDB by [gridFile.ts](/docs/src/lib/files/gridFile.ts).
+
+SvelteKit ships them commented rather than absent so the names are on hand if a
+project ever grows into them.
+
+```ts ! app.d.ts
 declare global {
 	namespace App {
 		// interface Error {}
@@ -21,6 +65,29 @@ declare global {
 		// interface Platform {}
 	}
 }
+```
 
+## !!steps The empty export that makes it work
+
+The last line looks like a no-op and is load-bearing. TypeScript treats a file
+with no top-level `import` or `export` as a *script*, whose declarations already
+sit in the global scope — and in that context `declare global` is an error,
+since there is nothing to reach out of.
+
+Adding `export {}` exports nothing but changes the file's classification to a
+*module*, giving its declarations their own scope. `declare global` is then the
+sanctioned way to reach back out and augment the global scope from inside one.
+Delete this line and the file stops compiling.
+
+```ts ! app.d.ts
 export {};
-````
+```
+
+</Scrollycoding>
+
+Nothing imports this file. TypeScript picks it up because the root
+`tsconfig.json` extends SvelteKit's generated `.svelte-kit/tsconfig.json`,
+whose `include` list covers `../src/**/*.ts`. Its practical significance is as a marker of the
+architecture documented on
+[+layout.ts](/docs/src/routes/+layout.ts) — everything the commented interfaces
+would describe belongs to a server this app deliberately does not have.
