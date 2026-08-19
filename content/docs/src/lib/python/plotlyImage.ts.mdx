@@ -1,20 +1,35 @@
 ---
 title: "plotlyImage.ts"
-description: "Renders a plotly figure spec to a PNG using plotly.js in a detached div. Pyodide can't export images itself — plotly's static export needs kaleido, which is …"
+description: "Rasterizes a plotly figure to a PNG with plotly.js in an offscreen div, because Pyodide cannot export images itself"
 source: "src/lib/python/plotlyImage.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A small module that exists because of a gap in the WebAssembly ecosystem.
+Plotly's Python library can export a figure to PNG, but only through
+**kaleido** — a native binary with no wasm build — so Pyodide simply cannot do
+it.
 
-````ts plotlyImage.ts -n
-// Renders a plotly figure spec to a PNG using plotly.js in a detached div.
-// Pyodide can't export images itself — plotly's static export needs kaleido,
-// which is a native binary with no wasm build — so the figure crosses over as
-// JSON and is rasterized by the JS library instead.
+The workaround is to move the job across the language boundary: the figure
+travels from Python as JSON, and the *JavaScript* plotly library, which needs
+nothing but a DOM, renders it here.
 
+<Scrollycoding>
+
+## !!steps A CDN library, loaded at most once
+
+plotly.js is a large dependency that most sessions never need, so it is not
+bundled — it is fetched from a CDN on first use. A hand-written interface
+describes only the three functions this module calls, which is enough to keep
+the dynamic import typed without pulling in the package's type definitions.
+
+The memoization has a deliberate asymmetry: the promise is cached so concurrent
+charts share one download, but the `catch` **clears the cache before
+rethrowing**. A rejected promise cached forever would mean a single network
+blip permanently disables charts for the session; clearing it lets the next run
+try again.
+
+```ts ! plotlyImage.ts
 const PLOTLY_URL = 'https://esm.sh/plotly.js-dist-min@3.0.1';
 
 interface PlotlyModule {
@@ -30,28 +45,77 @@ function loadPlotly(): Promise<PlotlyModule> {
 		plotlyPromise = import(/* @vite-ignore */ PLOTLY_URL)
 			.then((m) => ((m as { default?: PlotlyModule }).default ?? m) as PlotlyModule)
 			.catch((e) => {
+				// !mark(1:2)
 				plotlyPromise = undefined; // let the next run retry a failed fetch
 				throw e;
 			});
 	}
 	return plotlyPromise;
 }
+```
 
+## !!steps Giving an autosizing figure a size
+
+The input is exactly what `fig.to_json()` produced in
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts) — the figure's `data`
+and `layout`.
+
+Sizing needs care because plotly figures usually *autosize*, meaning the layout
+carries no explicit width or height and the library measures its container
+instead. Rendering offscreen there is no meaningful container to measure, so
+missing dimensions would produce a degenerate image. The `||` fallbacks supply
+a chart-shaped 800×450 default, and because `Number(undefined)` is `NaN` — which
+is falsy — the same expression covers both absent and unusable values.
+
+```ts ! plotlyImage.ts
 /** Rasterizes `fig.to_json()` output to a PNG data URL. */
 export async function figureToPng(figureJson: string): Promise<string> {
 	const fig = JSON.parse(figureJson) as { data: unknown; layout?: Record<string, unknown> };
 	const layout = fig.layout ?? {};
 	// figures usually autosize; pick a chart-shaped default when they do
+	// !mark(1:2)
 	const width = Number(layout.width) || 800;
 	const height = Number(layout.height) || 450;
+```
 
+## !!steps Rendering where nobody can see it
+
+plotly.js can only render into a real DOM element, so one is created and pushed
+far off-screen rather than hidden. That distinction matters: `display: none`
+would give the element zero dimensions and produce an empty image, whereas a
+positioned element retains its box and lays out normally while remaining
+invisible.
+
+The plot is created with `staticPlot` and no mode bar, since interactivity and
+toolbars would only add chrome to a still image. `toImage` then returns the PNG
+as a data URL — the same form matplotlib figures already arrive in, which is
+why the caller can treat both identically.
+
+```ts ! plotlyImage.ts
 	const Plotly = await loadPlotly();
 	const div = document.createElement('div');
+	// !mark
 	div.style.cssText = `position:absolute;left:-10000px;top:0;width:${width}px;height:${height}px`;
 	document.body.appendChild(div);
 	try {
 		await Plotly.newPlot(div, fig.data, layout, { staticPlot: true, displayModeBar: false });
 		return await Plotly.toImage(div, { format: 'png', width, height });
+```
+
+## !!steps Cleaning up without hiding the real error
+
+The `finally` guarantees the temporary element leaves the document however the
+render turned out — otherwise a failed chart would leak a detached plotly
+instance into the page on every attempt.
+
+The nested `try` around `purge` is the thoughtful detail. `purge` releases
+plotly's internal state for an element, and if it were to throw during cleanup
+that exception would replace whatever error was already propagating —
+substituting a confusing teardown failure for the real cause. Swallowing it,
+with a comment saying exactly why, keeps the original error intact. `div.remove()`
+runs regardless.
+
+```ts ! plotlyImage.ts
 	} finally {
 		try {
 			Plotly.purge(div);
@@ -61,4 +125,13 @@ export async function figureToPng(figureJson: string): Promise<string> {
 		div.remove();
 	}
 }
-````
+```
+
+</Scrollycoding>
+
+The only caller is [pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts),
+which imports this module dynamically so neither it nor plotly.js is fetched
+for cells that never chart, and wraps the call so a failure here becomes a
+warning in the cell's output rather than a failed run. The resulting data URL is
+stored on the cell and drawn as a sprite by
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts).

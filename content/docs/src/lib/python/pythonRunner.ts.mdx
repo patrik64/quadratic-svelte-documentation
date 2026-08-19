@@ -1,36 +1,42 @@
 ---
 title: "pythonRunner.ts"
-description: "Pyodide-backed Python cells, mirroring quadratic's run_python.py API: getCell/c/cell, getCells((x0,y0),(x1,y1)) -> pandas DataFrame, cells[...], last express…"
+description: "Pyodide-backed Python cells — a Python prelude defining the cell API, package auto-install, and chart capture"
 source: "src/lib/python/pythonRunner.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Python cells run in [Pyodide](https://pyodide.org), CPython compiled to
+WebAssembly, loaded from a CDN on first use. Most of this file is not
+TypeScript at all: a 200-line Python program lives in the `PRELUDE` template
+literal, and it is what defines the API a cell actually sees.
 
-````ts pythonRunner.ts -n
-import { writable } from 'svelte/store';
-import type { ArrayOutput } from '../core/types';
+The split is deliberate. Anything that needs to *be* Python — the `getCells`
+DataFrame wrapper, the `cells[...]` slicing syntax, patching `plotly` — is
+written in Python and evaluated once at startup. The TypeScript around it
+handles loading, the bridge back to the sheet, and turning results into
+something the grid can store.
 
-// Pyodide-backed Python cells, mirroring quadratic's run_python.py API:
-// getCell/c/cell, getCells((x0,y0),(x1,y1)) -> pandas DataFrame, cells[...],
-// last expression (or assignment) is the cell's output.
+<Scrollycoding>
 
-export interface PythonRunResult {
-	success: boolean;
-	output_value: string | null;
-	array_output?: ArrayOutput | null;
-	cells_accessed: [number, number][];
-	std_out?: string;
-	std_err?: string;
-	image_output?: string;
-}
+## !!steps A result and a status anyone can watch
 
+`PythonRunResult` mirrors its JavaScript counterpart in
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts) field for
+field, so both languages feed the same recompute pipeline.
+
+`pythonStatus` is the difference. Pyodide is tens of megabytes and takes
+seconds to arrive, so the runtime's state is published as a Svelte store that
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) renders in the
+status bar — otherwise a Python cell that appears to do nothing would be
+indistinguishable from a broken one. The `detail` field carries transient
+progress, used later while packages install.
+
+```ts ! pythonRunner.ts
 export interface PythonStatus {
 	state: 'idle' | 'loading' | 'ready' | 'error';
 	version?: string;
 	error?: string;
+	// !mark
 	/** Transient progress note, e.g. while micropip fetches a package. */
 	detail?: string;
 }
@@ -38,13 +44,24 @@ export interface PythonStatus {
 export const pythonStatus = writable<PythonStatus>({ state: 'idle' });
 
 const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.mjs';
+```
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type Pyodide = any;
+## !!steps A bridge that has to be module-level
 
-let loadPromise: Promise<Pyodide> | undefined;
+These two mutable variables look like a smell and are close to unavoidable.
+The Python side reaches the sheet through a JS module registered *once* when
+Pyodide loads, but the sheet accessor differs per run — it is a closure the
+caller supplies. Since the registered module cannot be re-created per run, the
+values it reads are swapped in module scope before each execution instead.
 
+`coerce` restores types on the way across: cell values are stored as strings,
+so a numeric cell must arrive in Python as a number, not `'42'`. It matches the
+JavaScript runner's coercion, with one deliberate difference — empty cells
+become `null`, which Pyodide converts to `None`, rather than `undefined`.
+
+```ts ! pythonRunner.ts
 // set per run so the GetCellsDB JS module reads from the live sheet
+// !mark(1:2)
 let currentGetCellValue: (x: number, y: number) => string | undefined = () => undefined;
 let currentAccessed: [number, number][] = [];
 
@@ -56,7 +73,23 @@ function coerce(raw: string | undefined): string | number | boolean | null {
 	if (raw === 'FALSE' || raw === 'False' || raw === 'false') return false;
 	return raw;
 }
+```
 
+## !!steps The cell API, written in Python
+
+The prelude opens by forcing matplotlib's `AGG` backend before anything can
+import it. Pyodide's default backend draws straight into the page, which would
+put a chart somewhere in the DOM instead of on the sheet; the file backend
+makes figures capturable as PNGs.
+
+Then the API itself. `getCell` is `async` because it crosses into JavaScript,
+and is aliased to `c` and `cell` for parity with Quadratic's original API.
+`getCells` builds a **pandas DataFrame** from a rectangle — the reason a Python
+cell can do real data work in one line — with `first_row_header` promoting the
+first row to column names, dropping it and reindexing so the frame reads
+naturally.
+
+```ts ! pythonRunner.ts
 const PRELUDE = `
 import re as _re
 import sys as _sys
@@ -66,10 +99,6 @@ import GetCellsDB
 # pyodide's matplotlib defaults to a canvas backend that draws into the page;
 # force the file backend so figures can be captured as PNGs instead
 _os.environ.setdefault('MPLBACKEND', 'AGG')
-
-# charts produced by a run: plotly figures as JSON, matplotlib as data URLs
-_quadratic_figures = []
-_quadratic_images = []
 
 async def getCell(x, y):
     return GetCellsDB.getCellValue(x, y)
@@ -85,7 +114,22 @@ async def getCells(p0, p1, first_row_header=False):
         df.columns = df.iloc[0]
         df = df.drop(df.index[0]).reset_index(drop=True)
     return df
+```
 
+## !!steps Subscript syntax through a callable class
+
+`cells` is an *instance*, not a function, and that is what lets it serve two
+call styles. Defining `__call__` keeps `cells((0,0),(3,5))` working, while
+`__getitem__` adds the bracket form that reads like NumPy.
+
+The slice handling is the interesting part. A key of two plain integers is a
+single cell; otherwise each half may be a `slice`, and `.stop - 1` converts
+Python's exclusive upper bound into the inclusive coordinate the sheet uses —
+so `cells[0:3, 0:5]` covers columns 0 through 2. A key that is neither raises
+an `IndexError` whose message shows both accepted forms rather than a generic
+type error.
+
+```ts ! pythonRunner.ts
 class _Cells:
     def __call__(self, p0, p1, first_row_header=False):
         return getCells(p0, p1, first_row_header)
@@ -102,7 +146,26 @@ class _Cells:
         raise IndexError('use cells[x, y] or cells[x0:x1, y0:y1]')
 
 cells = _Cells()
+```
 
+## !!steps Finding imports the runtime does not have
+
+Pyodide ships a fixed set of packages; anything else has to be fetched from
+PyPI. To know what to fetch, the code is parsed with `ast` and every top-level
+module name collected from both `import` and `from ... import` forms, with
+`node.level == 0` excluding relative imports.
+
+The `except SyntaxError` fallback matters more than it looks. Cells routinely
+use top-level `await`, which `ast.parse` rejects outright — so a perfectly
+normal cell would otherwise yield no imports at all and fail later with a
+confusing `ModuleNotFoundError`. When parsing fails, the code is scanned
+textually with a regex instead.
+
+Names are then filtered to those genuinely absent, checking `sys.modules` first
+and `importlib.util.find_spec` second, and returned as JSON because that is the
+simplest thing to hand back across the language boundary.
+
+```ts ! pythonRunner.ts
 def _quadratic_missing_imports(code):
     """Top-level imports that aren't available — candidates for micropip."""
     import ast, importlib.util, json
@@ -130,8 +193,25 @@ def _quadratic_missing_imports(code):
         except (ImportError, ModuleNotFoundError, ValueError):
             missing.append(name)
     return json.dumps(missing)
+```
 
+## !!steps Making fig.show() mean something
 
+`fig.show()` is how plotly is normally used, and under Pyodide it silently does
+nothing — there is no renderer, so the call succeeds and no chart appears. That
+is a bad failure: the user's code looks correct and produces nothing.
+
+The patch replaces `show` on plotly's figure base class with a function that
+appends the figure's JSON to a module-level list, and does the same for
+`plotly.io.show`. A `_quadratic_patched` sentinel keeps a second run from
+re-patching. Both imports sit inside a `try` so the patch is a no-op when
+plotly was never installed.
+
+The figures cross the boundary as JSON rather than images because Pyodide
+cannot rasterize them itself — that job belongs to
+[plotlyImage.ts](/docs/src/lib/python/plotlyImage.ts).
+
+```ts ! pythonRunner.ts
 def _quadratic_patch_plotly():
     """fig.show() has no renderer under pyodide and silently does nothing;
     capture the figure so it can be drawn on the sheet instead."""
@@ -151,12 +231,21 @@ def _quadratic_patch_plotly():
     _pio.show = lambda fig, *a, **k: _quadratic_figures.append(
         fig.to_json() if hasattr(fig, 'to_json') else _pio.to_json(fig)
     )
+```
 
+## !!steps Sweeping up matplotlib figures
 
-def _quadratic_is_figure(value):
-    return type(value).__module__.split('.')[0] == 'plotly' and hasattr(value, 'to_json')
+matplotlib needs no patching, because it accumulates figures in global state.
+After a run, any figure still open is one the cell drew, so each is saved to an
+in-memory buffer and base64-encoded into a data URL — arriving ready to display,
+unlike plotly's JSON.
 
+The guard on `sys.modules` means the whole routine costs nothing when the cell
+never touched matplotlib, and `plt.close('all')` prevents one run's figures
+leaking into the next. `bbox_inches='tight'` trims the surrounding whitespace
+that would otherwise pad the image on the sheet.
 
+```ts ! pythonRunner.ts
 def _quadratic_collect_matplotlib():
     """Any figures left open by the run become PNGs."""
     if 'matplotlib.pyplot' not in _sys.modules:
@@ -170,35 +259,25 @@ def _quadratic_collect_matplotlib():
             'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()
         )
     plt.close('all')
+```
 
+## !!steps Evaluating the cell
 
-def _sanitize(v):
-    import math
-    if v is None:
-        return None
-    if isinstance(v, float):
-        if math.isnan(v) or math.isinf(v):
-            return None
-        return v
-    if isinstance(v, (int, str, bool)):
-        return v
-    return str(v)
+`eval_code_async` does the heavy lifting, and `return_mode='last_expr_or_assign'`
+is what implements the documented rule that a cell's output is its last
+expression *or* assignment — so both a bare `df` and `result = df` produce
+output, matching notebook behavior.
 
-async def _quadratic_run(code):
-    import io, json, traceback
-    from contextlib import redirect_stdout
-    import pyodide.code
+Running with `globals=globals()` puts the cell in the same namespace as the
+prelude, which is how `getCell` and `cells` are in scope without any import.
+`redirect_stdout` captures `print` into a buffer that becomes `std_out`.
 
-    # allow synchronous-looking use of the async-free API (kept for parity)
-    code = _re.sub(r'\\bawait await\\b', 'await', code)
+Errors are caught and returned as data, not raised: `traceback.format_exc()`
+gives the user the Python traceback they expect rather than a JavaScript
+exception. Note stdout captured before the failure is returned too, so prints
+leading up to an error are not lost.
 
-    _quadratic_figures.clear()
-    _quadratic_images.clear()
-    # plotly must be patched before the code runs, since fig.show() happens
-    # during evaluation; importing it here is free once micropip installed it
-    if 'plotly' in code:
-        _quadratic_patch_plotly()
-
+```ts ! pythonRunner.ts
     out = io.StringIO()
     try:
         with redirect_stdout(out):
@@ -216,18 +295,26 @@ async def _quadratic_run(code):
             'std_out': out.getvalue(),
             'std_err': traceback.format_exc(),
         })
+```
 
-    # a figure as the cell's last expression counts as displaying it
-    if _quadratic_is_figure(value):
-        _quadratic_figures.append(value.to_json())
-        value = None
-    try:
-        _quadratic_collect_matplotlib()
-    except Exception:
-        pass
+## !!steps Turning Python objects into a grid block
 
-    array_output = None
-    output_value = None
+The conversion ladder decides what a returned object becomes on the sheet. A
+`DataFrame` spills as rows, with its column names prepended as a header row —
+but only when they are not a default `RangeIndex`, so a frame with no real
+column names does not gain a header of `0, 1, 2`. A `Series` spills as a flat
+list, and an `ndarray` branches on `ndim`.
+
+Two details are load-bearing. The whole block is wrapped in
+`except ModuleNotFoundError`, so a cell that never imported pandas or numpy
+still works — the imports are attempted, not required. And `value = None` after
+each conversion is what stops the object also being stringified into
+`output_value` further down.
+
+`_sanitize` maps `NaN` and infinities to `None` and stringifies anything
+exotic, so nothing unrepresentable reaches the grid.
+
+```ts ! pythonRunner.ts
     try:
         import pandas as pd
         import numpy as np
@@ -245,40 +332,29 @@ async def _quadratic_run(code):
             value = None
     except ModuleNotFoundError:
         pass
+```
 
-    if array_output is None and isinstance(value, (list, tuple)):
-        array_output = [
-            [_sanitize(v) for v in row] if isinstance(row, (list, tuple)) else _sanitize(row)
-            for row in value
-        ]
-        value = None
+## !!steps Booting the runtime once
 
-    if value is not None:
-        if isinstance(value, bool):
-            output_value = 'TRUE' if value else 'FALSE'
-        else:
-            output_value = str(value)
+`loadPromise` memoizes the whole startup so concurrent cells share one
+interpreter rather than each downloading Pyodide.
 
-    return json.dumps({
-        'success': True,
-        'output_value': output_value,
-        'array_output': array_output,
-        'std_out': out.getvalue(),
-        'std_err': None,
-        'figures': list(_quadratic_figures),
-        'images': list(_quadratic_images),
-    })
-`;
+`registerJsModule` is the bridge: it makes `import GetCellsDB` work inside
+Python, backed by JavaScript closures that read the live sheet — and, crucially,
+**record each coordinate into `currentAccessed`** as they go. That is the
+dependency tracking, discovered by observing reads rather than declared. Both
+accessors funnel through `coerce`.
 
-async function loadPython(): Promise<Pyodide> {
-	if (loadPromise) return loadPromise;
-	loadPromise = (async () => {
-		pythonStatus.set({ state: 'loading' });
-		try {
-			const { loadPyodide } = await import(/* @vite-ignore */ PYODIDE_URL);
-			const py = await loadPyodide();
+numpy, pandas and micropip are preloaded because they are near-universal in
+spreadsheet Python, then the prelude is evaluated and the interpreter's version
+published for the status bar. On failure `loadPromise` is cleared, so a
+transient network error does not permanently poison the runtime — the next run
+retries.
+
+```ts ! pythonRunner.ts
 			py.registerJsModule('GetCellsDB', {
 				getCellValue: (x: number, y: number) => {
+					// !mark
 					currentAccessed.push([x, y]);
 					return coerce(currentGetCellValue(x, y));
 				},
@@ -298,25 +374,32 @@ async function loadPython(): Promise<Pyodide> {
 			await py.loadPackage(['numpy', 'pandas', 'micropip']);
 			await py.runPythonAsync(PRELUDE);
 			const version = py.runPython('import sys; sys.version.split()[0]') as string;
+			// !mark
 			pythonStatus.set({ state: 'ready', version });
-			return py;
-		} catch (e) {
-			pythonStatus.set({ state: 'error', error: String(e) });
-			loadPromise = undefined;
-			throw e;
-		}
-	})();
-	return loadPromise;
-}
+```
 
-/** Installs imports that aren't in the pyodide distribution (plotly, …) from
- * PyPI. A failure is left alone: the import itself then raises the usual
- * ModuleNotFoundError, which is a clearer message than anything thrown here. */
+## !!steps Installing packages, and forgiving await
+
+Missing packages are installed one at a time so `detail` can name the current
+one in the status bar — a several-second wait with no feedback otherwise. The
+empty `catch` is a deliberate choice explained in the doc comment: letting the
+install fail silently means the user sees Python's own `ModuleNotFoundError` at
+the import line, which points at their code, rather than a wrapper error
+pointing at the installer.
+
+`attemptFixAwait` addresses the API being async. Users write `cell(0, 0)`
+without `await`, which would yield a coroutine object instead of a value, so a
+lookbehind-guarded regex inserts `await` before the API names when one is not
+already present. The second pass collapses any `await await` the first pass
+produced.
+
+```ts ! pythonRunner.ts
 async function installMissingPackages(py: Pyodide, code: string): Promise<void> {
 	const missing: string[] = JSON.parse(py.globals.get('_quadratic_missing_imports')(code));
 	if (missing.length === 0) return;
 	const micropip = py.pyimport('micropip');
 	for (const name of missing) {
+		// !mark
 		pythonStatus.update((s) => ({ ...s, detail: `Installing ${name}…` }));
 		try {
 			await micropip.install(name);
@@ -329,16 +412,31 @@ async function installMissingPackages(py: Pyodide, code: string): Promise<void> 
 
 /** Insert `await` before the cell-API calls so users can write them synchronously. */
 function attemptFixAwait(code: string): string {
+	// !mark
 	let fixed = code.replace(/(?<!await\s)\b(cells?|c|getCells?|getCell)(\s*[([])/g, 'await $1$2');
 	fixed = fixed.replace(/await\s+await/g, 'await');
 	return fixed;
 }
+```
 
-export async function runPython(
-	code: string,
-	getCellValue: (x: number, y: number) => string | undefined
-): Promise<PythonRunResult> {
-	try {
+## !!steps Orchestrating a run
+
+The public entry point sequences everything: ensure the runtime, point the
+bridge at this run's sheet accessor, reset the accessed list, let Pyodide
+preload packages it recognizes from the imports, install the ones it does not,
+then evaluate.
+
+Afterwards the two chart paths converge. matplotlib images are already PNGs, so
+they win by default; a plotly figure is rasterized on demand through a
+dynamically imported [plotlyImage.ts](/docs/src/lib/python/plotlyImage.ts),
+keeping that library out of the bundle for cells that never chart. A render
+failure becomes a warning rather than failing the cell.
+
+Only the first chart is shown, and producing more earns an explicit warning —
+better than silently dropping them. The outer `catch` still reports
+`cells_accessed`, so dependencies recorded before a failure are not lost.
+
+```ts ! pythonRunner.ts
 		const py = await loadPython();
 		currentGetCellValue = getCellValue;
 		currentAccessed = [];
@@ -351,6 +449,7 @@ export async function runPython(
 		// matplotlib arrives as a PNG already; plotly figures rasterize here
 		const logs: string[] = parsed.std_out ? [parsed.std_out] : [];
 		let imageOutput: string | undefined = parsed.images?.[0];
+		// !mark(1:7)
 		if (!imageOutput && parsed.figures?.length) {
 			try {
 				const { figureToPng } = await import('./plotlyImage');
@@ -361,23 +460,14 @@ export async function runPython(
 		}
 		const extra = (parsed.figures?.length ?? 0) + (parsed.images?.length ?? 0);
 		if (extra > 1) logs.push(`WARNING: showing the first of ${extra} charts`);
+```
 
-		return {
-			success: parsed.success,
-			output_value: parsed.output_value,
-			array_output: parsed.array_output,
-			cells_accessed: currentAccessed,
-			std_out: logs.length ? logs.join('\n') : undefined,
-			std_err: parsed.std_err || undefined,
-			image_output: imageOutput
-		};
-	} catch (e) {
-		return {
-			success: false,
-			output_value: null,
-			cells_accessed: currentAccessed,
-			std_err: `Failed to run Python: ${String(e)}`
-		};
-	}
-}
-````
+</Scrollycoding>
+
+Cells reach this through
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts), which
+supplies the sheet accessor and writes back the spilled block and the recorded
+dependencies. The status store is rendered by
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte), and captured
+charts become sprites via
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts).
