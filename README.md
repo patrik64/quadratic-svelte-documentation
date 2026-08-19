@@ -8,6 +8,10 @@ files are documented as **scrollycoding walkthroughs** (scroll-driven code
 panel with animated token transitions); all other pages are auto-generated and
 embed the full, syntax-highlighted source with a link to the file on GitHub.
 
+## View
+
+live at https://quadratic-svelte-documentation.vercel.app/
+
 ## Run
 
 ```sh
