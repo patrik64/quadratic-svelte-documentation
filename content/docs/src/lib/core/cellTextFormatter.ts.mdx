@@ -1,46 +1,154 @@
 ---
 title: "cellTextFormatter.ts"
-description: "Format a cell's raw value for display according to its CellFormat."
+description: "Display formatting for cell values — four numeric types, each with a subtly different decimal policy, and a guard that never mangles text"
 source: "src/lib/core/cellTextFormatter.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Forty lines turning a cell's stored string into what the grid draws. The
+separation is strict: nothing here ever changes what is stored, so a cell
+holding `1234.5` still holds `1234.5` however it is displayed, and formulas
+reading it see the raw value.
 
-````ts cellTextFormatter.ts -n
-import type { Cell, CellFormat } from './types';
+The one thing worth studying is precision. All four numeric types accept a
+`decimalPlaces` field, and **each interprets it differently** — a difference
+that is invisible until you compare their outputs side by side.
 
-/** Format a cell's raw value for display according to its CellFormat. */
+<Scrollycoding>
+
+## !!steps Three guards before any formatting
+
+The entry point works through progressively narrower reasons to give up.
+
+A missing cell yields an empty string rather than throwing, so callers can
+render sparse regions without checking coordinates first — the grid is infinite
+and mostly empty, so this is the common case, not the exception.
+
+Then the format is inspected for a `textFormat` specifically. A format carrying
+only `bold` returns the raw value, and this check happens **before** the value
+is parsed, so styling a text cell costs nothing.
+
+The last guard is the one that protects data: a blank or unparseable value is
+returned untouched. That is what lets a numeric format sit on a whole column
+without turning its header row into `NaN`.
+
+```ts ! cellTextFormatter.ts
 export function formatCellValue(cell: Cell | undefined, format: CellFormat | undefined): string {
+	// !mark
 	if (!cell) return '';
 	const value = cell.value ?? '';
 	const tf = format?.textFormat;
+	// !mark
 	if (!tf) return value;
 	const n = Number(value);
+	// !mark
 	if (value.trim() === '' || Number.isNaN(n)) return value;
-	switch (tf.type) {
+```
+
+## !!steps Two independent fallbacks in one branch
+
+`NUMBER` looks like ordinary locale formatting, and the detail is that the two
+fraction-digit options fall back **separately**.
+
+Supply `decimalPlaces: 2` and both become 2, so output is padded to exactly two
+places — `1234.5` renders as `1,234.50`, which is what makes a column line up.
+Omit the field entirely and the minimum falls back to `0` while the maximum
+falls back to `2`, giving up to two decimals with no padding: `1234.5` renders
+as `1,234.5`.
+
+So one expression encodes two different policies depending on whether the
+caller specified anything. Writing it as a single bound variable, as the
+currency branch does below, would have lost that.
+
+The locale is fixed to `en-US` rather than following the browser — deliberate,
+since the stored value is not locale-dependent either, and it keeps display
+stable across machines.
+
+```ts ! cellTextFormatter.ts
 		case 'NUMBER':
 			return n.toLocaleString('en-US', {
+				// !mark(1:2)
 				minimumFractionDigits: tf.decimalPlaces ?? 0,
 				maximumFractionDigits: tf.decimalPlaces ?? 2
 			});
+```
+
+## !!steps Currency, always a fixed width
+
+Currency binds its precision to a single variable and uses it for both bounds,
+so the width is always exact — two decimals by default, or whatever was asked
+for including zero.
+
+That is the strictest of the four policies, and the right one here: money in a
+column that sometimes shows `2` and sometimes `2.00` reads as an error.
+
+The symbol is prepended as a plain string rather than going through
+`Intl.NumberFormat`'s currency mode. Simpler, and it accepts any symbol without
+a currency code — but it always places the symbol before the digits, so
+currencies conventionally written with a trailing symbol come out in the
+Anglo-American order.
+
+```ts ! cellTextFormatter.ts
 		case 'CURRENCY': {
+			// !mark
 			const dp = tf.decimalPlaces ?? 2;
 			return `${tf.symbol ?? '$'}${n.toLocaleString('en-US', {
+				// !mark(1:2)
 				minimumFractionDigits: dp,
 				maximumFractionDigits: dp
 			})}`;
 		}
+```
+
+## !!steps Percentages scale, and their decimals are a ceiling
+
+Two things happen here. The value is multiplied by 100, because percentages are
+stored as fractions — a cell showing `25%` holds `0.25`, which is what formulas
+compute with.
+
+The second is the asymmetry. Unlike the two branches above, the minimum is
+hard-coded to `0` and only the maximum comes from `decimalPlaces`, making the
+setting a **ceiling** rather than a fixed width. So with one decimal place
+requested, `0.25` renders as `25%` while `0.333` renders as `33.3%` — the
+column does not align.
+
+Whether that is intended the code does not say, and
+[cellTextFormatter.test.ts](/docs/src/lib/core/cellTextFormatter.test.ts) locks
+the behavior in with an assertion that looks wrong until you know this. Worth
+knowing before assuming the test is stale.
+
+```ts ! cellTextFormatter.ts
 		case 'PERCENTAGE': {
 			const dp = tf.decimalPlaces ?? 1;
+			// !mark
 			return `${(n * 100).toLocaleString('en-US', {
+				// !mark(1:2)
 				minimumFractionDigits: 0,
 				maximumFractionDigits: dp
 			})}%`;
 		}
+```
+
+## !!steps Delegating, defaulting, and the shared predicate
+
+`EXPONENTIAL` hands the whole job to JavaScript's own `toExponential`, so its
+conventions — the `e+3` form, the absence of grouping — are the platform's
+rather than choices made here. It is the one branch that ignores locale
+entirely.
+
+The `default` arm returns the raw value, so a `textFormat` with an unrecognized
+type degrades to no formatting instead of throwing. Combined with the guards at
+the top, there is no input that produces an error.
+
+`isNumericValue` exports the same test the third guard applies, so callers
+needing that decision get it from one place rather than reimplementing the
+blank-versus-`NaN` distinction — which
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) draws when
+deciding what to sum.
+
+```ts ! cellTextFormatter.ts
 		case 'EXPONENTIAL':
+			// !mark
 			return n.toExponential(tf.decimalPlaces ?? 2);
 		default:
 			return value;
@@ -48,6 +156,21 @@ export function formatCellValue(cell: Cell | undefined, format: CellFormat | und
 }
 
 export function isNumericValue(value: string): boolean {
+	// !mark
 	return value.trim() !== '' && !Number.isNaN(Number(value));
 }
-````
+```
+
+</Scrollycoding>
+
+Called from [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) when rasterizing
+each visible cell, so it runs in the render loop — which is why every branch is
+a single formatting call with no allocation beyond the result string.
+
+The formats it reads are set by the Format menu in
+[TopBar.svelte](/docs/src/lib/components/TopBar.svelte) and the command palette,
+stored per cell in
+[Sheet.ts](/docs/src/lib/core/Sheet.ts) and persisted by
+[gridFile.ts](/docs/src/lib/files/gridFile.ts). Because formatting is purely
+presentational, changing a cell's format never triggers recomputation — only a
+redraw.
