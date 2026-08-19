@@ -92,10 +92,17 @@ and the font stack leads with Open Sans to match the cell text measured in
 ## !!steps Reaching through the wrapper element
 
 Styles in a Svelte component are scoped by default, so `:global(...)` is
-required to reach `html` and `body` at all. This second rule handles the
-element SvelteKit renders around the app: the height chain has to be unbroken
-from `html` down to the app container, or `height: 100vh` inside
-[+page.svelte](/docs/src/routes/+page.svelte) would have nothing to sit in.
+required to reach `html` and `body` at all. This second rule aims at the
+wrapper SvelteKit renders around the app, intending to keep the height chain
+unbroken from `html` down to the app container.
+
+In practice neither selector bites. No element in this project carries
+`id="svelte"` — that is a leftover from SvelteKit 1.x — and the `body > div`
+wrapper defined in [app.html](/docs/src/app.html) carries
+`display: contents`, so it generates no box for a height to apply to. Nothing
+breaks, because `.app` in [+page.svelte](/docs/src/routes/+page.svelte) sizes
+itself with `height: 100vh` against the viewport rather than against its
+ancestors.
 
 ```svelte ! +layout.svelte
 <style>

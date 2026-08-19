@@ -1,25 +1,107 @@
 ---
 title: "app.html"
-description: "SvelteKit HTML template that hosts the application."
+description: "The HTML shell SvelteKit fills in — placeholders, the preload attribute, and a wrapper div that generates no box"
 source: "src/app.html"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Every page the app serves is this file with two placeholders substituted. It is
+close to SvelteKit's stock template, and because
+[+layout.ts](/docs/src/routes/+layout.ts) turns the project into a prerendered
+client-only app, this shell is effectively *the* deliverable: the static HTML
+that gets uploaded, with an empty body that the client fills in.
 
-````html app.html -n
+<Scrollycoding>
+
+## !!steps A template, not a page
+
+The outer structure is ordinary HTML, with `lang="en"` on the root and the two
+meta tags every document needs — `charset` first, since the parser needs the
+encoding before it reads much else, and the viewport tag that stops mobile
+browsers rendering at a fake 980px width and scaling down.
+
+What makes it a template rather than a page is that SvelteKit reads this file
+and replaces the `%...%` tokens at build time. It is never served as written.
+
+```html ! app.html
 <!doctype html>
 <html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+	</head>
+</html>
+```
+
+## !!steps Where SvelteKit injects the head
+
+`%sveltekit.head%` is the first substitution point: SvelteKit replaces it with
+the `link` and `script` tags for the app's CSS and JavaScript bundles, plus
+anything a component contributed through `svelte:head` — which here is the
+document title set in
+[+layout.svelte](/docs/src/routes/+layout.svelte).
+
+Its position matters. Sitting last in the head means the project's own meta
+tags are parsed before the framework's assets are discovered.
+
+The `text-scale` meta above it is not a standard meta name and not part of
+SvelteKit's stock template. Nothing in this repository reads it, and no
+behavior in the app depends on it.
+
+```html ! app.html
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
 		%sveltekit.head%
 	</head>
+```
+
+## !!steps Preloading on hover
+
+`data-sveltekit-preload-data="hover"` asks SvelteKit's client router to start
+fetching a route's data as soon as the pointer enters a link to it, buying the
+few hundred milliseconds between hover and click.
+
+It is inherited by every link in the document, which is why it sits on `body` —
+but it is close to inert here. The app has exactly one route, and its links
+point outward to GitHub and the live site rather than to other pages, so there
+is nothing for the router to preload. This is stock SvelteKit boilerplate that
+a single-page app never exercises.
+
+```html ! app.html
+	<body data-sveltekit-preload-data="hover">
+	</body>
+```
+
+## !!steps A wrapper that generates no box
+
+The second substitution point is where the application is mounted. SvelteKit
+wraps it in a div carrying `display: contents`, a value that makes the element
+generate no box at all: its children are laid out as though they were direct
+children of `body`. That is the point — the wrapper gives SvelteKit a stable
+mount target without inserting a layout box that would disturb the app's own
+flex layout.
+
+It also has a consequence worth knowing. Because the element produces no box,
+sizing it does nothing, so the `body > div` half of the height rule in
+[+layout.svelte](/docs/src/routes/+layout.svelte) has no effect on it — and the
+`#svelte` half matches nothing, since no element in this project carries that
+id (it is a leftover from SvelteKit 1.x). The app is sized regardless because
+`.app` in [+page.svelte](/docs/src/routes/+page.svelte) uses `height: 100vh`,
+which is measured against the viewport and needs no unbroken chain of ancestor
+heights.
+
+```html ! app.html
 	<body data-sveltekit-preload-data="hover">
 		<div style="display: contents">%sveltekit.body%</div>
 	</body>
-</html>
-````
+```
+
+</Scrollycoding>
+
+One omission relative to SvelteKit's stock template: the default
+`<link rel="icon">` line has been removed and not replaced. Nothing in `src/`,
+`static/` or `vite.config.ts` references an icon, so the browser falls back to
+requesting `/favicon.ico`; the `favicon.svg` that ships in `src/lib/assets/` is
+never referenced.
