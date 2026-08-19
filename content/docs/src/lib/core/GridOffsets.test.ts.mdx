@@ -1,57 +1,144 @@
 ---
 title: "GridOffsets.test.ts"
-description: "Unit tests for GridOffsets.ts."
+description: "Vitest coverage for cell-to-pixel mapping — sparse defaults, negative coordinates, boundary round-trips, and the sizing rules"
 source: "src/lib/core/GridOffsets.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Eight tests over [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts), the class
+that converts between cell coordinates and pixels. Because everything drawn on
+the canvas goes through it, an error here would not throw — it would quietly
+misplace cells, cursors and the floating editor by a few pixels.
 
-````ts GridOffsets.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { GridOffsets } from './GridOffsets';
-import { CELL_HEIGHT, CELL_WIDTH } from './types';
+The tests are written against `CELL_WIDTH` and `CELL_HEIGHT` rather than
+literal numbers, so changing a default in
+[types.ts](/docs/src/lib/core/types.ts) does not invalidate the suite.
 
-describe('GridOffsets', () => {
+<Scrollycoding>
+
+## !!steps Sparse storage means defaults everywhere
+
+The first test states the sparse contract: a column and a row nobody has
+touched still report a size. The grid is infinite, so the maps hold only
+exceptions and everything else falls back.
+
+Querying a *negative* row for the default is deliberate. Nothing about the
+fallback should depend on which side of the origin a coordinate sits, and using
+`-3` here rather than another positive index makes that an assertion rather than
+an assumption.
+
+```ts ! GridOffsets.test.ts
 	it('returns defaults for untouched columns and rows', () => {
 		const g = new GridOffsets();
 		expect(g.getColumnWidth(7)).toBe(CELL_WIDTH);
+		// !mark
 		expect(g.getRowHeight(-3)).toBe(CELL_HEIGHT);
 	});
+```
 
+## !!steps Positions accumulate across mixed sizes
+
+Setting one custom width and then checking three positions is what proves
+`getColumnX` accumulates rather than multiplies.
+
+The three assertions are chosen so each isolates a different property. Column 0
+is the origin and must be exactly `0` — the anchor the whole coordinate system
+hangs from. Column 1 sits after one *default* column, so its position is
+unaffected by its own custom width. Column 2 sits after a default and a custom
+one, and only a real accumulation produces `CELL_WIDTH + 150`.
+
+An implementation that multiplied index by a default width would pass the first
+two and fail the third.
+
+```ts ! GridOffsets.test.ts
 	it('accumulates custom widths in getColumnX', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(1, 150);
+		// !mark(1:3)
 		expect(g.getColumnX(0)).toBe(0);
 		expect(g.getColumnX(1)).toBe(CELL_WIDTH);
 		expect(g.getColumnX(2)).toBe(CELL_WIDTH + 150);
 	});
+```
 
+## !!steps Walking the other way from the origin
+
+Negative coordinates use a separate code path — accumulating downward instead
+of upward — so they get their own test.
+
+The first two assertions pin the sign convention: column `-1` *starts* at
+`-CELL_WIDTH` and ends at zero, so the column immediately left of the origin
+occupies the space just before it rather than after. Row `-2` confirms the same
+logic scales.
+
+The third line is the interesting one: after giving column `-1` a custom width
+of 60, its left edge moves to `-60`. That is only correct if the negative walk
+consults the same per-column overrides as the positive one — a plausible bug
+would be for the negative branch to use defaults throughout.
+
+```ts ! GridOffsets.test.ts
 	it('handles negative coordinates', () => {
 		const g = new GridOffsets();
 		expect(g.getColumnX(-1)).toBe(-CELL_WIDTH);
 		expect(g.getRowY(-2)).toBe(-2 * CELL_HEIGHT);
 		g.setColumnWidth(-1, 60);
+		// !mark
 		expect(g.getColumnX(-1)).toBe(-60);
 	});
+```
 
+## !!steps Both edges of every cell resolve correctly
+
+This is the strongest test in the file: for five columns spanning both sides of
+the origin, it converts an index to a position and back.
+
+Each iteration checks two points, and the second is what makes it rigorous.
+`left` is the cell's first pixel; `left + width - 1` is its **last** pixel. A
+hit-test that included one pixel too many would return the next column for that
+second assertion, which is exactly the off-by-one that would make clicking near
+a boundary select the wrong cell.
+
+Column `2` carries a custom width of 40, so the loop crosses a non-uniform
+region rather than a regular grid. Rows get a shorter version of the same check
+in both directions.
+
+```ts ! GridOffsets.test.ts
 	it('roundtrips world coordinates through getColumnIndex/getRowIndex', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(2, 40);
 		for (const col of [-3, -1, 0, 2, 5]) {
 			const left = g.getColumnX(col);
 			expect(g.getColumnIndex(left)).toBe(col);
+			// !mark
 			expect(g.getColumnIndex(left + g.getColumnWidth(col) - 1)).toBe(col);
 		}
 		expect(g.getRowIndex(g.getRowY(4))).toBe(4);
 		expect(g.getRowIndex(g.getRowY(-4))).toBe(-4);
 	});
+```
 
+## !!steps Two rules that keep the store honest
+
+The clamp test is small but guards a real failure: a column dragged to five
+pixels comes back as ten. Without a floor, a column resized to zero width would
+become impossible to grab again — its edge and its body would occupy the same
+pixel.
+
+The second test covers the sparse invariant from the other direction. Setting a
+column back to the default width, or a row to `undefined`, does not store that
+value — it **deletes** the entry, leaving the export empty. That keeps a file
+that was resized and then reset identical to one that never was, so
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) does not accumulate no-op
+entries over a document's life.
+
+The two paths are checked separately because they are separate branches:
+matching the default, and being explicitly cleared.
+
+```ts ! GridOffsets.test.ts
 	it('clamps sizes to a 10px minimum', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(0, 5);
+		// !mark
 		expect(g.getColumnWidth(0)).toBe(10);
 	});
 
@@ -59,17 +146,38 @@ describe('GridOffsets', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(0, 200);
 		g.setColumnWidth(0, CELL_WIDTH);
+		// !mark
 		expect(g.exportColumns()).toEqual([]);
 		g.setRowHeight(1, 50);
 		g.setRowHeight(1, undefined);
 		expect(g.exportRows()).toEqual([]);
 	});
+```
 
+## !!steps A round trip through serialization, and the composite
+
+The export/import test builds one instance, serializes it, and loads the result
+into a *second* instance — which is what makes it a genuine round trip rather
+than a self-consistency check. Using a negative row index confirms the sign
+survives the `id`/`size` record shape that lands in a `.grid` file.
+
+The last test covers `getCellRect`, the method everything actually calls. Its
+value is that it checks position and size *together*: `x` and `y` come from the
+accumulated walk while `w` and `h` come from the lookups, so a rectangle built
+from mismatched sources would show up here even though each part is correct
+alone.
+
+That rectangle is what [CellInput.svelte](/docs/src/lib/components/CellInput.svelte)
+positions itself with and what [PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts)
+draws into — the reason the DOM overlay and the canvas agree on where a cell is.
+
+```ts ! GridOffsets.test.ts
 	it('exports and imports headings', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(3, 120);
 		g.setRowHeight(-1, 42);
 
+		// !mark(1:2)
 		const g2 = new GridOffsets();
 		g2.importHeadings(g.exportColumns(), g.exportRows());
 		expect(g2.getColumnWidth(3)).toBe(120);
@@ -80,7 +188,20 @@ describe('GridOffsets', () => {
 		const g = new GridOffsets();
 		g.setColumnWidth(1, 80);
 		g.setRowHeight(1, 30);
+		// !mark
 		expect(g.getCellRect(1, 1)).toEqual({ x: CELL_WIDTH, y: CELL_HEIGHT, w: 80, h: 30 });
 	});
-});
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. Between them these cover every public method of the class
+except `getRowY` and `getRowIndex` in isolation — both are exercised only
+alongside their column counterparts, which is reasonable given the two axes are
+implemented symmetrically.
+
+What no unit test can cover is the interaction that motivates the class: that a
+resize dragged in [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte)
+writes here directly for responsiveness and is then replayed as a transaction
+through [SheetController.ts](/docs/src/lib/core/SheetController.ts) so undo sees
+one operation.
