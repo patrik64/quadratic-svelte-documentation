@@ -1,35 +1,76 @@
 ---
 title: "DropdownMenu.svelte"
-description: "The DropdownMenu Svelte component."
+description: "The reusable menu primitive behind the menubar — click-outside dismissal, click delegation, and global styles for snippet content"
 source: "src/lib/components/DropdownMenu.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+A small, generic dropdown: a trigger button and a panel that appears beneath
+it. It holds no application state and knows nothing about spreadsheets — the
+menu contents are passed in as a snippet by whoever uses it, which today is
+[TopBar.svelte](/docs/src/lib/components/TopBar.svelte) and its seven menubar
+menus.
 
-````svelte DropdownMenu.svelte -n
+Most of the file is styling, and that turns out to be the interesting part: the
+rules for menu items live here rather than in the parent, which takes some
+arranging in Svelte.
+
+<Scrollycoding>
+
+## !!steps A label that can be text or markup
+
+The props are minimal, but `label` has a union type worth noticing: a plain
+string, or a `Snippet`. Most menubar entries are just a word, and typing the
+common case as `string` avoids forcing every caller to wrap `File` in snippet
+syntax — while still allowing markup where an icon or a caret is needed.
+
+`align` exists for the one case where a menu sits near the right edge of the
+window; `open` is the only piece of state, and `rootEl` is captured for the
+click-outside test.
+
+```svelte ! DropdownMenu.svelte
 <script lang="ts">
-	import type { Snippet } from 'svelte';
-
 	let {
 		label,
 		title,
 		children,
 		align = 'left'
+		// !mark
 	}: { label: Snippet | string; title?: string; children: Snippet; align?: 'left' | 'right' } =
 		$props();
 
 	let open = $state(false);
 	let rootEl: HTMLDivElement | undefined = $state();
+</script>
+```
 
+## !!steps Closing on a click elsewhere
+
+A menu has to close when you click away from it, which needs a document-level
+listener rather than anything the component's own markup can express.
+
+The test is containment: if the menu is open and the event target is not inside
+`rootEl`, close. Checking `open` first means the listener costs nothing while
+the menu is shut.
+
+`mousedown` rather than `click` is the deliberate choice. It fires at the start
+of the interaction, so the menu is already closed by the time a click lands on
+whatever is underneath — with `click`, the press and release would both happen
+before dismissal and the panel would appear to linger.
+
+The effect's returned function is the cleanup Svelte runs on unmount, which is
+what keeps a destroyed menu from leaving a listener behind.
+
+```svelte ! DropdownMenu.svelte
+<script lang="ts">
 	function onWindowClick(e: MouseEvent): void {
+		// !mark
 		if (open && rootEl && !rootEl.contains(e.target as Node)) open = false;
 	}
 
 	$effect(() => {
 		window.addEventListener('mousedown', onWindowClick);
+		// !mark
 		return () => window.removeEventListener('mousedown', onWindowClick);
 	});
 
@@ -37,7 +78,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		open = false;
 	}
 </script>
+```
 
+## !!steps Closing from inside, by delegation
+
+The trigger toggles, and `class:active` keeps it looking pressed while the
+panel is open — the same background the hover state uses, so an open menu reads
+as engaged rather than merely hovered.
+
+The panel's own `onclick` is the neat part: **any** click inside it closes the
+menu. Because the event bubbles up from whichever menu item was pressed, the
+seventy-odd items in [TopBar.svelte](/docs/src/lib/components/TopBar.svelte)
+need no closing logic of their own — they just do their thing and the panel
+dismisses itself.
+
+The consequence is that a menu cannot hold a control you interact with without
+dismissing it, such as a checkbox you toggle repeatedly. For a menubar of
+one-shot commands that is the right trade.
+
+```svelte ! DropdownMenu.svelte
 <div class="dropdown" bind:this={rootEl}>
 	<button class="trigger" {title} onclick={() => (open = !open)} class:active={open}>
 		{#if typeof label === 'string'}{label}{:else}{@render label()}{/if}
@@ -49,28 +108,25 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		</div>
 	{/if}
 </div>
+```
 
+## !!steps Anchoring the panel, and releasing it
+
+Positioning is the classic pairing: `position: relative` on the wrapper,
+`position: absolute` on the panel, so `top: 100%` places it directly under the
+trigger regardless of where the trigger sits.
+
+The `max-height` and `overflow-y` matter for the longer menus — Format in
+particular — keeping a tall panel inside the viewport instead of running off the
+bottom of the screen.
+
+The right-aligned variant carries its own explanation in the source, and it is a
+real CSS trap: an absolutely positioned box with **both** `left` and `right` set
+stretches to span between them rather than hugging either edge. So switching
+alignment has to release `left` back to `auto`, not merely add `right: 0`.
+
+```svelte ! DropdownMenu.svelte
 <style>
-	.dropdown {
-		position: relative;
-		display: inline-flex;
-	}
-	.trigger {
-		background: none;
-		border: none;
-		font: inherit;
-		color: inherit;
-		cursor: pointer;
-		padding: 0.25rem 0.5rem;
-		border-radius: 3px;
-		display: inline-flex;
-		align-items: center;
-		gap: 0.25rem;
-	}
-	.trigger:hover,
-	.trigger.active {
-		background: var(--panel-2);
-	}
 	.panel {
 		position: absolute;
 		top: 100%;
@@ -93,6 +149,29 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		left: auto;
 		right: 0;
 	}
+</style>
+```
+
+## !!steps Styling content this component never wrote
+
+Here is the arrangement the file is really built around. The menu items are
+written by the *parent* and passed in as a snippet, so Svelte scopes their
+classes to the parent's stylesheet — a plain `.menu-item` rule here would be
+compiled with this component's scope hash and match nothing.
+
+Wrapping each selector in `:global()` removes the hash so the rule applies to
+whatever lands inside. Keeping the `.panel` prefix outside the `:global()` is
+what stops it becoming genuinely global: the rules still only apply to elements
+inside a dropdown panel, which is the useful middle ground.
+
+The payoff is that a parent writes `<button class="menu-item">` and gets the
+full appearance — layout, hover, disabled treatment — without repeating any of
+it. The same problem appears elsewhere in the app with the `syn-*` classes in
+[app.css](/docs/src/app.css), solved there by going fully global because the
+class names are built at runtime.
+
+```svelte ! DropdownMenu.svelte
+<style>
 	.panel :global(button.menu-item) {
 		display: flex;
 		width: 100%;
@@ -115,6 +194,24 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		color: var(--faint-2);
 		cursor: default;
 	}
+</style>
+```
+
+## !!steps A small vocabulary for menu content
+
+Three more global rules complete the contract, and together they amount to a
+tiny markup language the parent writes against: `menu-divider` for a rule
+between groups, `menu-header` for a small uppercase caption, and `shortcut` for
+the muted key hint that the item's `space-between` pushes to the right.
+
+Notice `:hover:not(:disabled)` in the previous step and the `:disabled` rule
+here: disabled items are dimmed and take the default cursor, and are explicitly
+excluded from the hover highlight, so a greyed-out entry never looks clickable.
+That is behavior the parent gets for free by setting the standard `disabled`
+attribute.
+
+```svelte ! DropdownMenu.svelte
+<style>
 	.panel :global(.menu-divider) {
 		border-top: 1px solid var(--border-light);
 		margin: 4px 0;
@@ -131,4 +228,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		font-size: 0.75rem;
 	}
 </style>
-````
+```
+
+</Scrollycoding>
+
+Every colour comes from the custom properties in
+[app.css](/docs/src/app.css), so menus follow the theme without this component
+knowing a theme exists.
+
+One loose end: `close()` is exported — in Svelte 5 that makes it callable on a
+component instance obtained with `bind:this` — but nothing in the project calls
+it. [TopBar.svelte](/docs/src/lib/components/TopBar.svelte) never binds to a
+menu instance, relying entirely on the panel's own click delegation instead. The
+export is a usable escape hatch for a menu that needs to close itself from
+outside, currently unused.
+
+Note also that [GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte)
+does *not* use this component despite being a menu — it positions itself at the
+pointer rather than under a trigger, so it implements its own container and does
+not share these styles.
