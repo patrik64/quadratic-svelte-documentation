@@ -1,296 +1,85 @@
 ---
 title: "state.svelte.ts"
-description: "Central reactive app state — the Svelte-runes equivalent of Quadratic's Recoil atoms (gridInteractionState, editorInteractionState, gridSettings)."
+description: "The reactive store and the app's action layer — runes for UI state, a redraw counter for the model, and every mutation as a transaction"
 source: "src/lib/state.svelte.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The largest file in the project, and the hinge everything turns on. It holds
+two things that could have been separate: the reactive UI state, and the
+functions that mutate the document.
 
-````ts state.svelte.ts -n
-// Central reactive app state — the Svelte-runes equivalent of Quadratic's
-// Recoil atoms (gridInteractionState, editorInteractionState, gridSettings).
+Keeping them together is what makes the app's structure work — a keyboard
+shortcut, a menu entry and a context-menu item all call the same exported
+function, so behavior lives in one place and the three entry points stay thin.
 
-import { findSheetRefs } from './formulas/sheetRefs';
-import { Sheet } from './core/Sheet';
-import { SheetController } from './core/SheetController';
-import { updateCellAndDCells } from './core/updateCellAndDCells';
-import { formatCellValue } from './core/cellTextFormatter';
-import { seriesNext } from './core/series';
-import { measureWrapped } from './grid/pixi/measureText';
-import {
-	CELL_HEIGHT,
-	CELL_WIDTH,
-	HEADING_SIZE,
-	isCodeCellType,
-	type Cell,
-	type CellAlignment,
-	type CellBorders,
-	type CellFormat,
-	type CellTextFormat,
-	type CellType,
-	type CellWrapping,
-	type Coordinate
-} from './core/types';
-import {
-	DEFAULT_FILE_NAME,
-	deleteStoredFile,
-	downloadGridFile,
-	exportGridFile,
-	importGridFile,
-	loadCurrentFile,
-	loadStoredFile,
-	parseCSV,
-	saveCurrentFile,
-	saveStoredFile
-} from './files/gridFile';
+<Scrollycoding>
 
-export type EditorMode = 'FORMULA' | 'PYTHON' | 'JAVASCRIPT';
-export type PanMode = 'disabled' | 'enabled' | 'dragging';
+## !!steps A store built from runes, exposed through accessors
 
-export const sheetController = new SheetController();
+`createState` declares each piece as a `$state` rune inside a closure and
+returns an object of getters and setters. That is the standard Svelte 5 pattern
+for a module-level store: runes cannot be exported directly, but an object
+whose properties read them can be.
 
-interface MultiCursor {
-	originPosition: Coordinate;
-	terminalPosition: Coordinate;
-}
+The state splits into four groups — interaction (cursor, selection, whether the
+cell input is open), editor and dialog visibility, user settings, and the
+viewport.
 
+The theme initializer is the one piece of logic here, reading `localStorage`
+and applying `data-theme` to the document immediately so there is no flash of
+the wrong theme. Note it defaults to `'light'` with no `prefers-color-scheme`
+check, despite what the comment in [app.css](/docs/src/app.css) claims.
+
+```ts ! state.svelte.ts
 function createState() {
 	// ---- interaction state ----
+	// !mark(1:3)
 	let cursorPosition = $state<Coordinate>({ x: 0, y: 0 });
 	let keyboardMovePosition = $state<Coordinate>({ x: 0, y: 0 });
 	let multiCursor = $state<MultiCursor | undefined>(undefined);
 	let showInput = $state(false);
 	let inputInitialValue = $state('');
 	let panMode = $state<PanMode>('disabled');
-
-	// ---- editor interaction state ----
-	let showCellTypeMenu = $state(false);
-	let showCodeEditor = $state(false);
-	let showCommandPalette = $state(false);
-	let showGoToMenu = $state(false);
-	let showFileMenu = $state(false);
-	let showFormulaDocs = $state(false);
-	let showSearch = $state(false);
-	let searchAllSheets = $state(false);
-	let pendingEditorInsert = $state('');
-	let pendingInsertIsRef = $state(false);
-	let editorMode = $state<EditorMode>('PYTHON');
-	let editorCell = $state<Coordinate>({ x: 0, y: 0 });
-
+	// ...
 	// ---- settings ----
 	// light by default; dark only when the user chose it (View → Dark theme)
 	const storedTheme =
 		typeof localStorage !== 'undefined'
 			? (localStorage.getItem('quadratic-theme') as 'light' | 'dark' | null)
 			: null;
+	// !mark
 	let theme = $state<'light' | 'dark'>(storedTheme ?? 'light');
 	if (typeof document !== 'undefined') document.documentElement.dataset.theme = theme;
-	let showHeadings = $state(true);
-	let showGridAxes = $state(true);
-	let showGridLines = $state(true);
-	let showCellTypeOutlines = $state(true);
-	// letters on column headings by default, like the current original;
-	// View → "Show A1 notation" toggles back to raw numeric coordinates
-	let showA1Notation = $state(true);
-	let presentationMode = $state(false);
+```
 
-	// ---- viewport (world coords of canvas top-left, scale) ----
-	let viewport = $state({ x: -HEADING_SIZE - 2, y: -HEADING_SIZE - 2, scale: 1 });
+## !!steps The counter that stands in for a reactive model
 
-	// ---- file ----
-	let filename = $state(DEFAULT_FILE_NAME);
-	let fileId = $state<string>(crypto.randomUUID());
+The spreadsheet itself — [Sheet.ts](/docs/src/lib/core/Sheet.ts) and its maps —
+is deliberately *not* reactive. Wrapping thousands of cells in Svelte proxies
+would cost far more than it returns.
 
-	// autosave health, shown in the BottomBar when something goes wrong
-	let saveError = $state('');
+`redraw` is the substitute: a single integer bumped by `markDirty` after any
+non-reactive mutation. Components that need to react to sheet content read it —
+the `void app.redraw` line that appears in
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte),
+[SearchBar.svelte](/docs/src/lib/components/SearchBar.svelte) and
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte) — turning one
+coarse signal into a dependency they can subscribe to.
 
+It is deliberately coarse. Any change invalidates every reader, which is
+acceptable because the expensive consumer, the canvas, redraws from dirty flags
+of its own rather than from this.
+
+```ts ! state.svelte.ts
 	// bump to force canvas redraw after non-reactive sheet mutations
+	// !mark
 	let redraw = $state(0);
-
-	return {
-		get cursorPosition() {
-			return cursorPosition;
-		},
-		set cursorPosition(v) {
-			cursorPosition = v;
-		},
-		get keyboardMovePosition() {
-			return keyboardMovePosition;
-		},
-		set keyboardMovePosition(v) {
-			keyboardMovePosition = v;
-		},
-		get multiCursor() {
-			return multiCursor;
-		},
-		set multiCursor(v) {
-			multiCursor = v;
-		},
-		get showInput() {
-			return showInput;
-		},
-		set showInput(v) {
-			showInput = v;
-		},
-		get inputInitialValue() {
-			return inputInitialValue;
-		},
-		set inputInitialValue(v) {
-			inputInitialValue = v;
-		},
-		get panMode() {
-			return panMode;
-		},
-		set panMode(v) {
-			panMode = v;
-		},
-		get showCellTypeMenu() {
-			return showCellTypeMenu;
-		},
-		set showCellTypeMenu(v) {
-			showCellTypeMenu = v;
-		},
-		get showCodeEditor() {
-			return showCodeEditor;
-		},
-		set showCodeEditor(v) {
-			showCodeEditor = v;
-		},
-		get showCommandPalette() {
-			return showCommandPalette;
-		},
-		set showCommandPalette(v) {
-			showCommandPalette = v;
-		},
-		get showGoToMenu() {
-			return showGoToMenu;
-		},
-		set showGoToMenu(v) {
-			showGoToMenu = v;
-		},
-		get showFileMenu() {
-			return showFileMenu;
-		},
-		set showFileMenu(v) {
-			showFileMenu = v;
-		},
-		get showFormulaDocs() {
-			return showFormulaDocs;
-		},
-		set showFormulaDocs(v) {
-			showFormulaDocs = v;
-		},
-		get showSearch() {
-			return showSearch;
-		},
-		set showSearch(v) {
-			showSearch = v;
-		},
-		get searchAllSheets() {
-			return searchAllSheets;
-		},
-		set searchAllSheets(v) {
-			searchAllSheets = v;
-		},
-		get pendingEditorInsert() {
-			return pendingEditorInsert;
-		},
-		set pendingEditorInsert(v) {
-			pendingEditorInsert = v;
-		},
-		get pendingInsertIsRef() {
-			return pendingInsertIsRef;
-		},
-		set pendingInsertIsRef(v) {
-			pendingInsertIsRef = v;
-		},
-		get editorMode() {
-			return editorMode;
-		},
-		set editorMode(v) {
-			editorMode = v;
-		},
-		get editorCell() {
-			return editorCell;
-		},
-		set editorCell(v) {
-			editorCell = v;
-		},
-		get showHeadings() {
-			return showHeadings;
-		},
-		set showHeadings(v) {
-			showHeadings = v;
-		},
-		get showGridAxes() {
-			return showGridAxes;
-		},
-		set showGridAxes(v) {
-			showGridAxes = v;
-		},
-		get showGridLines() {
-			return showGridLines;
-		},
-		set showGridLines(v) {
-			showGridLines = v;
-		},
-		get showCellTypeOutlines() {
-			return showCellTypeOutlines;
-		},
-		set showCellTypeOutlines(v) {
-			showCellTypeOutlines = v;
-		},
-		get theme() {
-			return theme;
-		},
-		set theme(v) {
-			theme = v;
-			localStorage.setItem('quadratic-theme', v);
-			document.documentElement.dataset.theme = v;
-			pixiRef.current?.setTheme(v);
-		},
-		get showA1Notation() {
-			return showA1Notation;
-		},
-		set showA1Notation(v) {
-			showA1Notation = v;
-		},
-		get presentationMode() {
-			return presentationMode;
-		},
-		set presentationMode(v) {
-			presentationMode = v;
-		},
-		get viewport() {
-			return viewport;
-		},
-		set viewport(v) {
-			viewport = v;
-		},
-		get filename() {
-			return filename;
-		},
-		set filename(v) {
-			filename = v;
-		},
-		get fileId() {
-			return fileId;
-		},
-		set fileId(v) {
-			fileId = v;
-		},
-		get saveError() {
-			return saveError;
-		},
-		set saveError(v) {
-			saveError = v;
-		},
+	// ...
 		get redraw() {
 			return redraw;
 		},
+		// !mark
 		markDirty() {
 			redraw++;
 		}
@@ -298,32 +87,61 @@ function createState() {
 }
 
 export const app = createState();
+```
 
+## !!steps One hook wires the model to the UI and the disk
+
+`onChange` on the controller is assigned exactly once, here, and it does both
+jobs that must follow any mutation: signal the UI, and persist.
+
+The autosave is **debounced at 300ms** with a cleared timer, so typing a row of
+values produces one write rather than one per cell — important because each
+write serializes the entire document through
+[gridFile.ts](/docs/src/lib/files/gridFile.ts).
+
+The outcome is fed back into the store. A success clears `saveError`, a failure
+records it, and [BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte)
+surfaces that in the status bar — the only way a user would learn that their
+work has stopped being saved.
+
+```ts ! state.svelte.ts
 // persist + redraw on any model change
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 sheetController.onChange = () => {
 	app.markDirty();
+	// !mark(1:2)
 	clearTimeout(saveTimer);
 	saveTimer = setTimeout(() => {
 		void saveCurrentFile(exportGridFile(sheetController, app.filename, app.fileId))
 			.then(() => (app.saveError = ''))
 			.catch((e) => {
+				// !mark
 				app.saveError = String(e);
 				console.error('autosave failed:', e);
 			});
 	}, 300);
 };
+```
 
-// ------------------------------------------------------------------ helpers
+## !!steps Selection as a rectangle, always
 
-export function clearSelection(): void {
-	app.multiCursor = undefined;
-}
+`getSelectionRect` is called by nearly every action in the file, and its value
+is that it erases a distinction callers would otherwise repeat.
 
+When a range is selected it normalizes the two corners; when only a cursor
+exists it returns a one-cell rectangle. So `setBorders`, `copySelection`,
+`deleteColumns` and the rest are written once against a rectangle, and the
+single-cell case needs no branch anywhere.
+
+This is why commands like "Delete row(s)" work identically whether you selected
+a block or just placed the cursor.
+
+```ts ! state.svelte.ts
 export function getSelectionRect(): { x0: number; y0: number; x1: number; y1: number } {
 	if (app.multiCursor) {
 		const { originPosition: o, terminalPosition: t } = app.multiCursor;
 		return {
+			// !mark(1:4)
 			x0: Math.min(o.x, t.x),
 			y0: Math.min(o.y, t.y),
 			x1: Math.max(o.x, t.x),
@@ -331,20 +149,39 @@ export function getSelectionRect(): { x0: number; y0: number; x1: number; y1: nu
 		};
 	}
 	const c = app.cursorPosition;
+	// !mark
 	return { x0: c.x, y0: c.y, x1: c.x, y1: c.y };
 }
+```
 
-// ------------------------------------------------------------------ editing
+## !!steps Committing a value, or deleting by emptiness
 
+`commitCellValue` is what the floating editor calls on close, and it treats an
+empty string as a deletion rather than as a value — matching the spreadsheet
+convention that clearing a cell removes it.
+
+Both paths run through
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts), so writing
+a value and clearing one both trigger the same dependent recomputation. The
+whole thing is wrapped in one transaction, which is why a commit that cascades
+into ten recalculated cells still undoes in a single step.
+
+The trailing autofit call handles wrapped text: a longer value in a wrapping
+cell grows its row, and doing it inside the open transaction means the resize
+undoes together with the edit.
+
+```ts ! state.svelte.ts
 export async function commitCellValue(x: number, y: number, value: string): Promise<void> {
 	const sheet = sheetController.sheet;
 	sheetController.startTransaction();
+	// !mark
 	if (value.trim() === '') {
 		const existing = sheet.getCell(x, y);
 		if (existing) {
 			await updateCellAndDCells({
 				starting_cells: [existing],
 				sheetController,
+				// !mark
 				delete_starting_cells: true
 			});
 		}
@@ -361,124 +198,58 @@ export async function commitCellValue(x: number, y: number, value: string): Prom
 	}
 	sheetController.endTransaction();
 }
+```
 
-export async function saveCellCode(
-	x: number,
-	y: number,
-	mode: EditorMode,
-	code: string
-): Promise<void> {
-	const existing = sheetController.sheet.getCell(x, y);
-	const cell: Cell = {
-		...(existing && existing.type === mode ? existing : {}),
-		x,
-		y,
-		type: mode,
-		value: existing?.value ?? '',
-		last_modified: new Date().toISOString()
-	};
-	if (mode === 'FORMULA') cell.formula_code = code;
-	else if (mode === 'JAVASCRIPT') cell.javascript_code = code;
-	else cell.python_code = code;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: [cell], sheetController });
-	sheetController.endTransaction();
-}
+## !!steps Undo rebuilds the graph it cannot restore
 
-export async function deleteCellsInRect(
-	x0: number,
-	y0: number,
-	x1: number,
-	y1: number
-): Promise<void> {
-	const cells = sheetController.sheet.getCellsInRect({ left: x0, top: y0, right: x1, bottom: y1 });
-	if (cells.length === 0) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({
-		starting_cells: cells,
-		sheetController,
-		delete_starting_cells: true
-	});
-	sheetController.endTransaction();
-}
+Undo and redo delegate to the controller and then do one extra thing:
+rebuild the dependency graph.
 
+That is necessary because the transaction system reverses *cells*, not the
+index derived from them. Restoring a cell restores its `evaluation_result` and
+therefore its recorded reads, so the graph can be regenerated — which is
+cheaper and more reliable than trying to capture and invert graph edges as part
+of every operation.
+
+It is the practical payoff of treating that graph as a discardable cache, as
+described on [Sheet.ts](/docs/src/lib/core/Sheet.ts).
+
+```ts ! state.svelte.ts
 export function undo(): void {
 	sheetController.undo();
+	// !mark
 	sheetController.sheet.rebuildDependencies();
 }
+```
 
-export function redo(): void {
-	sheetController.redo();
-	sheetController.sheet.rebuildDependencies();
-}
+## !!steps A format painter that clears as well as paints
 
-// ------------------------------------------------------------------ formatting
+The format painter stores a two-dimensional snapshot, deep-copied so later
+edits to the source cannot change what is pasted.
 
-function forEachSelectedCell(fn: (x: number, y: number) => void): void {
-	const { x0, y0, x1, y1 } = getSelectionRect();
-	for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) fn(x, y);
-}
+The doc comment explains the choice that makes it a painter rather than a
+merge: an `undefined` entry means "explicitly unformatted", and pasting it
+**clears** the target's format. Copying a plain cell and painting it over a
+bold one removes the bold, which is what a format painter is supposed to do —
+a merge would leave it.
 
-export function setFormat(update: Partial<CellFormat>): void {
-	sheetController.startTransaction();
-	forEachSelectedCell((x, y) => {
-		const existing = sheetController.sheet.getFormat(x, y) ?? { x, y };
-		sheetController.execute({ type: 'setFormat', x, y, format: { ...existing, ...update, x, y } });
-	});
-	sheetController.endTransaction();
-}
+Pasting tiles the pattern with modulo indexing, so a 2×2 pattern painted over a
+6×6 selection repeats. And because the span is the larger of pattern and
+selection, painting into a single cell still lays down the whole pattern —
+stated in the comment as Excel behavior.
 
-export function getCursorFormat(): CellFormat | undefined {
-	return sheetController.sheet.getFormat(app.cursorPosition.x, app.cursorPosition.y);
-}
-
-export function toggleBold(): void {
-	setFormat({ bold: !(getCursorFormat()?.bold === true) });
-}
-
-export function toggleItalic(): void {
-	setFormat({ italic: !(getCursorFormat()?.italic === true) });
-}
-
-export function setAlignment(alignment: CellAlignment | undefined): void {
-	setFormat({ alignment });
-}
-
-// ------------------------------------------------------------- format painter
-
-let copiedFormats:
-	| { w: number; h: number; formats: (CellFormat | undefined)[][] }
-	| undefined;
-
-/** Snapshots the selection's formats (deep-copied; `undefined` entries mean
- * "explicitly unformatted", which pasteFormat clears — that's what makes it
- * a painter rather than a merge). */
-export function copyFormat(): void {
-	const { x0, y0, x1, y1 } = getSelectionRect();
-	const formats: (CellFormat | undefined)[][] = [];
-	for (let y = y0; y <= y1; y++) {
-		const row: (CellFormat | undefined)[] = [];
-		for (let x = x0; x <= x1; x++) {
-			const f = sheetController.sheet.getFormat(x, y);
-			row.push(f ? (JSON.parse(JSON.stringify(f)) as CellFormat) : undefined);
-		}
-		formats.push(row);
-	}
-	copiedFormats = { w: x1 - x0 + 1, h: y1 - y0 + 1, formats };
-}
-
-/** Paints the copied format pattern over the selection, tiling when the
- * target is larger; a smaller target still receives one full pattern from
- * its anchor (Excel behavior). One transaction — a single undo reverts. */
+```ts ! state.svelte.ts
 export function pasteFormat(): void {
 	if (!copiedFormats) return;
 	const { x0, y0, x1, y1 } = getSelectionRect();
 	const { w, h, formats } = copiedFormats;
+	// !mark(1:2)
 	const spanX = Math.max(x1 - x0 + 1, w);
 	const spanY = Math.max(y1 - y0 + 1, h);
 	sheetController.startTransaction();
 	for (let dy = 0; dy < spanY; dy++) {
 		for (let dx = 0; dx < spanX; dx++) {
+			// !mark
 			const src = formats[dy % h][dx % w];
 			const x = x0 + dx;
 			const y = y0 + dy;
@@ -492,43 +263,26 @@ export function pasteFormat(): void {
 	}
 	sheetController.endTransaction();
 }
+```
 
-export type BorderMode =
-	| 'all'
-	| 'outer'
-	| 'inner'
-	| 'top'
-	| 'bottom'
-	| 'left'
-	| 'right'
-	| 'clear';
+## !!steps Borders owned per cell, edges stored once
 
-function isEmptyFormat(format: CellFormat): boolean {
-	return Object.keys(format).every((k) => k === 'x' || k === 'y');
-}
+Borders are stored on each cell's four edges rather than as lines between
+cells, which raises a question the comment answers: an interior border is
+shared by two cells, so which one owns it?
 
-/** Applies borders over the selection. Each cell owns its four edges;
- * `inner` uses top/left of non-first rows/columns so shared edges are
- * stored once. */
-export function setBorders(mode: BorderMode, color = '#000000'): void {
-	const { x0, y0, x1, y1 } = getSelectionRect();
-	sheetController.startTransaction();
-	for (let y = y0; y <= y1; y++) {
-		for (let x = x0; x <= x1; x++) {
-			const existing = sheetController.sheet.getFormat(x, y) ?? { x, y };
-			const format: CellFormat = { ...existing, x, y };
-			if (mode === 'clear') {
-				if (!format.borders) continue;
-				delete format.borders;
-				sheetController.execute({
-					type: 'setFormat',
-					x,
-					y,
-					format: isEmptyFormat(format) ? undefined : format
-				});
-				continue;
-			}
+The rule is that `inner` writes `top` on every row *after* the first and `left`
+on every column after the first. Each shared edge therefore has exactly one
+owner, so toggling borders cannot leave a duplicate behind, and clearing one
+cell's border genuinely removes that line.
+
+The `clear` branch shows the sparse discipline again: after deleting the
+borders it checks whether anything is left, and passes `undefined` when the
+format has become empty — deleting the record rather than storing a husk.
+
+```ts ! state.svelte.ts
 			const edges: CellBorders = { ...(format.borders ?? {}) };
+			// !mark(1:2)
 			if (mode === 'all' || ((mode === 'outer' || mode === 'top') && y === y0) || (mode === 'inner' && y > y0))
 				edges.top = color;
 			if (mode === 'all' || ((mode === 'outer' || mode === 'bottom') && y === y1)) edges.bottom = color;
@@ -538,99 +292,31 @@ export function setBorders(mode: BorderMode, color = '#000000'): void {
 			if (Object.keys(edges).length === 0) continue;
 			format.borders = edges;
 			sheetController.execute({ type: 'setFormat', x, y, format });
-		}
-	}
-	sheetController.endTransaction();
-}
+```
 
-const ROW_VERTICAL_PADDING = 4;
+## !!steps Clipboard as plain TSV
 
-/** Grows rows (never shrinks) so wrapped text in the rect is fully visible.
- * Emits setHeading ops, so it must run inside an open transaction. */
-function autofitWrappedRows(x0: number, y0: number, x1: number, y1: number): void {
-	const sheet = sheetController.sheet;
-	for (let y = y0; y <= y1; y++) {
-		let needed = 0;
-		for (let x = x0; x <= x1; x++) {
-			const format = sheet.getFormat(x, y);
-			if (format?.wrapping !== 'wrap') continue;
-			const cell = sheet.getCell(x, y);
-			if (!cell) continue;
-			const displayText = formatCellValue(cell, format);
-			if (displayText === '') continue;
-			const colWidth = sheet.gridOffsets.getColumnWidth(x);
-			const { height } = measureWrapped(displayText, colWidth, {
-				bold: format.bold,
-				italic: format.italic
-			});
-			needed = Math.max(needed, height + ROW_VERTICAL_PADDING);
-		}
-		if (needed > sheet.gridOffsets.getRowHeight(y)) {
-			sheetController.execute({ type: 'setHeading', kind: 'row', id: y, size: Math.ceil(needed) });
-		}
-	}
-}
+Copying builds tab-separated rows from raw cell values — not formatted display
+values — so a number formatted as currency copies as `1234.5`, which is what
+pastes usefully into another application.
 
-export function setWrapping(wrapping: CellWrapping | undefined): void {
-	sheetController.startTransaction();
-	forEachSelectedCell((x, y) => {
-		const existing = sheetController.sheet.getFormat(x, y) ?? { x, y };
-		const format = { ...existing, x, y };
-		if (wrapping === undefined) delete (format as CellFormat).wrapping;
-		else format.wrapping = wrapping;
-		sheetController.execute({ type: 'setFormat', x, y, format });
-	});
-	if (wrapping === 'wrap') {
-		const { x0, y0, x1, y1 } = getSelectionRect();
-		autofitWrappedRows(x0, y0, x1, y1);
-	}
-	sheetController.endTransaction();
-}
+Pasting reverses it, splitting on newlines and tabs and skipping empty fields
+so a sparse block does not create empty cells. Both wrap their clipboard access
+in `try`/`catch`, because the Clipboard API rejects without permission and a
+denied read should do nothing rather than throw.
 
-export function setTextFormat(textFormat: CellTextFormat | undefined): void {
-	sheetController.startTransaction();
-	forEachSelectedCell((x, y) => {
-		const existing = sheetController.sheet.getFormat(x, y) ?? { x, y };
-		const format = { ...existing, x, y };
-		if (textFormat === undefined) delete (format as CellFormat).textFormat;
-		else format.textFormat = textFormat;
-		sheetController.execute({ type: 'setFormat', x, y, format });
-	});
-	sheetController.endTransaction();
-}
+Cut is composed rather than special-cased: copy, then delete the same
+rectangle. Only the deletion is a mutation, and `deleteCellsInRect` wraps it in
+its own transaction — so a cut is still a single undo step.
 
-export function changeDecimals(delta: number): void {
-	sheetController.startTransaction();
-	forEachSelectedCell((x, y) => {
-		const existing = sheetController.sheet.getFormat(x, y);
-		const tf = existing?.textFormat ?? { type: 'NUMBER' as const, decimalPlaces: 2 };
-		const decimals = Math.max(0, (tf.decimalPlaces ?? 2) + delta);
-		sheetController.execute({
-			type: 'setFormat',
-			x,
-			y,
-			format: { ...(existing ?? { x, y }), x, y, textFormat: { ...tf, decimalPlaces: decimals } }
-		});
-	});
-	sheetController.endTransaction();
-}
-
-export function clearFormatting(): void {
-	sheetController.startTransaction();
-	forEachSelectedCell((x, y) => {
-		sheetController.execute({ type: 'setFormat', x, y, format: undefined });
-	});
-	sheetController.endTransaction();
-}
-
-// ------------------------------------------------------------------ clipboard
-
+```ts ! state.svelte.ts
 export async function copySelection(cut = false): Promise<void> {
 	const { x0, y0, x1, y1 } = getSelectionRect();
 	const sheet = sheetController.sheet;
 	const lines: string[] = [];
 	for (let y = y0; y <= y1; y++) {
 		const parts: string[] = [];
+		// !mark
 		for (let x = x0; x <= x1; x++) parts.push(sheet.getCell(x, y)?.value ?? '');
 		lines.push(parts.join('\t'));
 	}
@@ -639,58 +325,37 @@ export async function copySelection(cut = false): Promise<void> {
 	} catch {
 		// clipboard permission denied; ignore
 	}
+	// !mark
 	if (cut) await deleteCellsInRect(x0, y0, x1, y1);
 }
+```
 
-export async function pasteFromClipboard(): Promise<void> {
-	let text = '';
-	try {
-		text = await navigator.clipboard.readText();
-	} catch {
-		return;
-	}
-	if (!text) return;
-	const rows = text.replace(/\r\n/g, '\n').replace(/\n$/, '').split('\n');
-	const { x, y } = app.cursorPosition;
-	const cells: Cell[] = [];
-	rows.forEach((line, dy) => {
-		line.split('\t').forEach((v, dx) => {
-			if (v !== '')
-				cells.push({
-					x: x + dx,
-					y: y + dy,
-					type: 'TEXT',
-					value: v,
-					last_modified: new Date().toISOString()
-				});
-		});
-	});
-	if (cells.length === 0) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: cells, sheetController });
-	sheetController.endTransaction();
-}
+## !!steps Zoom anchored on a point
 
-// ------------------------------------------------------------------ zoom / viewport
+`setZoom` clamps to a 0.1–10 range and then does anchored zooming: convert the
+anchor to world coordinates *before* changing scale, and afterwards place the
+viewport so that same world point sits back under the anchor.
 
-export function screenToWorld(sx: number, sy: number): { x: number; y: number } {
-	return { x: app.viewport.x + sx / app.viewport.scale, y: app.viewport.y + sy / app.viewport.scale };
-}
+Defaulting the anchor to the canvas centre is what makes the zoom buttons and
+`⌘+` feel right — they magnify what you are looking at rather than drifting
+toward the origin. The identical arithmetic appears in
+[PixiGrid.ts](/docs/src/lib/grid/pixi/PixiGrid.ts) for cmd+wheel, anchored on
+the pointer instead.
 
-export function worldToScreen(wx: number, wy: number): { x: number; y: number } {
-	return {
-		x: (wx - app.viewport.x) * app.viewport.scale,
-		y: (wy - app.viewport.y) * app.viewport.scale
-	};
-}
+`zoomToRect` inverts the relationship, solving for the scale that fits a
+rectangle with a 1.2 buffer and capping at 2 so zooming to a single small cell
+does not fill the screen with one number.
 
+```ts ! state.svelte.ts
 export function setZoom(scale: number, centerScreen?: { x: number; y: number }): void {
+	// !mark
 	const clamped = Math.min(10, Math.max(0.1, scale));
 	const canvas = document.querySelector<HTMLCanvasElement>('canvas.grid-canvas');
 	const center = centerScreen ?? {
 		x: (canvas?.clientWidth ?? window.innerWidth) / 2,
 		y: (canvas?.clientHeight ?? window.innerHeight) / 2
 	};
+	// !mark(1:3)
 	const world = screenToWorld(center.x, center.y);
 	app.viewport = {
 		scale: clamped,
@@ -698,153 +363,36 @@ export function setZoom(scale: number, centerScreen?: { x: number; y: number }):
 		y: world.y - center.y / clamped
 	};
 }
+```
 
-export function zoomIn(): void {
-	setZoom(app.viewport.scale * 2);
-}
-export function zoomOut(): void {
-	setZoom(app.viewport.scale * 0.5);
-}
-export function zoomTo100(): void {
-	setZoom(1);
-}
+## !!steps Inserting a row without re-running the sheet
 
-export function zoomToRect(x0: number, y0: number, x1: number, y1: number): void {
-	const offsets = sheetController.sheet.gridOffsets;
-	const left = offsets.getColumnX(x0);
-	const top = offsets.getRowY(y0);
-	const right = offsets.getColumnX(x1) + offsets.getColumnWidth(x1);
-	const bottom = offsets.getRowY(y1) + offsets.getRowHeight(y1);
-	const canvas = document.querySelector<HTMLCanvasElement>('canvas.grid-canvas');
-	const cw = canvas?.clientWidth ?? window.innerWidth;
-	const ch = canvas?.clientHeight ?? window.innerHeight;
-	const buffer = 1.2;
-	const scale = Math.min(2, Math.min(cw / ((right - left) * buffer), ch / ((bottom - top) * buffer)));
-	const cx = (left + right) / 2;
-	const cy = (top + bottom) / 2;
-	app.viewport = { scale, x: cx - cw / 2 / scale, y: cy - ch / 2 / scale };
-}
+`shiftAxis` is the most involved function in the file, and its doc comment
+records a decision that is easy to get wrong: inserting a row **does not re-run
+code cells**.
 
-export function zoomToFit(): void {
-	const bounds = sheetController.sheet.getBounds();
-	if (!bounds) {
-		zoomTo100();
-		return;
-	}
-	zoomToRect(bounds.left, bounds.top, bounds.right, bounds.bottom);
-}
+The reason is stated plainly — re-running could regenerate random data or
+re-spill over the sheet. So instead of recomputing, the shift carries each
+cell's *metadata* along: `array_cells` and `cells_accessed` are remapped so the
+dependency graph and spill blocks stay consistent with the new positions.
 
-export function zoomToSelection(): void {
-	const { x0, y0, x1, y1 } = getSelectionRect();
-	zoomToRect(x0, y0, x1, y1);
-}
+Formulas are the exception, because their A1 text encodes positions that must
+follow the shift; they are rewritten through the Rust core's `adjust_formula`.
+Python and JavaScript reference strings are left alone, since those are
+arbitrary code rather than a parseable reference syntax — a real asymmetry the
+comment is honest about.
 
-/** Move the cursor and scroll it into view (re-centering only if offscreen). */
-export function gotoCell(x: number, y: number, range?: { x1: number; y1: number }): void {
-	app.cursorPosition = { x, y };
-	app.keyboardMovePosition = { x, y };
-	if (range) {
-		app.multiCursor = {
-			originPosition: { x: Math.min(x, range.x1), y: Math.min(y, range.y1) },
-			terminalPosition: { x: Math.max(x, range.x1), y: Math.max(y, range.y1) }
-		};
-	} else {
-		app.multiCursor = undefined;
-	}
-	ensureCursorVisible();
-}
+The sort direction matters: shifting away from the origin processes cells in
+descending order so a move never overwrites a cell not yet processed.
 
-export function ensureCursorVisible(): void {
-	const offsets = sheetController.sheet.gridOffsets;
-	const { x, y } = app.cursorPosition;
-	const rect = offsets.getCellRect(x, y);
-	const canvas = document.querySelector<HTMLCanvasElement>('canvas.grid-canvas');
-	const cw = (canvas?.clientWidth ?? window.innerWidth) / app.viewport.scale;
-	const ch = (canvas?.clientHeight ?? window.innerHeight) / app.viewport.scale;
-	const headingWorld = HEADING_SIZE / app.viewport.scale;
-	let { x: vx, y: vy } = app.viewport;
-	if (rect.x < vx + headingWorld) vx = rect.x - headingWorld - 2;
-	else if (rect.x + rect.w > vx + cw) vx = rect.x + rect.w - cw + 2;
-	if (rect.y < vy + headingWorld) vy = rect.y - headingWorld - 2;
-	else if (rect.y + rect.h > vy + ch) vy = rect.y + rect.h - ch + 2;
-	if (vx !== app.viewport.x || vy !== app.viewport.y)
-		app.viewport = { ...app.viewport, x: vx, y: vy };
-}
-
-// ------------------------------------------------------------------ sheets
-
-export function switchSheet(index: number): void {
-	sheetController.switchSheet(index);
-	app.multiCursor = undefined;
-}
-
-export function switchSheetRelative(delta: number): void {
-	const n = sheetController.sheets.length;
-	if (n < 2) return;
-	switchSheet((sheetController.currentSheetIndex + delta + n) % n);
-}
-
-// ------------------------------------------------------------------ insert
-
-/** Opens the code editor at the cursor in the given language. */
-export function openCodeEditorAt(mode: EditorMode): void {
-	app.editorCell = { ...app.cursorPosition };
-	app.editorMode = mode;
-	app.showCellTypeMenu = false;
-	app.showCodeEditor = true;
-}
-
-/** Writes today's date (optionally with time) into the current cell. */
-export async function insertTodayDate(withTime = false): Promise<void> {
-	const now = new Date();
-	const pad = (n: number) => String(n).padStart(2, '0');
-	const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-	const value = withTime
-		? `${date} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
-		: date;
-	await commitCellValue(app.cursorPosition.x, app.cursorPosition.y, value);
-}
-
-export function addSheet(): void {
-	sheetController.addSheet();
-	app.multiCursor = undefined;
-}
-
-export function duplicateCurrentSheet(): void {
-	sheetController.duplicateSheet(sheetController.currentSheetIndex);
-	app.multiCursor = undefined;
-}
-
-export function deleteCurrentSheet(): void {
-	sheetController.deleteSheet(sheetController.currentSheetIndex);
-	app.multiCursor = undefined;
-}
-
-// ------------------------------------------------------- rows and columns
-
-/** Shifts every cell/format/size at or beyond `at` along an axis by `delta`.
- * Code cells are NOT re-run (re-running could regenerate random data or
- * re-spill over the sheet); their spill/dependency metadata is shifted so
- * the graph stays consistent. Formula A1 text is rewritten via the Rust
- * core's adjust_formula; Python/JS reference strings are not. */
-async function shiftAxis(axis: 'x' | 'y', at: number, delta: number): Promise<void> {
-	const sheet = sheetController.sheet;
-	const desc = delta > 0;
-	const hasFormulas = sheet.getAllCells().some((c) => c.type === 'FORMULA');
-	const { adjustFormula } = hasFormulas
-		? await import('./formulas/runFormula')
-		: { adjustFormula: undefined };
-
-	const shiftPair = ([px, py]: [number, number]): [number, number] =>
-		axis === 'x' ? [px >= at ? px + delta : px, py] : [px, py >= at ? py + delta : py];
-	const pairsEqual = (a: [number, number][] | undefined, b: [number, number][] | undefined) =>
-		JSON.stringify(a) === JSON.stringify(b);
-
+```ts ! state.svelte.ts
 	const cells = sheet
 		.getAllCells()
+		// !mark
 		.sort((a, b) => (desc ? b[axis] - a[axis] : a[axis] - b[axis]));
 	for (const cell of cells) {
 		const movedCoord = cell[axis] >= at;
+		// !mark(1:2)
 		const array_cells = cell.array_cells?.map(shiftPair);
 		const cells_accessed = cell.evaluation_result?.cells_accessed?.map(shiftPair);
 		// formulas follow the shift: their A1 text is rewritten by the core
@@ -852,392 +400,57 @@ async function shiftAxis(axis: 'x' | 'y', at: number, delta: number): Promise<vo
 		if (cell.type === 'FORMULA' && formula_code && adjustFormula) {
 			formula_code = await adjustFormula(formula_code, cell, axis, at, delta);
 		}
-		const metaChanged =
-			!pairsEqual(array_cells, cell.array_cells) ||
-			!pairsEqual(cells_accessed, cell.evaluation_result?.cells_accessed) ||
-			formula_code !== cell.formula_code;
-		if (!movedCoord && !metaChanged) continue;
+```
 
-		const moved = { ...cell, [axis]: movedCoord ? cell[axis] + delta : cell[axis] };
-		if (array_cells) moved.array_cells = array_cells;
-		if (formula_code !== undefined) moved.formula_code = formula_code;
-		if (cell.evaluation_result && cells_accessed) {
-			moved.evaluation_result = { ...cell.evaluation_result, cells_accessed };
-		}
-		sheetController.execute({ type: 'setCell', x: cell.x, y: cell.y, cell: undefined });
-		sheetController.execute({ type: 'setCell', x: moved.x, y: moved.y, cell: moved });
-	}
+## !!steps Opening a file, from three sources
 
-	const formats = sheet
-		.getAllFormats()
-		.filter((f) => f[axis] >= at)
-		.sort((a, b) => (desc ? b[axis] - a[axis] : a[axis] - b[axis]));
-	for (const format of formats) {
-		sheetController.execute({ type: 'setFormat', x: format.x, y: format.y, format: undefined });
-		const moved = { ...format, [axis]: format[axis] + delta };
-		sheetController.execute({ type: 'setFormat', x: moved.x, y: moved.y, format: moved });
-	}
+The three open paths — a new blank file, a file from disk or an example, and a
+stored file — converge on the same sequence: import, rebuild cross-sheet
+dependencies, reset filename and id, move the cursor home, fire `onChange`,
+and fit the view.
 
-	const kind = axis === 'x' ? ('column' as const) : ('row' as const);
-	const headings =
-		axis === 'x' ? sheet.gridOffsets.exportColumns() : sheet.gridOffsets.exportRows();
-	const affected = headings
-		.filter((h) => h.id >= at)
-		.sort((a, b) => (desc ? b.id - a.id : a.id - b.id));
-	for (const h of affected) {
-		sheetController.execute({ type: 'setHeading', kind, id: h.id, size: undefined });
-		sheetController.execute({ type: 'setHeading', kind, id: h.id + delta, size: h.size });
-	}
+`rebuildCrossSheetDeps` has to run explicitly because those dependencies are
+not persisted; they are re-derived by scanning formula text, as described on
+[SheetController.ts](/docs/src/lib/core/SheetController.ts).
 
-	sheet.rebuildDependencies();
-}
+Firing `onChange` is what makes the opened file become the *current* one — the
+autosave it triggers writes both the document and the pointer, so a reload
+returns to it. `zoomToFit` then frames the content, which is why opening an
+example lands on the data rather than at the origin.
 
-export async function insertColumn(at: number): Promise<void> {
-	sheetController.startTransaction();
-	await shiftAxis('x', at, 1);
-	sheetController.endTransaction();
-}
-
-export async function insertRow(at: number): Promise<void> {
-	sheetController.startTransaction();
-	await shiftAxis('y', at, 1);
-	sheetController.endTransaction();
-}
-
-export async function deleteColumns(x0: number, x1: number): Promise<void> {
-	const sheet = sheetController.sheet;
-	sheetController.startTransaction();
-	// plain deletion — like insert, no code re-runs (see shiftAxis)
-	for (const cell of sheet.getAllCells().filter((c) => c.x >= x0 && c.x <= x1)) {
-		sheetController.execute({ type: 'setCell', x: cell.x, y: cell.y, cell: undefined });
-	}
-	for (const f of sheet.getAllFormats().filter((f) => f.x >= x0 && f.x <= x1)) {
-		sheetController.execute({ type: 'setFormat', x: f.x, y: f.y, format: undefined });
-	}
-	await shiftAxis('x', x1 + 1, -(x1 - x0 + 1));
-	sheetController.endTransaction();
-}
-
-export async function deleteRows(y0: number, y1: number): Promise<void> {
-	const sheet = sheetController.sheet;
-	sheetController.startTransaction();
-	for (const cell of sheet.getAllCells().filter((c) => c.y >= y0 && c.y <= y1)) {
-		sheetController.execute({ type: 'setCell', x: cell.x, y: cell.y, cell: undefined });
-	}
-	for (const f of sheet.getAllFormats().filter((f) => f.y >= y0 && f.y <= y1)) {
-		sheetController.execute({ type: 'setFormat', x: f.x, y: f.y, format: undefined });
-	}
-	await shiftAxis('y', y1 + 1, -(y1 - y0 + 1));
-	sheetController.endTransaction();
-}
-
-// ------------------------------------------------------------------ export
-
-/** Set by GridCanvas so actions can reach the renderer (PNG export). */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const pixiRef: { current?: any } = {};
-
-/** Copies the current selection to the clipboard as a PNG image. */
-export async function copySelectionAsPng(): Promise<void> {
-	const grid = pixiRef.current;
-	if (!grid) return;
-	const { x0, y0, x1, y1 } = getSelectionRect();
-	const offsets = sheetController.sheet.gridOffsets;
-	const left = offsets.getColumnX(x0);
-	const top = offsets.getRowY(y0);
-	const right = offsets.getColumnX(x1) + offsets.getColumnWidth(x1);
-	const bottom = offsets.getRowY(y1) + offsets.getRowHeight(y1);
-	const blob: Blob | null = await grid.extractPng(left, top, right - left, bottom - top);
-	if (!blob) return;
-	try {
-		await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-	} catch {
-		// clipboard image write unsupported; fall back to downloading
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = `${app.filename} selection.png`;
-		a.click();
-		URL.revokeObjectURL(url);
-	}
-}
-
-/** Downloads the current selection (or the whole sheet) as a CSV file. */
-export function downloadSelectionAsCsv(): void {
-	const sheet = sheetController.sheet;
-	let { x0, y0, x1, y1 } = getSelectionRect();
-	if (!app.multiCursor) {
-		const bounds = sheet.getBounds();
-		if (bounds) ({ left: x0, top: y0, right: x1, bottom: y1 } = bounds);
-	}
-	const rows: string[] = [];
-	for (let y = y0; y <= y1; y++) {
-		const fields: string[] = [];
-		for (let x = x0; x <= x1; x++) {
-			const value = sheet.getCell(x, y)?.value ?? '';
-			fields.push(/[",\n]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value);
-		}
-		rows.push(fields.join(','));
-	}
-	const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
-	const url = URL.createObjectURL(blob);
-	const a = document.createElement('a');
-	a.href = url;
-	a.download = `${app.filename}.csv`;
-	a.click();
-	URL.revokeObjectURL(url);
-}
-
-/** Re-runs every code cell on the current sheet. */
-export async function rerunAllCode(): Promise<void> {
-	const codeCells = sheetController.sheet.getAllCells().filter((c) => isCodeCellType(c.type));
-	if (codeCells.length === 0) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: codeCells, sheetController });
-	sheetController.endTransaction();
-}
-
-/** Re-runs the code cell under the cursor. */
-export async function rerunCurrentCell(): Promise<void> {
-	const cell = sheetController.sheet.getCell(app.cursorPosition.x, app.cursorPosition.y);
-	if (!cell || !isCodeCellType(cell.type)) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: [cell], sheetController });
-	sheetController.endTransaction();
-}
-
-// ------------------------------------------------------------------ files
-
-export function newFile(): void {
-	sheetController.sheets = [new Sheet()];
-	sheetController.currentSheetIndex = 0;
-	app.filename = DEFAULT_FILE_NAME;
-	app.fileId = crypto.randomUUID();
-	app.cursorPosition = { x: 0, y: 0 };
-	app.multiCursor = undefined;
-	app.viewport = { x: -HEADING_SIZE - 2, y: -HEADING_SIZE - 2, scale: 1 };
-	sheetController.onChange();
-}
-
-export function saveFile(): void {
-	downloadGridFile(exportGridFile(sheetController, app.filename, app.fileId));
-}
-
-export function openFileFromJSON(json: string, name?: string): void {
-	const parsed = JSON.parse(json);
-	importGridFile(sheetController, parsed);
-	sheetController.rebuildCrossSheetDeps(findSheetRefs);
-	app.filename = name?.replace(/\.grid$/, '') ?? parsed.filename ?? DEFAULT_FILE_NAME;
-	app.fileId = parsed.id ?? crypto.randomUUID();
-	app.cursorPosition = { x: 0, y: 0 };
-	app.multiCursor = undefined;
-	sheetController.onChange();
-	zoomToFit();
-}
-
-/** Opens a file from the local store and makes it current. */
+```ts ! state.svelte.ts
 export async function openStoredFile(id: string): Promise<void> {
 	const file = await loadStoredFile(id);
 	if (!file) return;
 	importGridFile(sheetController, file);
+	// !mark
 	sheetController.rebuildCrossSheetDeps(findSheetRefs);
 	app.filename = file.filename ?? DEFAULT_FILE_NAME;
 	app.fileId = file.id ?? crypto.randomUUID();
 	app.cursorPosition = { x: 0, y: 0 };
 	app.multiCursor = undefined;
+	// !mark
 	sheetController.onChange(); // autosave re-persists it as the current file
 	zoomToFit();
 }
+```
 
-/** Copies a stored file under a new id without switching to it. */
-export async function duplicateStoredFileById(id: string): Promise<void> {
-	const file = await loadStoredFile(id);
-	if (!file) return;
-	await saveStoredFile({
-		...file,
-		id: crypto.randomUUID(),
-		filename: `${file.filename ?? DEFAULT_FILE_NAME} copy`,
-		created: Date.now(),
-		modified: Date.now()
-	});
-}
+</Scrollycoding>
 
-/** Deletes a stored file; the open file is protected. */
-export async function deleteStoredFileById(id: string): Promise<boolean> {
-	if (id === app.fileId) return false;
-	await deleteStoredFile(id);
-	return true;
-}
+Nearly every exported function follows the same shape: read
+`getSelectionRect`, open a transaction, execute ops or call
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts), close the
+transaction. That uniformity is what makes a paste of fifty cells or a fill of
+a hundred a single undo step.
 
-export async function importCSVAt(text: string, at: Coordinate): Promise<void> {
-	const rows = parseCSV(text);
-	const cells: Cell[] = [];
-	rows.forEach((row, dy) => {
-		row.forEach((v, dx) => {
-			if (v !== '')
-				cells.push({
-					x: at.x + dx,
-					y: at.y + dy,
-					type: 'TEXT',
-					value: v,
-					last_modified: new Date().toISOString()
-				});
-		});
-	});
-	if (cells.length === 0) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: cells, sheetController });
-	sheetController.endTransaction();
-}
+The consumers are the three entry points into the app —
+[keyboard.ts](/docs/src/lib/grid/keyboard.ts),
+[CommandPalette.svelte](/docs/src/lib/components/CommandPalette.svelte) and
+[GridContextMenu.svelte](/docs/src/lib/components/GridContextMenu.svelte) —
+plus the components that read state directly. Because all three import from
+here rather than reimplementing, a behavior fixed once is fixed everywhere.
 
-export async function loadInitialFile(): Promise<void> {
-	const saved = await loadCurrentFile();
-	if (saved) {
-		try {
-			importGridFile(sheetController, saved);
-			sheetController.rebuildCrossSheetDeps(findSheetRefs);
-			app.filename = saved.filename ?? DEFAULT_FILE_NAME;
-			app.fileId = saved.id ?? crypto.randomUUID();
-			app.markDirty();
-			return;
-		} catch {
-			// fall through to example content
-		}
-	}
-	seedExampleContent();
-}
-
-function seedExampleContent(): void {
-	const now = new Date().toISOString();
-	const cells: Cell[] = [];
-	const put = (x: number, y: number, value: string) =>
-		cells.push({ x, y, type: 'TEXT', value, last_modified: now });
-	put(0, 0, 'Welcome to Quadratic Svelte!');
-	put(0, 2, 'Item');
-	put(1, 2, 'Q1');
-	put(2, 2, 'Q2');
-	put(3, 2, 'Total');
-	const data: [string, number, number][] = [
-		['Apples', 34, 41],
-		['Oranges', 28, 33],
-		['Pears', 19, 25]
-	];
-	data.forEach(([name, q1, q2], i) => {
-		put(0, 3 + i, name);
-		put(1, 3 + i, String(q1));
-		put(2, 3 + i, String(q2));
-	});
-	sheetController.startTransaction();
-	void (async () => {
-		await updateCellAndDCells({ starting_cells: cells, sheetController });
-		const formulas: Cell[] = [
-			{ x: 3, y: 3, type: 'FORMULA', value: '', formula_code: 'SUM(B3:C3)', last_modified: now },
-			{ x: 3, y: 4, type: 'FORMULA', value: '', formula_code: 'SUM(B4:C4)', last_modified: now },
-			{ x: 3, y: 5, type: 'FORMULA', value: '', formula_code: 'SUM(B5:C5)', last_modified: now },
-			{ x: 1, y: 6, type: 'FORMULA', value: '', formula_code: 'SUM(B3:B5)', last_modified: now },
-			{ x: 2, y: 6, type: 'FORMULA', value: '', formula_code: 'SUM(C3:C5)', last_modified: now },
-			{ x: 3, y: 6, type: 'FORMULA', value: '', formula_code: 'SUM(D3:D5)', last_modified: now }
-		];
-		await updateCellAndDCells({ starting_cells: formulas, sheetController });
-		sheetController.execute({
-			type: 'setCell',
-			x: 0,
-			y: 6,
-			cell: { x: 0, y: 6, type: 'TEXT', value: 'Total', last_modified: now }
-		});
-		sheetController.endTransaction();
-	})();
-	for (let x = 0; x <= 3; x++) {
-		sheetController.execute({ type: 'setFormat', x, y: 2, format: { x, y: 2, bold: true } });
-	}
-}
-
-export const constants = { CELL_WIDTH, CELL_HEIGHT, HEADING_SIZE };
-export type { Cell, CellFormat, CellType, Coordinate };
-
-// ------------------------------------------------------------------ fill
-
-/**
- * Fills from a source rect into the adjacent target area along `axis`
- * (down when 'y', right when 'x'): arithmetic/text series per line where
- * detected, otherwise cycling copies with formula relocation.
- */
-export async function fillRange(
-	source: { x0: number; y0: number; x1: number; y1: number },
-	extent: number,
-	axis: 'x' | 'y'
-): Promise<void> {
-	if (extent <= 0) return;
-	const sheet = sheetController.sheet;
-	const { relocateFormula } = await import('./formulas/runFormula');
-	const now = new Date().toISOString();
-	const cells: Cell[] = [];
-
-	const lines: { fixed: number }[] = [];
-	if (axis === 'y') for (let x = source.x0; x <= source.x1; x++) lines.push({ fixed: x });
-	else for (let y = source.y0; y <= source.y1; y++) lines.push({ fixed: y });
-
-	for (const line of lines) {
-		const sourceCells: (Cell | undefined)[] = [];
-		const s0 = axis === 'y' ? source.y0 : source.x0;
-		const s1 = axis === 'y' ? source.y1 : source.x1;
-		for (let i = s0; i <= s1; i++) {
-			sourceCells.push(axis === 'y' ? sheet.getCell(line.fixed, i) : sheet.getCell(i, line.fixed));
-		}
-		const n = sourceCells.length;
-		const allPlain = sourceCells.every(
-			(c) => c !== undefined && (c.type === 'TEXT' || c.type === 'COMPUTED')
-		);
-		const values = sourceCells.map((c) => c?.value ?? '');
-
-		for (let step = 0; step < extent; step++) {
-			const targetIndex = s1 + 1 + step;
-			const tx = axis === 'y' ? line.fixed : targetIndex;
-			const ty = axis === 'y' ? targetIndex : line.fixed;
-
-			const continued = allPlain ? seriesNext(values, step) : undefined;
-			if (continued !== undefined) {
-				cells.push({ x: tx, y: ty, type: 'TEXT', value: continued, last_modified: now });
-				continue;
-			}
-			// cycle-copy the source pattern
-			const src = sourceCells[step % n];
-			if (!src) continue;
-			const copy: Cell = { ...src, x: tx, y: ty, last_modified: now };
-			delete copy.array_cells;
-			delete copy.dependent_cells;
-			delete copy.evaluation_result;
-			if (copy.type === 'COMPUTED') copy.type = 'TEXT';
-			if (copy.type === 'FORMULA' && copy.formula_code) {
-				copy.formula_code = await relocateFormula(copy.formula_code, src, { x: tx, y: ty });
-			}
-			cells.push(copy);
-		}
-	}
-
-	if (cells.length === 0) return;
-	sheetController.startTransaction();
-	await updateCellAndDCells({ starting_cells: cells, sheetController });
-	sheetController.endTransaction();
-}
-
-/** ⌘D: fill the selection from its top row (single row: from the row above). */
-export async function fillDown(): Promise<void> {
-	const sel = getSelectionRect();
-	if (sel.y0 === sel.y1) {
-		await fillRange({ x0: sel.x0, y0: sel.y0 - 1, x1: sel.x1, y1: sel.y0 - 1 }, 1, 'y');
-	} else {
-		await fillRange({ x0: sel.x0, y0: sel.y0, x1: sel.x1, y1: sel.y0 }, sel.y1 - sel.y0, 'y');
-	}
-}
-
-/** ⌘R: fill the selection from its left column (single column: from the left). */
-export async function fillRight(): Promise<void> {
-	const sel = getSelectionRect();
-	if (sel.x0 === sel.x1) {
-		await fillRange({ x0: sel.x0 - 1, y0: sel.y0, x1: sel.x0 - 1, y1: sel.y1 }, 1, 'x');
-	} else {
-		await fillRange({ x0: sel.x0, y0: sel.y0, x1: sel.x0, y1: sel.y1 }, sel.x1 - sel.x0, 'x');
-	}
-}
-````
+One structural note: `pixiRef` is a mutable box assigned by
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte), giving actions
+like PNG export a way to reach the renderer. It is the one place the store
+depends on the view rather than the other way round.
