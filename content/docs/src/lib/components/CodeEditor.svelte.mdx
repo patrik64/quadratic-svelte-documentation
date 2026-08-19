@@ -1,28 +1,40 @@
 ---
 title: "CodeEditor.svelte"
-description: "The CodeEditor Svelte component."
+description: "The side panel for code cells — overlay syntax highlighting, formula autocomplete positioned by a hidden mirror, and the output pane"
 source: "src/lib/components/CodeEditor.svelte"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+The panel that opens beside the grid when you edit a Formula, Python or
+JavaScript cell. It is a full editing surface built without an editor library:
+a plain `<textarea>` with syntax highlighting painted behind it, an
+autocomplete dropdown fed by the Rust core's LSP module, and an output pane
+showing whatever the last run produced.
 
-````svelte CodeEditor.svelte -n
+Everything here rests on one structural trick — the highlighted text and the
+editable text are two different elements stacked on top of each other — and
+most of the surrounding complexity exists to keep them agreeing.
+
+<Scrollycoding>
+
+## !!steps Two layers pretending to be one
+
+Syntax highlighting is a `<pre>` of colored spans sitting behind a `<textarea>`
+whose own text is transparent. You edit the textarea; you see the `<pre>`.
+
+That only works while the two stay pixel-aligned, which is why the tokenizer in
+[codeHighlight.ts](/docs/src/lib/helpers/codeHighlight.ts) guarantees its
+output concatenates back to the exact input — a single dropped character would
+shift every glyph after it.
+
+Alignment also has to survive scrolling, hence `syncHighlightScroll`. The effect
+around it covers the case a scroll listener cannot: switching to a different
+cell replaces the content outright, producing no scroll event even though the
+scroll offsets are now wrong. Reading `hlTokens` is what subscribes the effect
+to that change.
+
+```svelte ! CodeEditor.svelte
 <script lang="ts">
-	import { getCellA1Notation } from '../core/a1';
-	import { editorModeColor } from '../grid/colors';
-	import { tokenizeCode } from '../helpers/codeHighlight';
-	import { KeyboardSymbols } from '../helpers/keyboardSymbols';
-	import { pythonStatus } from '../python/pythonRunner';
-	import type { FormulaCompletion } from '../formulas/runFormula';
-	import { app, saveCellCode, sheetController } from '../state.svelte';
-
-	let code = $state('');
-	let running = $state(false);
-	let textareaEl: HTMLTextAreaElement | undefined = $state();
-
 	// syntax highlighting: a <pre> of colored tokens sits behind the textarea,
 	// whose own text is transparent (same layering trick as the caret mirror)
 	let highlightEl: HTMLPreElement | undefined = $state();
@@ -37,156 +49,31 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 
 	// re-sync after content changes that produce no scroll event (cell switch)
 	$effect(() => {
+		// !mark
 		void hlTokens;
 		syncHighlightScroll();
 	});
+</script>
+```
 
-	// ---------- formula autocomplete (fed by the core's LSP module) ----------
+## !!steps Reloading the buffer when the target changes
 
-	let completions: FormulaCompletion[] = $state([]);
-	$effect(() => {
-		if (app.editorMode === 'FORMULA' && completions.length === 0) {
-			void import('../formulas/runFormula').then(async (m) => {
-				completions = await m.getFormulaCompletions();
-			});
-		}
-	});
+`code` is local component state, not a binding into the sheet, so something has
+to reload it when the editor is pointed at a different cell.
 
-	let caretPos = $state(0);
-	let acDismissed = $state(false);
-	let acIndex = $state(0);
-	let acPos = $state({ left: 0, top: 0 });
+`loadedKey` is that guard: a composite of the cell coordinates *and* the mode,
+compared before doing anything. Without it the effect would re-run on every
+unrelated state change and overwrite in-progress edits with the saved text.
+Including the mode in the key matters because the same cell holds three
+independent sources — a formula, some Python and some JavaScript — so switching
+language on one cell is as much a reload as moving to another cell.
 
-	// identifier ending at the caret, unless the caret sits inside a string
-	const acWord = $derived.by(() => {
-		if (app.editorMode !== 'FORMULA') return null;
-		const upto = code.slice(0, caretPos);
-		let quote: string | null = null;
-		for (const ch of upto) {
-			if (quote) {
-				if (ch === quote) quote = null;
-			} else if (ch === '"' || ch === "'") quote = ch;
-		}
-		if (quote) return null;
-		const m = /[A-Za-z_][A-Za-z0-9_]*$/.exec(upto);
-		return m ? { start: caretPos - m[0].length, text: m[0] } : null;
-	});
-
-	const acItems = $derived.by(() => {
-		if (!acWord || acDismissed || completions.length === 0) return [];
-		const prefix = acWord.text.toUpperCase();
-		return completions.filter((c) => c.label.startsWith(prefix));
-	});
-	const acOpen = $derived(acItems.length > 0);
-	const acSel = $derived(Math.min(acIndex, Math.max(acItems.length - 1, 0)));
-
-	/** Flattens a Monaco `${n:placeholder}` snippet to plain text, keeping the
-	 * first placeholder's range so it can be selected for type-over. */
-	function expandSnippet(snippet: string): { text: string; selStart: number; selEnd: number } {
-		let text = '';
-		let sel: { start: number; end: number } | undefined;
-		let i = 0;
-		const re = /\$\{\d+:([^}]*)\}|\$\d+/g;
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(snippet))) {
-			text += snippet.slice(i, m.index);
-			const ph = m[1] ?? '';
-			if (!sel) sel = { start: text.length, end: text.length + ph.length };
-			text += ph;
-			i = m.index + m[0].length;
-		}
-		text += snippet.slice(i);
-		const at = sel ?? { start: text.length, end: text.length };
-		return { text, selStart: at.start, selEnd: at.end };
-	}
-
-	function acceptCompletion(item: FormulaCompletion): void {
-		if (!acWord || !textareaEl) return;
-		const { text, selStart, selEnd } = expandSnippet(item.insertText ?? `${item.label}()`);
-		const start = acWord.start;
-		code = code.slice(0, start) + text + code.slice(caretPos);
-		acDismissed = true; // stay closed until the user types again
-		queueMicrotask(() => {
-			textareaEl?.focus();
-			textareaEl?.setSelectionRange(start + selStart, start + selEnd);
-			caretPos = start + selEnd;
-		});
-	}
-
-	function acDocText(item: FormulaCompletion): string {
-		const doc = item.documentation;
-		const raw = typeof doc === 'string' ? doc : (doc?.value ?? '');
-		// keep the prose: drop the leading "# Description" header, the examples
-		// section, and code ticks
-		const cut = raw.split(/\n#/)[0];
-		return cut
-			.replace(/^#[^\n]*\n?/, '')
-			.replace(/`/g, '')
-			.trim();
-	}
-
-	// caret pixel position via a hidden mirror of the textarea's text layout
-	let mirror: HTMLDivElement | undefined;
-	function refreshAcPos(): void {
-		const el = textareaEl;
-		if (!el) return;
-		const upto = el.value.slice(0, el.selectionStart ?? 0);
-		const wordLen = /[A-Za-z_][A-Za-z0-9_]*$/.exec(upto)?.[0].length ?? 0;
-		if (!mirror) {
-			mirror = document.createElement('div');
-			el.parentElement?.appendChild(mirror);
-		}
-		const cs = getComputedStyle(el);
-		for (const p of [
-			'fontFamily',
-			'fontSize',
-			'fontWeight',
-			'lineHeight',
-			'letterSpacing',
-			'tabSize',
-			'padding'
-		] as const) {
-			mirror.style[p] = cs[p];
-		}
-		Object.assign(mirror.style, {
-			position: 'absolute',
-			top: '0',
-			left: '0',
-			visibility: 'hidden',
-			whiteSpace: 'pre-wrap',
-			overflowWrap: 'break-word',
-			pointerEvents: 'none',
-			width: `${el.clientWidth}px`
-		});
-		mirror.textContent = upto.slice(0, upto.length - wordLen);
-		const marker = document.createElement('span');
-		marker.textContent = '\u200b';
-		mirror.appendChild(marker);
-		const lineHeight = parseFloat(cs.lineHeight) || 18;
-		const left = Math.max(
-			0,
-			Math.min(marker.offsetLeft - el.scrollLeft, el.clientWidth - 290)
-		);
-		acPos = { left, top: marker.offsetTop - el.scrollTop + lineHeight + 2 };
-	}
-
-	function updateCaret(): void {
-		caretPos = textareaEl?.selectionStart ?? 0;
-		refreshAcPos();
-	}
-
-	function keepSelectedInView(): void {
-		queueMicrotask(() =>
-			document
-				.querySelector('.code-editor .ac li.sel')
-				?.scrollIntoView({ block: 'nearest' })
-		);
-	}
-
-	// reload the buffer whenever the editor targets a different cell/mode
+```svelte ! CodeEditor.svelte
+<script lang="ts">
 	let loadedKey = $state('');
 	$effect(() => {
 		const key = `${app.editorCell.x},${app.editorCell.y},${app.editorMode}`;
+		// !mark
 		if (key !== loadedKey) {
 			loadedKey = key;
 			const cell = sheetController.sheet.getCell(app.editorCell.x, app.editorCell.y);
@@ -199,18 +86,172 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			queueMicrotask(() => textareaEl?.focus());
 		}
 	});
+</script>
+```
 
-	// insert requests from the formula reference (FormulaDocs) and from
-	// grid pointing mode. A pointed ref remembers its span so pointing at a
-	// different cell REPLACES the previous ref (Excel-style repointing);
-	// typing anything clears the marker.
-	let lastRefSpan: { start: number; end: number } | undefined;
-	$effect(() => {
-		const text = app.pendingEditorInsert;
-		if (text && textareaEl) {
+## !!steps The word being completed, unless it is inside a string
+
+Completions load lazily — the dynamic import only fires the first time a
+formula is edited, keeping the WASM core off the critical path for Python and
+JavaScript cells.
+
+`acWord` decides what is being typed, and its first job is knowing when *not*
+to offer anything. It walks the text before the caret tracking quote state, and
+bails if the caret is inside a string literal — otherwise typing prose in
+`CONCAT("SU...` would pop up `SUM`. The scan is a simple toggle rather than a
+parser, which is proportionate for deciding whether a dropdown appears.
+
+Finding the identifier is then a single anchored regex, returning both the text
+and its start offset — the offset being what `acceptCompletion` later needs to
+know how much to replace.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
+	const acWord = $derived.by(() => {
+		if (app.editorMode !== 'FORMULA') return null;
+		const upto = code.slice(0, caretPos);
+		let quote: string | null = null;
+		for (const ch of upto) {
+			if (quote) {
+				if (ch === quote) quote = null;
+			} else if (ch === '"' || ch === "'") quote = ch;
+		}
+		// !mark
+		if (quote) return null;
+		const m = /[A-Za-z_][A-Za-z0-9_]*$/.exec(upto);
+		return m ? { start: caretPos - m[0].length, text: m[0] } : null;
+	});
+</script>
+```
+
+## !!steps Flattening a Monaco snippet
+
+The core's LSP module returns Monaco-shaped insert text, so a completion
+arrives as something like `SUM(${1:numbers...})` — placeholder syntax this
+editor has no machinery to honour.
+
+`expandSnippet` strips it down to plain text while keeping one useful piece of
+the behavior: the range of the **first** placeholder is recorded so the caller
+can select it. That is what makes an accepted completion land with its first
+argument highlighted, ready to type over — most of the value of snippet support
+for a fraction of the implementation.
+
+When a snippet has no placeholders the fallback collapses the range to a caret
+at the end, so the same code path handles both.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
+	function expandSnippet(snippet: string): { text: string; selStart: number; selEnd: number } {
+		let text = '';
+		let sel: { start: number; end: number } | undefined;
+		let i = 0;
+		const re = /\$\{\d+:([^}]*)\}|\$\d+/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(snippet))) {
+			text += snippet.slice(i, m.index);
+			const ph = m[1] ?? '';
+			// !mark
+			if (!sel) sel = { start: text.length, end: text.length + ph.length };
+			text += ph;
+			i = m.index + m[0].length;
+		}
+		text += snippet.slice(i);
+		const at = sel ?? { start: text.length, end: text.length };
+		return { text, selStart: at.start, selEnd: at.end };
+	}
+</script>
+```
+
+## !!steps Accepting without immediately reopening
+
+Insertion replaces the span from the word's start to the caret, then restores
+focus and applies the placeholder selection — offset by `start`, since
+`expandSnippet` reports positions relative to its own output.
+
+`acDismissed` is the detail that makes it feel right. Having just inserted
+`SUM(`, the text before the caret still ends in an identifier, so `acWord` would
+match and the dropdown would spring straight back open over the argument you are
+about to type. Setting the flag suppresses it until the next keystroke, where
+the `oninput` handler clears it.
+
+The `queueMicrotask` defers focus and selection until after Svelte has flushed
+the new `code` value into the DOM; setting a selection range before that would
+address the old text.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
+	function acceptCompletion(item: FormulaCompletion): void {
+		if (!acWord || !textareaEl) return;
+		const { text, selStart, selEnd } = expandSnippet(item.insertText ?? `${item.label}()`);
+		const start = acWord.start;
+		code = code.slice(0, start) + text + code.slice(caretPos);
+		// !mark
+		acDismissed = true; // stay closed until the user types again
+		queueMicrotask(() => {
+			textareaEl?.focus();
+			textareaEl?.setSelectionRange(start + selStart, start + selEnd);
+			caretPos = start + selEnd;
+		});
+	}
+</script>
+```
+
+## !!steps Finding the caret in pixels
+
+A textarea will not tell you where its caret is on screen, which the dropdown
+needs in order to appear beneath the word being typed.
+
+The standard workaround is a **mirror**: a hidden div copying the textarea's
+font, padding and width, filled with the text up to the caret. A zero-width
+marker span is appended, and its `offsetLeft` and `offsetTop` are the caret's
+coordinates — the browser does the text layout that would otherwise have to be
+reimplemented.
+
+Two adjustments make it usable. The text is truncated *before* the word being
+completed, so the popup anchors to the word's start rather than drifting right
+as you type. And `left` is clamped against the container width so a caret near
+the right edge does not push the dropdown off-panel.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
+		// !mark
+		mirror.textContent = upto.slice(0, upto.length - wordLen);
+		const marker = document.createElement('span');
+		marker.textContent = '\u200b';
+		mirror.appendChild(marker);
+		const lineHeight = parseFloat(cs.lineHeight) || 18;
+		// !mark(1:4)
+		const left = Math.max(
+			0,
+			Math.min(marker.offsetLeft - el.scrollLeft, el.clientWidth - 290)
+		);
+		acPos = { left, top: marker.offsetTop - el.scrollTop + lineHeight + 2 };
+	}
+</script>
+```
+
+## !!steps Repointing a reference instead of appending
+
+Two features insert text from outside: clicking a function in
+[FormulaDocs.svelte](/docs/src/lib/components/FormulaDocs.svelte), and pointing
+at a cell on the grid while a formula is open.
+
+Pointing needs more than insertion. In a spreadsheet, clicking one cell and
+then another should *move* the reference, not produce `A1B2`. `lastRefSpan`
+remembers where the previous pointed reference landed, and when the caret is
+still sitting exactly at its end, the replacement starts from that reference's
+beginning — overwriting it.
+
+The condition is deliberately strict: both selection ends must equal the
+remembered end, so any click elsewhere or manual edit falls through to normal
+insertion. Typing clears the marker too, in the `oninput` handler.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
 			const isRef = app.pendingInsertIsRef;
 			let start = textareaEl.selectionStart ?? code.length;
 			let end = textareaEl.selectionEnd ?? start;
+			// !mark(1:3)
 			if (isRef && lastRefSpan && start === lastRefSpan.end && end === lastRefSpan.end) {
 				start = lastRefSpan.start;
 			}
@@ -218,45 +259,29 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			lastRefSpan = isRef ? { start, end: start + text.length } : undefined;
 			app.pendingEditorInsert = '';
 			app.pendingInsertIsRef = false;
-			const caret = start + text.length;
-			queueMicrotask(() => {
-				textareaEl?.focus();
-				textareaEl?.setSelectionRange(caret, caret);
-				caretPos = caret;
-			});
-		}
-	});
+</script>
+```
 
-	const cell = $derived.by(() => {
-		void app.redraw;
-		return sheetController.sheet.getCell(app.editorCell.x, app.editorCell.y);
-	});
-	const result = $derived(cell?.evaluation_result);
-	const modeColor = $derived(editorModeColor(app.editorMode));
-	const modeName = $derived(
-		app.editorMode === 'FORMULA'
-			? 'Formula'
-			: app.editorMode === 'JAVASCRIPT'
-				? 'JavaScript'
-				: 'Python'
-	);
+## !!steps Swallowing only the keys it owns
 
-	async function run(): Promise<void> {
-		if (running) return;
-		running = true;
-		try {
-			await saveCellCode(app.editorCell.x, app.editorCell.y, app.editorMode, code);
-		} finally {
-			running = false;
-		}
-	}
+The comment states the policy: this handler intercepts what it handles and lets
+everything else bubble, so global shortcuts keep working while the editor has
+focus. That is the opposite of
+[CellInput.svelte](/docs/src/lib/components/CellInput.svelte), which stops
+everything — appropriate there, since a one-line cell editor has no shortcuts
+of its own to preserve.
 
-	function close(): void {
-		app.showCodeEditor = false;
-	}
+Cmd/Ctrl+Enter runs, checked first so it wins regardless of any other state.
 
-	// swallow only the keys handled here; everything else bubbles so global
-	// shortcuts (⌘., ⌘P, zoom, …) keep working while the editor is focused
+The autocomplete block then takes priority over the editor's own bindings while
+the dropdown is open, and only while the event came from the textarea. Arrows
+move the selection with the same wrap-around arithmetic used elsewhere, Tab and
+Enter both accept, and Escape dismisses the dropdown **without closing the
+panel** — the reason that Escape case is handled inside the guarded block and
+returns early, ahead of the Escape below that does close it.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
 	function onKeyDown(e: KeyboardEvent): void {
 		if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
 			e.preventDefault();
@@ -265,6 +290,7 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			return;
 		}
 		// autocomplete owns navigation keys while its dropdown is open
+		// !mark
 		if (acOpen && e.target === textareaEl) {
 			if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
 				e.preventDefault();
@@ -282,63 +308,62 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 			if (e.key === 'Escape') {
 				e.preventDefault();
 				e.stopPropagation();
+				// !mark
 				acDismissed = true;
 				return;
 			}
 		}
-		if (e.key === 'Escape') {
-			e.preventDefault();
-			e.stopPropagation();
-			close();
-			return;
-		}
+</script>
+```
+
+## !!steps Tab indents instead of leaving
+
+Left alone, Tab moves focus out of the textarea — useless in a code editor. So
+it is intercepted and turned into four spaces at the caret, with the selection
+restored afterwards.
+
+Because it is checked *after* the autocomplete block, Tab accepts a completion
+when the dropdown is open and indents when it is not, which is the behavior
+every code editor has trained users to expect.
+
+The `e.target === textareaEl` test keeps the rule scoped to the editing
+surface, so Tab still moves focus normally between the header's buttons.
+
+```svelte ! CodeEditor.svelte
+<script lang="ts">
 		if (e.key === 'Tab' && e.target === textareaEl && textareaEl) {
 			e.preventDefault();
 			e.stopPropagation();
 			const start = textareaEl.selectionStart;
 			const end = textareaEl.selectionEnd;
+			// !mark
 			code = code.slice(0, start) + '    ' + code.slice(end);
 			queueMicrotask(() => textareaEl?.setSelectionRange(start + 4, start + 4));
 		}
 	}
 </script>
+```
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="code-editor" onkeydown={onKeyDown}>
-	<div class="header" style:border-top="3px solid {modeColor}">
-		<div class="title">
-			<span class="mode" style:color={modeColor}>{modeName}</span>
-			<span class="cellref">
-				Cell ({app.editorCell.x}, {app.editorCell.y})
-				<span class="a1">{getCellA1Notation(app.editorCell.x, app.editorCell.y)}</span>
-			</span>
-		</div>
-		<div class="actions">
-			{#if app.editorMode === 'FORMULA'}
-				<button
-					class="fx"
-					onclick={() => (app.showFormulaDocs = true)}
-					title="Browse all formula functions"
-				>
-					ƒx Functions
-				</button>
-			{/if}
-			<button class="run" onclick={() => void run()} disabled={running} title="Run ({KeyboardSymbols.Cmd}{KeyboardSymbols.Enter})">
-				{#if running}Running…{:else}▶ Run{/if}
-			</button>
-			<button class="close" onclick={close} title="Close (Esc)">✕</button>
-		</div>
-	</div>
+## !!steps The stacked markup, and what each event resets
 
-	{#if app.editorMode === 'PYTHON' && ($pythonStatus.state === 'loading' || $pythonStatus.detail)}
-		<div class="python-loading">
-			{$pythonStatus.detail ??
-				'Loading Python runtime (Pyodide + pandas)… first run may take a moment.'}
-		</div>
-	{/if}
+The `<pre>` and `<textarea>` sit in the same container. The `<pre>` is
+`aria-hidden` since it duplicates text a screen reader already gets from the
+textarea, and the trailing `{'\n'}` guarantees a final line box so the last line
+scrolls identically in both layers.
 
-	<div class="editor-area">
-		<pre class="highlight" aria-hidden="true" bind:this={highlightEl}>{#each hlTokens as t}{#if t.type === 'plain'}{t.text}{:else}<span class="syn-{t.type}">{t.text}</span>{/if}{/each}{'\n'}</pre>
+The token spans carry `syn-{t.type}` classes built at runtime — the reason
+those colors live in the global [app.css](/docs/src/app.css) rather than in this
+component's scoped styles.
+
+The handlers divide the work by what each event can change: `oninput` clears
+both dismissal flags and the ref marker; `onscroll` re-syncs the layers and
+repositions the dropdown; `onkeyup` refreshes the caret only for keys that move
+it, avoiding recomputation on every character; and `onblur` dismisses the
+dropdown — which is why the list items below use `onmousedown` with
+`preventDefault` rather than `onclick`, since a click would blur the textarea
+and close the dropdown before the selection could register.
+
+```svelte ! CodeEditor.svelte
 		<textarea
 			bind:this={textareaEl}
 			bind:value={code}
@@ -360,41 +385,27 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 				refreshAcPos();
 			}}
 			onblur={() => (acDismissed = true)}
-			placeholder={app.editorMode === 'FORMULA'
-				? 'e.g.  SUM(A0:A5) * 2'
-				: app.editorMode === 'JAVASCRIPT'
-					? "e.g.\nlet total = q.cells('D6');\nreturn total * 2;"
-					: 'e.g.\nresult = cell(0, 0)\nresult * 2'}
-		></textarea>
-		{#if acOpen}
-			<div class="ac" style:left="{acPos.left}px" style:top="{acPos.top}px">
-				<ul>
-					{#each acItems as item, i (item.label)}
-						<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-						<li
-							class:sel={i === acSel}
-							onmousedown={(e) => {
-								e.preventDefault();
-								acceptCompletion(item);
-							}}
-							onmousemove={() => (acIndex = i)}
-						>
-							<span class="ac-fx">ƒ</span>{item.label}
-						</li>
-					{/each}
-				</ul>
-				{#if acItems[acSel]}
-					<div class="ac-doc">
-						<div class="ac-usage">{acItems[acSel].detail?.split('\n')[0]}</div>
-						<div class="ac-text">{acDocText(acItems[acSel])}</div>
-					</div>
-				{/if}
-			</div>
-		{/if}
-	</div>
+```
 
-	<div class="output">
-		<div class="output-header">OUTPUT</div>
+## !!steps Reporting whatever the run produced
+
+The output pane reads the cell's stored `evaluation_result`, so it survives
+closing and reopening the panel — it is not transient component state.
+
+A successful run can produce four different things, rendered independently
+rather than as alternatives: an image from a returned canvas or a captured
+chart, a scalar value, a note when the result spilled onto the grid, and
+captured stdout. The array case reports a *count* rather than the values, since
+those are already visible in the cells behind the panel.
+
+The explicit `!== null && !== undefined` test is doing real work: a formula that
+legitimately evaluates to `0` or an empty string must still display, which a
+truthiness check would swallow.
+
+Failure replaces all of it with the error text, and a cell that has never run
+says so rather than showing an empty pane.
+
+```svelte ! CodeEditor.svelte
 		{#if result}
 			{#if result.success}
 				{#if result.image_output}
@@ -417,222 +428,22 @@ hand-written walkthrough, remove `generated: true` from the frontmatter so
 		{:else}
 			<div class="output-note">Not run yet.</div>
 		{/if}
-	</div>
-</div>
+```
 
-<style>
-	.code-editor {
-		width: min(420px, 45vw);
-		border-left: 1px solid var(--border);
-		background: var(--panel);
-		display: flex;
-		flex-direction: column;
-		font-size: 0.85rem;
-	}
-	.header {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		padding: 0.5rem 0.75rem;
-		border-bottom: 1px solid var(--border-light);
-	}
-	.title {
-		display: flex;
-		flex-direction: column;
-		gap: 0.1rem;
-	}
-	.mode {
-		font-weight: 600;
-	}
-	.cellref {
-		color: var(--muted);
-		font-size: 0.75rem;
-	}
-	.a1 {
-		color: var(--faint-2);
-		margin-left: 0.4rem;
-	}
-	.actions {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-	}
-	.run {
-		background: #6cd4ff;
-		color: #003a52;
-		border: none;
-		border-radius: 3px;
-		padding: 0.3rem 0.8rem;
-		font: inherit;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.run:disabled {
-		opacity: 0.6;
-		cursor: default;
-	}
-	.fx {
-		background: none;
-		border: 1px solid var(--border);
-		border-radius: 3px;
-		color: var(--formula);
-		padding: 0.3rem 0.6rem;
-		font: inherit;
-		font-size: 0.78rem;
-		cursor: pointer;
-	}
-	.fx:hover {
-		background: var(--hover);
-		border-color: var(--formula);
-	}
-	.close {
-		background: none;
-		border: none;
-		font-size: 1rem;
-		color: var(--muted);
-		cursor: pointer;
-		padding: 0.2rem 0.4rem;
-	}
-	.python-loading {
-		padding: 0.4rem 0.75rem;
-		background: var(--warn-bg);
-		color: var(--warn-text);
-		font-size: 0.75rem;
-	}
-	.editor-area {
-		position: relative;
-		flex: 1;
-		display: flex;
-		min-height: 8rem;
-	}
-	/* the textarea and the highlight layer must share identical text metrics
-	 * so their glyphs overlap exactly */
-	.code,
-	.highlight {
-		padding: 0.75rem;
-		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-		font-size: 0.8rem;
-		line-height: 1.5;
-		tab-size: 4;
-		white-space: pre-wrap;
-		overflow-wrap: break-word;
-	}
-	.code {
-		flex: 1;
-		width: 100%;
-		border: none;
-		outline: none;
-		resize: none;
-		position: relative; /* paints above the absolutely-positioned highlight */
-		color: transparent; /* the highlight layer renders the glyphs */
-		background: transparent;
-	}
-	.code::placeholder {
-		color: var(--faint);
-	}
-	.highlight {
-		position: absolute;
-		inset: 0;
-		margin: 0;
-		overflow: hidden;
-		pointer-events: none;
-		color: var(--text);
-	}
-	.ac {
-		position: absolute;
-		z-index: 70;
-		width: 280px;
-		background: var(--panel);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		box-shadow: 0 6px 20px var(--shadow);
-		font-size: 0.78rem;
-		overflow: hidden;
-	}
-	.ac ul {
-		list-style: none;
-		margin: 0;
-		padding: 0.2rem 0;
-		max-height: 11rem;
-		overflow-y: auto;
-	}
-	.ac li {
-		padding: 0.22rem 0.6rem;
-		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-		font-size: 0.75rem;
-		cursor: pointer;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.ac li.sel {
-		background: var(--accent-soft);
-	}
-	.ac-fx {
-		color: var(--formula);
-		margin-right: 0.45rem;
-		font-style: italic;
-	}
-	.ac-doc {
-		border-top: 1px solid var(--border-light);
-		padding: 0.4rem 0.6rem;
-		background: var(--panel-2);
-	}
-	.ac-usage {
-		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-		font-size: 0.7rem;
-		color: var(--accent);
-		margin-bottom: 0.25rem;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	.ac-text {
-		color: var(--muted);
-		font-size: 0.72rem;
-		line-height: 1.4;
-		display: -webkit-box;
-		-webkit-line-clamp: 3;
-		line-clamp: 3;
-		-webkit-box-orient: vertical;
-		overflow: hidden;
-	}
-	.output {
-		border-top: 1px solid var(--border-light);
-		max-height: 40%;
-		overflow: auto;
-		padding: 0.5rem 0.75rem;
-	}
-	.output-header {
-		font-size: 0.65rem;
-		letter-spacing: 0.08em;
-		color: var(--faint-2);
-		margin-bottom: 0.3rem;
-	}
-	.output-value {
-		font-family: 'SF Mono', ui-monospace, Menlo, Consolas, monospace;
-		font-size: 0.8rem;
-	}
-	.output-image {
-		max-width: 100%;
-		height: auto;
-		border: 1px solid var(--border-light);
-		border-radius: 3px;
-		margin-bottom: 0.3rem;
-	}
-	.output-note {
-		color: var(--muted);
-		font-size: 0.75rem;
-	}
-	pre.stdout,
-	pre.stderr {
-		margin: 0.3rem 0 0;
-		font-size: 0.75rem;
-		white-space: pre-wrap;
-		word-break: break-word;
-	}
-	pre.stderr {
-		color: var(--error);
-	}
-</style>
-````
+</Scrollycoding>
+
+Running delegates to `saveCellCode` in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), which writes the source onto
+the cell and pushes it through
+[updateCellAndDCells.ts](/docs/src/lib/core/updateCellAndDCells.ts) — so the
+same path handles evaluation, spilling and dependent recomputation regardless
+of language. The panel is mounted beside the grid by
+[+page.svelte](/docs/src/routes/+page.svelte) and opened either by
+[CellTypeMenu.svelte](/docs/src/lib/components/CellTypeMenu.svelte) or directly
+from [keyboard.ts](/docs/src/lib/grid/keyboard.ts).
+
+The Python banner deserves a mention: while
+[pythonRunner.ts](/docs/src/lib/python/pythonRunner.ts) is downloading Pyodide
+or installing a package, its status store drives a line at the top of the panel,
+so a first run that takes several seconds explains itself instead of appearing
+stuck.
