@@ -1,37 +1,35 @@
 ---
 title: "SheetController.test.ts"
-description: "Unit tests for SheetController.ts."
+description: "Vitest coverage for transactions, sheet management and cross-sheet deps — including the unwind that must not stop halfway"
 source: "src/lib/core/SheetController.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Seventeen tests across three suites, covering the undo system, sheet
+management, and the cross-sheet dependency index in
+[SheetController.ts](/docs/src/lib/core/SheetController.ts).
 
-````ts SheetController.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { SheetController } from './SheetController';
-import type { Cell } from './types';
+Undo is the kind of feature that appears to work until a specific sequence
+proves it does not, so several of these tests are shaped around exactly the
+sequences that would expose a plausible shortcut.
 
-function textCell(x: number, y: number, value: string): Cell {
-	return { x, y, type: 'TEXT', value, last_modified: '2026-01-01T00:00:00.000Z' };
-}
+<Scrollycoding>
 
-describe('transactions and undo/redo', () => {
-	it('undoes and redoes a setCell', () => {
-		const sc = new SheetController();
-		sc.startTransaction();
-		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'a') });
-		sc.endTransaction();
+## !!steps The round trip, then the one that catches a half-unwind
 
-		expect(sc.sheet.getCell(0, 0)?.value).toBe('a');
-		sc.undo();
-		expect(sc.sheet.getCell(0, 0)).toBeUndefined();
-		sc.redo();
-		expect(sc.sheet.getCell(0, 0)?.value).toBe('a');
-	});
+The first test is the baseline: write, undo back to nothing, redo back to the
+value.
 
+The second is the one that matters, and its inline comment says why. Writing to
+the *same cell twice inside one transaction* produces two inverse ops. Applying
+them forwards would restore `'first'` and stop, leaving the cell populated when
+it should be gone; only unwinding in reverse walks all the way back.
+
+Asserting `undefined` rather than `'first'` is what distinguishes a correct
+implementation from one that merely looks correct on single-op transactions —
+which is what most real edits are, so this failure would hide easily.
+
+```ts ! SheetController.test.ts
 	it('applies inverse ops in reverse order within a transaction', () => {
 		const sc = new SheetController();
 		sc.startTransaction();
@@ -41,9 +39,24 @@ describe('transactions and undo/redo', () => {
 
 		expect(sc.sheet.getCell(0, 0)?.value).toBe('second');
 		sc.undo(); // must unwind second → first → gone, not leave 'first' behind
+		// !mark
 		expect(sc.sheet.getCell(0, 0)).toBeUndefined();
 	});
+```
 
+## !!steps Two rules about what enters the history
+
+Branch discarding is tested as a sequence rather than a state: edit, undo — so
+redo is available — then edit again, and redo must be gone. That is the
+standard behavior, and the assertion pair around the second transaction is what
+pins the timing to `endTransaction` rather than to `execute`.
+
+The empty-transaction test is four lines and guards something users feel
+constantly. Opening and closing without executing anything must leave no undo
+step, so a gesture that changed nothing — a resize dragged back to where it
+started, a format reapplied — does not silently consume a press of `⌘Z`.
+
+```ts ! SheetController.test.ts
 	it('clears the redo stack when a new transaction lands', () => {
 		const sc = new SheetController();
 		sc.startTransaction();
@@ -55,6 +68,7 @@ describe('transactions and undo/redo', () => {
 		sc.startTransaction();
 		sc.execute({ type: 'setCell', x: 1, y: 1, cell: textCell(1, 1, 'b') });
 		sc.endTransaction();
+		// !mark
 		expect(sc.hasRedo).toBe(false);
 	});
 
@@ -62,9 +76,26 @@ describe('transactions and undo/redo', () => {
 		const sc = new SheetController();
 		sc.startTransaction();
 		sc.endTransaction();
+		// !mark
 		expect(sc.hasUndo).toBe(false);
 	});
+```
 
+## !!steps Restoring a format, not merging into it
+
+This test sets up a pre-existing `bold`, then replaces it with `italic` through
+a transaction — and asserts that bold is **gone** afterwards, not merged.
+
+That middle assertion is doing the real work. `setFormat` on
+[Sheet.ts](/docs/src/lib/core/Sheet.ts) merges by design, so applying a format
+op naively would leave `bold` alongside `italic`. The controller clears before
+setting precisely to avoid that, and this line is what would fail if the clear
+were dropped.
+
+The undo then restores the original bold, confirming the captured inverse held
+the full previous format rather than a delta.
+
+```ts ! SheetController.test.ts
 	it('restores a previous format on undo', () => {
 		const sc = new SheetController();
 		sc.sheet.setFormat(2, 2, { bold: true });
@@ -73,11 +104,30 @@ describe('transactions and undo/redo', () => {
 		sc.endTransaction();
 
 		expect(sc.sheet.getFormat(2, 2)?.italic).toBe(true);
+		// !mark
 		expect(sc.sheet.getFormat(2, 2)?.bold).toBeUndefined();
 		sc.undo();
+		// !mark
 		expect(sc.sheet.getFormat(2, 2)?.bold).toBe(true);
 	});
+```
 
+## !!steps Undo restores absence, not a default
+
+The heading test asserts something subtler than a size. After undoing a resize,
+the check is not that the column is back to its default width — it is that
+`exportColumns()` is **empty**.
+
+Those are different states. Storing the default width would produce the same
+visual result while leaving an entry that persists into the saved file, and the
+sparse discipline in [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts) exists
+to prevent exactly that accumulation. Undoing has to restore the *absence* of a
+value.
+
+It works because the captured inverse holds `undefined` when the column had
+never been resized, and setting `undefined` deletes rather than stores.
+
+```ts ! SheetController.test.ts
 	it('restores heading sizes on undo', () => {
 		const sc = new SheetController();
 		sc.startTransaction();
@@ -86,9 +136,27 @@ describe('transactions and undo/redo', () => {
 
 		expect(sc.sheet.gridOffsets.getColumnWidth(3)).toBe(200);
 		sc.undo();
+		// !mark
 		expect(sc.sheet.gridOffsets.exportColumns()).toEqual([]);
 	});
+```
 
+## !!steps Editing one sheet while looking at another
+
+This test constructs the situation the `sheetIndex` tag exists for: two sheets,
+the *first* one current, and an op explicitly targeting the second.
+
+Three assertions cover it completely. The current sheet must be untouched, the
+tagged sheet must have the value, and — the important one — undo must reverse
+it on the tagged sheet rather than on whichever is current. An implementation
+that resolved the sheet at apply time instead of carrying the tag through would
+pass the first two and fail the third.
+
+The no-op test beside it is trivial but worth having: undo and redo on empty
+stacks must not throw, since the keyboard shortcuts are always live regardless
+of history.
+
+```ts ! SheetController.test.ts
 	it('routes ops to the tagged sheet, not the current one', () => {
 		const sc = new SheetController();
 		sc.addSheet(); // becomes current (index 1)
@@ -100,24 +168,34 @@ describe('transactions and undo/redo', () => {
 		expect(sc.sheets[0].getCell(0, 0)).toBeUndefined();
 		expect(sc.sheets[1].getCell(0, 0)?.value).toBe('other');
 		sc.undo();
+		// !mark
 		expect(sc.sheets[1].getCell(0, 0)).toBeUndefined();
 	});
+```
 
-	it('undo/redo on empty stacks is a no-op', () => {
-		const sc = new SheetController();
-		expect(() => {
-			sc.undo();
-			sc.redo();
-		}).not.toThrow();
-	});
-});
+## !!steps Names that reuse freed numbers
 
-describe('sheet management', () => {
+The naming test ends on an assertion that looks like a mistake: after two
+sheets named `Sheet2` and `Sheet3`, renaming index 1 to `Data` makes the *next*
+sheet `Sheet2` again.
+
+That is gap-filling rather than counting. The generator scans for the lowest
+unused `Sheet{n}`, so freeing a name makes it available immediately instead of
+leaving a hole and producing `Sheet4`. Whether that is desirable is a judgement
+call; the test at least makes it deliberate.
+
+The validation test covers three rejection paths in sequence — a duplicate
+name, a whitespace-only name, and a 40-character name clamped to 31 — asserting
+after each that the sheet kept or received the right value rather than checking
+only the final state.
+
+```ts ! SheetController.test.ts
 	it('names new sheets with the next free number', () => {
 		const sc = new SheetController();
 		expect(sc.addSheet().name).toBe('Sheet2');
 		expect(sc.addSheet().name).toBe('Sheet3');
 		sc.renameSheet(1, 'Data');
+		// !mark
 		expect(sc.addSheet().name).toBe('Sheet2');
 	});
 
@@ -129,24 +207,31 @@ describe('sheet management', () => {
 		sc.renameSheet(1, '   '); // empty → refused
 		expect(sc.sheets[1].name).toBe('Sheet2');
 		sc.renameSheet(1, 'x'.repeat(40));
+		// !mark
 		expect(sc.sheets[1].name).toBe('x'.repeat(31));
 	});
+```
 
-	it('never deletes the last sheet, and clears undo history on delete', () => {
-		const sc = new SheetController();
-		sc.deleteSheet(0);
-		expect(sc.sheets.length).toBe(1);
+## !!steps Deletion, deep copies, and a moving current index
 
-		sc.addSheet();
-		sc.startTransaction();
-		sc.execute({ type: 'setCell', x: 0, y: 0, cell: textCell(0, 0, 'a') });
-		sc.endTransaction();
-		expect(sc.hasUndo).toBe(true);
-		sc.deleteSheet(1);
-		expect(sc.sheets.length).toBe(1);
-		expect(sc.hasUndo).toBe(false);
-	});
+Three sheet-management behaviors, each testing something that would be easy to
+get subtly wrong.
 
+Deleting the only sheet is refused, and deleting any sheet **clears the undo
+history** — asserted by checking `hasUndo` flips from true to false. That is
+the consequence of ops carrying sheet indices that no longer mean the same
+thing once the list shifts.
+
+The duplication test proves depth by mutation rather than by comparing
+structures: change the copy, then assert the original is unchanged. A shallow
+copy sharing the underlying maps would fail on that final line while passing
+every equality check before it.
+
+The move test tracks the *current index* across a reorder, confirming it follows
+the sheet the user was on rather than staying at a position that now holds a
+different sheet.
+
+```ts ! SheetController.test.ts
 	it('duplicates a sheet as a deep copy', () => {
 		const sc = new SheetController();
 		sc.sheet.setCell(textCell(1, 1, 'source'));
@@ -155,6 +240,7 @@ describe('sheet management', () => {
 		expect(sc.sheets[1].name).toBe('Sheet1 copy');
 		expect(sc.sheets[1].getCell(1, 1)?.value).toBe('source');
 		sc.sheets[1].setCell(textCell(1, 1, 'changed'));
+		// !mark
 		expect(sc.sheets[0].getCell(1, 1)?.value).toBe('source');
 	});
 
@@ -164,19 +250,30 @@ describe('sheet management', () => {
 		sc.addSheet(); // current index 2 (Sheet3)
 		sc.moveSheet(2, -1);
 		expect(sc.sheets.map((s) => s.name)).toEqual(['Sheet1', 'Sheet3', 'Sheet2']);
+		// !mark
 		expect(sc.currentSheetIndex).toBe(1);
 	});
-});
+```
 
-describe('cross-sheet dependency graph', () => {
-	it('finds dependents whose rects contain the changed cell', () => {
-		const sc = new SheetController();
-		sc.setCrossSheetDeps({ sheetIndex: 1, x: 5, y: 5 }, [
-			{ sheetName: 'Sheet1', x0: 0, y0: 0, x1: 2, y1: 2 }
-		]);
+## !!steps Rectangle containment, and replacement by dependent
 
+The cross-sheet suite tests the rectangle index with three lookups against one
+registered dependency: a cell inside the rect matches, a cell outside it does
+not, and the same coordinates on a *differently named* sheet do not either.
+
+That third case is the one guarding against a containment check that forgot to
+compare the sheet name — which would silently recompute formulas on every sheet
+whenever any sheet changed.
+
+The replacement test covers re-registration. Setting deps for the same dependent
+cell twice must **discard** the first set, not accumulate, so a formula edited
+from reading `A0` to reading `I9` stops being woken by changes to `A0`. Without
+that, stale dependencies would pile up for the life of the document.
+
+```ts ! SheetController.test.ts
 		expect(sc.getCrossSheetDependents('Sheet1', 1, 1)).toEqual([{ sheetIndex: 1, x: 5, y: 5 }]);
 		expect(sc.getCrossSheetDependents('Sheet1', 3, 1)).toEqual([]);
+		// !mark
 		expect(sc.getCrossSheetDependents('Other', 1, 1)).toEqual([]);
 	});
 
@@ -189,8 +286,19 @@ describe('cross-sheet dependency graph', () => {
 			{ sheetName: 'Sheet1', x0: 9, y0: 9, x1: 9, y1: 9 }
 		]);
 
+		// !mark
 		expect(sc.getCrossSheetDependents('Sheet1', 0, 0)).toEqual([]);
 		expect(sc.getCrossSheetDependents('Sheet1', 9, 9)).toEqual([{ sheetIndex: 1, x: 5, y: 5 }]);
 	});
-});
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. Every test constructs a bare `SheetController` with no
+mocking, since the class owns plain [Sheet.ts](/docs/src/lib/core/Sheet.ts)
+instances and needs no environment — which is what makes the undo behavior
+practical to test this thoroughly.
+
+Not covered here: `rebuildCrossSheetDeps`, which needs a formula parser injected
+and is exercised only through the app; `onChange`, never asserted as firing; and
+the interaction where a transaction spans multiple sheets at once.

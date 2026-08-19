@@ -1,43 +1,69 @@
 ---
 title: "SheetController.ts"
-description: "Operation-based transactions with captured inverses, replacing Quadratic's statement/runner architecture. Ops are tagged with the sheet they ran on so undo/r…"
+description: "Multi-sheet ownership and undo — transactions that store captured inverses, making undo and redo the same operation"
 source: "src/lib/core/SheetController.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Owns the collection of sheets and everything that mutates them. Two
+responsibilities live here: managing sheets as a list, and wrapping cell
+changes in undoable transactions.
 
-````ts SheetController.ts -n
-import { Sheet } from './Sheet';
-import type { Cell, CellFormat } from './types';
+The undo design is the part worth studying. Rather than recording what was done
+and computing how to reverse it, each operation captures its own inverse at the
+moment it is applied — which makes undo and redo literally the same code path.
 
-// Operation-based transactions with captured inverses, replacing Quadratic's
-// statement/runner architecture. Ops are tagged with the sheet they ran on so
-// undo/redo lands on the right sheet in a multi-sheet file.
+<Scrollycoding>
 
+## !!steps Three operations, each tagged with its sheet
+
+Everything undoable is one of three shapes: a cell write, a format write, or a
+column or row resize. Anything not expressible as these — adding a sheet,
+renaming one — is deliberately outside the system.
+
+The intersection type appends `sheetIndex` to all three. That tag is what makes
+undo correct in a multi-sheet file: without it, undoing an edit after switching
+tabs would apply the reversal to whichever sheet happened to be visible. The
+header comment names this as the reason the ops carry it at all.
+
+A `Transaction` is just a list of ops, and the comment on that field states the
+crucial detail — they are the **inverses**, stored in execution order.
+
+```ts ! SheetController.ts
 export type Op = (
 	| { type: 'setCell'; x: number; y: number; cell: Cell | undefined }
 	| { type: 'setFormat'; x: number; y: number; format: CellFormat | undefined }
 	| { type: 'setHeading'; kind: 'column' | 'row'; id: number; size: number | undefined }
+	// !mark
 ) & { sheetIndex?: number };
 
 interface Transaction {
+	// !mark
 	ops: Op[]; // inverse ops, in execution order (undo applies them reversed)
 }
+```
 
-export class SheetController {
-	sheets: Sheet[] = [new Sheet()];
-	currentSheetIndex = 0;
+## !!steps Cross-sheet dependencies as rectangles
 
-	private undoStack: Transaction[] = [];
-	private redoStack: Transaction[] = [];
-	private activeTransaction: Transaction | undefined;
+Ordinary dependencies live in [Sheet.ts](/docs/src/lib/core/Sheet.ts) as
+cell-to-cell edges. Cross-sheet ones cannot: a formula reading `Data!A0:Z999`
+would generate thousands of edges for a single reference.
 
+So they are stored as **rectangles** — one entry covering the whole referenced
+range, as the comment explains. Lookup becomes a containment test rather than a
+hash, which is linear in the number of cross-sheet formulas rather than in the
+cells they cover. That is the right trade when the former is small and the
+latter can be enormous.
+
+The other note in that comment matters for correctness: this index is **not
+persisted**. It is rebuilt from formula text on load, which is why the field is
+private and no export method touches it.
+
+```ts ! SheetController.ts
 	/** Cross-sheet formula dependencies: rect on a named sheet → dependent
 	 * cell. Kept as rects so huge ranges cost one entry; rebuilt from formula
 	 * text on load, so it is not persisted in the file. */
+	// !mark
 	private crossDeps: {
 		sheetName: string;
 		x0: number;
@@ -48,48 +74,28 @@ export class SheetController {
 		depX: number;
 		depY: number;
 	}[] = [];
+```
 
-	setCrossSheetDeps(
-		dependent: { sheetIndex: number; x: number; y: number },
-		refs: { sheetName: string; x0: number; y0: number; x1: number; y1: number }[]
-	): void {
-		this.crossDeps = this.crossDeps.filter(
-			(d) =>
-				!(
-					d.depSheetIndex === dependent.sheetIndex &&
-					d.depX === dependent.x &&
-					d.depY === dependent.y
-				)
-		);
-		for (const ref of refs) {
-			this.crossDeps.push({
-				...ref,
-				depSheetIndex: dependent.sheetIndex,
-				depX: dependent.x,
-				depY: dependent.y
-			});
-		}
-	}
+## !!steps Rebuilding the cross-sheet index from source text
 
-	/** Cells (possibly on other sheets) whose formulas read (x, y) on `sheetName`. */
-	getCrossSheetDependents(
-		sheetName: string,
-		x: number,
-		y: number
-	): { sheetIndex: number; x: number; y: number }[] {
-		return this.crossDeps
-			.filter(
-				(d) =>
-					d.sheetName === sheetName && x >= d.x0 && x <= d.x1 && y >= d.y0 && y <= d.y1
-			)
-			.map((d) => ({ sheetIndex: d.depSheetIndex, x: d.depX, y: d.depY }));
-	}
+Recovering the index means re-reading every formula, which is why the parser is
+injected as a callback rather than imported. The caller supplies `findSheetRefs`
+from [sheetRefs.ts](/docs/src/lib/formulas/sheetRefs.ts), keeping this file free
+of any dependency on formula syntax.
 
+Scanning the *formula text* rather than the evaluation results is necessary
+here, and it is the one place dependency tracking cannot use the recorded
+`cells_accessed`. Because cross-sheet references are inlined as literal values
+before evaluation, the engine never reports them as accessed — so the only
+surviving evidence of the reference is the source the user typed.
+
+```ts ! SheetController.ts
 	/** Re-derives cross-sheet deps by scanning formula text (used on load). */
 	rebuildCrossSheetDeps(findRefs: (code: string) => { sheetName: string; x0: number; y0: number; x1: number; y1: number }[]): void {
 		this.crossDeps = [];
 		this.sheets.forEach((sheet, sheetIndex) => {
 			for (const cell of sheet.getAllCells()) {
+				// !mark
 				if (cell.type !== 'FORMULA' || !cell.formula_code) continue;
 				const refs = findRefs(cell.formula_code);
 				if (refs.length > 0) {
@@ -98,43 +104,64 @@ export class SheetController {
 			}
 		});
 	}
+```
 
-	/** Called after any model mutation so the UI can re-render/persist. */
-	onChange: () => void = () => {};
+## !!steps Sheet operations deliberately outside undo
 
-	/** The active sheet; all grid actions operate on this. */
-	get sheet(): Sheet {
-		return this.sheets[this.currentSheetIndex] ?? this.sheets[0];
-	}
+The section comment states it plainly: sheet management is not undoable, and
+that matches the version of Quadratic this is a port of.
 
-	// ---------- sheet management (not undoable, matching v0.3) ----------
+`nextSheetName` fills gaps rather than counting up. It collects the names in use
+and returns the first free `Sheet{n}` — so renaming `Sheet2` to something else
+frees that name for the next sheet added, instead of leaving a hole and
+producing `Sheet4`.
 
+`deleteSheet` has two guards worth noting. It refuses to remove the last sheet,
+so the document always has one. And it **clears both history stacks**, because
+the ops in them carry a `sheetIndex` that no longer means what it did once a
+sheet is spliced out. Discarding history is the honest response to indices that
+have shifted underneath it.
+
+```ts ! SheetController.ts
 	private nextSheetName(base = 'Sheet'): string {
 		let n = 1;
 		const names = new Set(this.sheets.map((s) => s.name));
+		// !mark
 		while (names.has(`${base}${n}`)) n++;
 		return `${base}${n}`;
 	}
-
-	addSheet(): Sheet {
-		const sheet = new Sheet();
-		sheet.name = this.nextSheetName();
-		this.sheets.push(sheet);
-		this.currentSheetIndex = this.sheets.length - 1;
-		this.onChange();
-		return sheet;
-	}
-
+	// ...
 	deleteSheet(index: number): void {
+		// !mark
 		if (this.sheets.length <= 1) return;
 		this.sheets.splice(index, 1);
 		this.currentSheetIndex = Math.min(this.currentSheetIndex, this.sheets.length - 1);
 		// undo history may reference the removed sheet; clear to stay consistent
+		// !mark(1:2)
 		this.undoStack = [];
 		this.redoStack = [];
 		this.onChange();
 	}
+```
 
+## !!steps Copying a sheet through its own serializer
+
+Duplication reuses the export and import methods rather than writing a clone,
+round-tripping through `JSON.parse(JSON.stringify(...))`.
+
+That is the cheapest way to guarantee a genuinely deep copy: every map, nested
+format object and evaluation result is reconstructed rather than shared, so
+editing the copy cannot reach back into the original. It also means duplication
+is automatically correct for any field the file format already handles.
+
+`rebuildDependencies` follows because the dependency graph is derived data —
+the copy's cells carry their `cells_accessed`, so the index can be regenerated
+rather than serialized across.
+
+The naming loop mirrors `nextSheetName`, appending a number only when `Sheet1
+copy` is taken.
+
+```ts ! SheetController.ts
 	duplicateSheet(index: number): void {
 		const source = this.sheets[index];
 		if (!source) return;
@@ -144,75 +171,82 @@ export class SheetController {
 		for (let n = 2; names.has(name); n++) name = `${source.name} copy ${n}`;
 		copy.name = name;
 		copy.color = source.color;
+		// !mark
 		copy.import(JSON.parse(JSON.stringify(source.export())));
+		// !mark
 		copy.rebuildDependencies();
 		this.sheets.splice(index + 1, 0, copy);
 		this.currentSheetIndex = index + 1;
 		this.onChange();
 	}
+```
 
-	renameSheet(index: number, name: string): void {
-		const trimmed = name.trim().slice(0, 31);
-		if (!trimmed || this.sheets.some((s, i) => i !== index && s.name === trimmed)) return;
-		this.sheets[index].name = trimmed;
-		this.onChange();
-	}
+## !!steps Opening, closing, and discarding empty transactions
 
-	moveSheet(index: number, direction: -1 | 1): void {
-		const target = index + direction;
-		if (target < 0 || target >= this.sheets.length) return;
-		const [sheet] = this.sheets.splice(index, 1);
-		this.sheets.splice(target, 0, sheet);
-		if (this.currentSheetIndex === index) this.currentSheetIndex = target;
-		else if (this.currentSheetIndex === target) this.currentSheetIndex = index;
-		this.onChange();
-	}
+`startTransaction` closes any transaction still open rather than nesting or
+throwing — a pragmatic choice that keeps a caller who forgot to close one from
+corrupting the next.
 
-	setSheetColor(index: number, color: string | undefined): void {
-		this.sheets[index].color = color;
-		this.onChange();
-	}
+`endTransaction` does two things worth naming. A transaction with no ops is
+**dropped** rather than pushed, so a gesture that turned out to change nothing —
+a resize dragged back to its original width, a format reapplied — does not
+consume an undo step. And landing a real transaction clears the redo stack,
+which is the standard branch-discarding behavior: once you edit after undoing,
+the abandoned future is gone.
 
-	switchSheet(index: number): void {
-		if (index < 0 || index >= this.sheets.length) return;
-		this.currentSheetIndex = index;
-		this.onChange();
-	}
-
-	// ---------- transactions ----------
-
+```ts ! SheetController.ts
 	startTransaction(): void {
+		// !mark
 		if (this.activeTransaction) this.endTransaction();
 		this.activeTransaction = { ops: [] };
 	}
 
 	endTransaction(): void {
 		if (!this.activeTransaction) return;
+		// !mark
 		if (this.activeTransaction.ops.length > 0) {
 			this.undoStack.push(this.activeTransaction);
+			// !mark
 			this.redoStack = [];
 		}
 		this.activeTransaction = undefined;
 		this.onChange();
 	}
+```
 
-	/** Apply op, recording its inverse in the active transaction. */
-	execute(op: Op): void {
-		if (op.sheetIndex === undefined) op.sheetIndex = this.currentSheetIndex;
-		const inverse = this.applyOp(op);
-		this.activeTransaction?.ops.push(inverse);
-	}
+## !!steps Capturing the inverse before mutating
 
+`applyOp` is the heart of the design. For each op it reads the **current** state
+first, builds an op that would restore it, then performs the change and returns
+that inverse.
+
+The ordering is essential — the previous value has to be captured before it is
+overwritten — and so is the copying. `{ ...prev }` snapshots the cell rather
+than keeping a reference, so a later mutation of the live object cannot
+retroactively alter what undo will restore.
+
+Note the format case clears before setting: `setFormat` on
+[Sheet.ts](/docs/src/lib/core/Sheet.ts) merges, so applying a format op without
+clearing first would leave attributes from the old format bleeding into the new
+one. Undo must reproduce a state exactly, not approximately.
+
+The heading case reads its previous size out of the exported headings, so an
+untouched column yields `undefined` — which the inverse then uses to delete the
+entry rather than store a default.
+
+```ts ! SheetController.ts
 	private applyOp(op: Op): Op {
 		const sheet = this.sheets[op.sheetIndex ?? this.currentSheetIndex] ?? this.sheet;
 		const sheetIndex = op.sheetIndex ?? this.currentSheetIndex;
 		switch (op.type) {
 			case 'setCell': {
+				// !mark
 				const prev = sheet.getCell(op.x, op.y);
 				const inverse: Op = {
 					type: 'setCell',
 					x: op.x,
 					y: op.y,
+					// !mark
 					cell: prev ? { ...prev } : undefined,
 					sheetIndex
 				};
@@ -220,51 +254,34 @@ export class SheetController {
 				else sheet.deleteCell(op.x, op.y);
 				return inverse;
 			}
-			case 'setFormat': {
-				const prev = sheet.getFormat(op.x, op.y);
-				const inverse: Op = {
-					type: 'setFormat',
-					x: op.x,
-					y: op.y,
-					format: prev ? { ...prev } : undefined,
-					sheetIndex
-				};
-				if (op.format) {
-					sheet.clearFormat(op.x, op.y);
-					sheet.setFormat(op.x, op.y, op.format);
-				} else sheet.clearFormat(op.x, op.y);
-				return inverse;
-			}
-			case 'setHeading': {
-				const prev =
-					op.kind === 'column'
-						? sheet.gridOffsets.exportColumns().find((c) => c.id === op.id)?.size
-						: sheet.gridOffsets.exportRows().find((r) => r.id === op.id)?.size;
-				const inverse: Op = {
-					type: 'setHeading',
-					kind: op.kind,
-					id: op.id,
-					size: prev,
-					sheetIndex
-				};
-				if (op.kind === 'column') sheet.gridOffsets.setColumnWidth(op.id, op.size);
-				else sheet.gridOffsets.setRowHeight(op.id, op.size);
-				return inverse;
-			}
-		}
-	}
+```
 
-	get hasUndo(): boolean {
-		return this.undoStack.length > 0;
-	}
-	get hasRedo(): boolean {
-		return this.redoStack.length > 0;
-	}
+## !!steps Undo and redo are the same function
 
+Here is the payoff. Both methods pop a transaction, apply its ops **in reverse
+order**, collect the inverses that come back, and push the result onto the
+opposite stack.
+
+The two bodies are identical apart from which stack they read and write. That
+falls out of the representation: since applying a transaction's stored inverses
+produces a new transaction of inverses, undoing an undo *is* a redo — there is
+no separate concept to implement.
+
+Reverse order is what makes multi-op transactions correct. If a transaction set
+a cell twice, unwinding forwards would restore the intermediate value and stop;
+unwinding backwards walks all the way back to the original state.
+
+`execute` completes the picture: it defaults the sheet tag to the current sheet
+and pushes each returned inverse into the open transaction — or nowhere at all
+if none is open, which is how the live resize drag mutates without recording
+history.
+
+```ts ! SheetController.ts
 	undo(): void {
 		const tx = this.undoStack.pop();
 		if (!tx) return;
 		const redo: Transaction = { ops: [] };
+		// !mark
 		for (let i = tx.ops.length - 1; i >= 0; i--) redo.ops.push(this.applyOp(tx.ops[i]));
 		this.redoStack.push(redo);
 		this.onChange();
@@ -274,9 +291,28 @@ export class SheetController {
 		const tx = this.redoStack.pop();
 		if (!tx) return;
 		const undo: Transaction = { ops: [] };
+		// !mark
 		for (let i = tx.ops.length - 1; i >= 0; i--) undo.ops.push(this.applyOp(tx.ops[i]));
 		this.undoStack.push(undo);
 		this.onChange();
 	}
-}
-````
+```
+
+</Scrollycoding>
+
+`onChange` is the single hook the rest of the app hangs off: assigned by
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) to bump the redraw counter and
+schedule an autosave, so every mutation reaches the renderer and the file store
+through one place.
+
+Callers rarely execute ops directly. The mutating helpers in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts) open a transaction, execute the
+ops a gesture implies, and close it — which is why a paste of fifty cells or a
+fill of a hundred is one undo step rather than fifty. The exception is the
+resize drag in [GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte),
+which mutates directly for responsiveness and then replays itself here as a
+single transaction.
+
+Behavior is pinned down by
+[SheetController.test.ts](/docs/src/lib/core/SheetController.test.ts),
+including the reverse-order unwind and the sheet routing.
