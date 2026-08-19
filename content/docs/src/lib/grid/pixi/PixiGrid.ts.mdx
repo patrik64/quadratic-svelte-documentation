@@ -524,6 +524,243 @@ fields on the state snapshot, all in the same single `Graphics`.
 	}
 ```
 
+## !!steps Chart images and the texture cache
+
+Python and JavaScript cells can return a chart, which arrives as a data URL on
+`cell.evaluation_result.image_output`. Those become sprites on a dedicated
+layer, redrawn from scratch each time (`removeChildren`) because the sprites
+themselves are cheap — the expensive part is the decoded texture, which is what
+the cache holds.
+
+The cache key is a *signature* rather than the URL: `url.length` plus the last
+40 characters. Data URLs for charts run to hundreds of kilobytes, so using the
+whole string as a `Map` key would mean hashing all of it on every frame. The
+lookup has three outcomes, and the `'loading'` sentinel is what makes the third
+one safe: a decode is in flight, so skip this cell rather than starting a second
+decode of the same image every frame. When the image finally loads it sets
+`dirtyCells`, which schedules the redraw that will actually place it.
+
+```ts ! PixiGrid.ts
+	private drawImages(range: ReturnType<PixiGrid['visibleRange']>): void {
+		this.imageLayer.removeChildren();
+		const offsets = this.getSheet().gridOffsets;
+		const cells = this.getSheet().getCellsInRect({
+			left: range.colStart - 40,
+			top: range.rowStart - 60,
+			right: range.colEnd,
+			bottom: range.rowEnd
+		});
+		const used = new Set<string>();
+		for (const cell of cells) {
+			const url = cell.evaluation_result?.image_output;
+			if (!url) continue;
+			// !mark
+			const key = `${url.length}:${url.slice(-40)}`;
+			used.add(key);
+			const tex = this.imageTextures.get(key);
+			if (tex === undefined) {
+				// !mark
+				this.imageTextures.set(key, 'loading');
+				const img = new Image();
+				img.onload = () => {
+					if (this.destroyed) return;
+					this.imageTextures.set(key, Texture.from(img));
+					this.dirtyCells = true;
+				};
+				img.src = url;
+				continue;
+			}
+			if (tex === 'loading') continue;
+```
+
+## !!steps Evicting textures that left the view
+
+Placing a ready texture is trivial — a `Sprite` at the cell's world position
+from [GridOffsets.ts](/docs/src/lib/core/GridOffsets.ts).
+
+The loop underneath is the important half. GPU textures are not garbage
+collected when the last sprite referencing them disappears; they have to be
+destroyed explicitly, and a spreadsheet full of charts would otherwise grow
+video memory without bound as you scroll. The `used` set collected during this
+pass is the liveness test: anything in the cache that this frame did not touch
+is gone from view (or its cell was re-run and produced a different URL, hence a
+different key), so it is destroyed. Entries still marked `'loading'` are
+skipped — their decode is in flight and has an `onload` closure pointing at
+this map.
+
+```ts ! PixiGrid.ts
+	private drawImages(range: ReturnType<PixiGrid['visibleRange']>): void {
+		// ...
+			const r = offsets.getCellRect(cell.x, cell.y);
+			const sprite = new Sprite(tex);
+			sprite.position.set(r.x, r.y);
+			this.imageLayer.addChild(sprite);
+		}
+		// evict textures for images that left the view or were re-run
+		for (const [key, tex] of this.imageTextures) {
+			// !mark(1:4)
+			if (!used.has(key) && tex !== 'loading') {
+				tex.destroy(true);
+				this.imageTextures.delete(key);
+			}
+		}
+	}
+```
+
+## !!steps Zooming with cmd and the wheel
+
+Pinch-to-zoom on a trackpad reaches the browser as a wheel event with
+`ctrlKey` set, and the `pixi-viewport` plugins already handle that. Cmd+wheel
+does not, so this listener adds it — registered in the **capture** phase
+precisely so it runs before the viewport's own wheel plugin and can stop the
+event from being interpreted as a pan.
+
+The guard is the whole reason the two paths coexist: bail unless `metaKey` is
+set, and bail if `ctrlKey` is set so a real pinch falls through to the plugin.
+What follows is anchored zooming — convert the pointer to world space *before*
+changing the scale, then move the corner so that same world point lands back
+under the pointer afterwards. That is what makes the grid zoom toward the
+cursor rather than the origin. The exponential `factor` keeps zoom steps
+perceptually even, and the result is clamped to a 0.1–10 range.
+
+`destroy()` removes this listener with the same `capture: true` flag it was
+registered with — a mismatch there would silently fail to detach it.
+
+```ts ! PixiGrid.ts
+		// cmd+wheel zooms (trackpad pinch arrives as ctrl+wheel and is handled
+		// by the pinch/wheel plugins); capture phase so the plugin never pans
+		this.app.canvas.addEventListener('wheel', this.handleMetaWheel, {
+			capture: true,
+			passive: false
+		});
+		// ...
+	private handleMetaWheel = (e: WheelEvent): void => {
+		// !mark
+		if (!e.metaKey || e.ctrlKey) return;
+		e.preventDefault();
+		e.stopImmediatePropagation();
+		const rect = this.app.canvas.getBoundingClientRect();
+		const point = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+		const factor = Math.pow(2, -e.deltaY * 0.01);
+		const newScale = Math.min(10, Math.max(0.1, this.viewport.scale.x * factor));
+		// !mark(1:3)
+		const world = this.viewport.toWorld(point.x, point.y);
+		this.viewport.setZoom(newScale, false);
+		this.viewport.moveCorner(world.x - point.x / newScale, world.y - point.y / newScale);
+		this.handleMoved();
+	};
+```
+
+## !!steps Driving the camera from outside
+
+The camera has two owners: the user dragging the canvas, and the app moving it
+programmatically — zoom buttons, the go-to dialog, keyboard scrolling. Both end
+up writing the same viewport, which is a loop waiting to happen: `handleMoved`
+pushes every viewport change into `app.viewport` in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), and a Svelte effect pushes
+`app.viewport` back down through `applyViewport`.
+
+The epsilon comparison breaks that cycle. When the incoming position already
+matches the current one to within `0.0001`, the method returns without touching
+the viewport, so the echo of a user-driven pan stops there instead of
+re-triggering `moved`.
+
+`resize` is the plainer sibling, resizing renderer and viewport together from
+the `ResizeObserver` in
+[GridCanvas.svelte](/docs/src/lib/components/GridCanvas.svelte). Note the
+doc comment that describes `applyViewport` actually sits a few lines higher,
+above `setTheme`.
+
+```ts ! PixiGrid.ts
+	applyViewport(x: number, y: number, scale: number): void {
+		if (!this.viewport) return;
+		const eps = 0.0001;
+		// !mark(1:6)
+		if (
+			Math.abs(this.viewport.left - x) < eps &&
+			Math.abs(this.viewport.top - y) < eps &&
+			Math.abs(this.viewport.scale.x - scale) < eps
+		)
+			return;
+		this.viewport.setZoom(scale, false);
+		this.viewport.moveCorner(x, y);
+		this.dirtyViewport = true;
+	}
+
+	resize(width: number, height: number): void {
+		if (!this.viewport) return;
+		this.app.renderer.resize(width, height);
+		this.viewport.resize(width, height);
+		this.dirtyViewport = true;
+	}
+```
+
+## !!steps Repainting after a theme change
+
+Switching between light and dark has to reach further than the background
+color, because every cached label was rasterized with the old font color baked
+into its texture. Setting `dirtyCells` is what handles that: as covered in the
+cache steps, a cells-dirty frame invalidates the label cache, so all visible
+text re-rasterizes in the new palette.
+
+All three dirty flags are set, since the headings, gridlines and cursor colors
+come from the same palette in [colors.ts](/docs/src/lib/grid/colors.ts).
+
+```ts ! PixiGrid.ts
+	setTheme(theme: ThemeName): void {
+		setPixiTheme(theme);
+		refreshHeadingLabelStyle();
+		this.app.renderer.background.color = themeBackground(theme);
+		// !mark(1:3)
+		this.dirtyCells = true;
+		this.dirtyViewport = true;
+		this.dirtyCursor = true;
+	}
+```
+
+## !!steps Exporting a region as PNG
+
+Copying a selection as an image reuses the renderer that is already on screen:
+`extract.canvas` re-renders an arbitrary world-space rectangle of the viewport
+off-screen. Because it targets `this.viewport`, the headings are excluded
+automatically — they live on the stage, not in the viewport — and the selection
+overlay is hidden explicitly around the call.
+
+Two details make the output usable outside the app: `resolution: 2` renders at
+double density so the PNG is not blurry when pasted, and `clearColor` forces a
+white background regardless of the current theme, so a dark-mode export does
+not paste as white-on-black. The `try`/`finally` guarantees the selection
+overlay comes back even if extraction throws, and the branch on
+`convertToBlob` covers both the `OffscreenCanvas` and `HTMLCanvasElement` paths
+depending on what the renderer returned.
+
+```ts ! PixiGrid.ts
+	async extractPng(x: number, y: number, w: number, h: number): Promise<Blob | null> {
+		if (!this.viewport) return null;
+		// !mark
+		this.selectionGfx.visible = false;
+		try {
+			const canvas = this.app.renderer.extract.canvas({
+				target: this.viewport,
+				frame: new Rectangle(x, y, w, h),
+				// !mark(1:2)
+				resolution: 2,
+				clearColor: '#ffffff'
+			});
+			if ('convertToBlob' in canvas) {
+				return await (canvas as OffscreenCanvas).convertToBlob({ type: 'image/png' });
+			}
+			return await new Promise<Blob | null>((resolve) =>
+				(canvas as HTMLCanvasElement).toBlob((blob) => resolve(blob), 'image/png')
+			);
+		} catch {
+			return null;
+		} finally {
+			this.selectionGfx.visible = true;
+		}
+	}
+```
+
 </Scrollycoding>
 
 The engine is created and owned by
