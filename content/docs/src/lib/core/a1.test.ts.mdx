@@ -1,32 +1,66 @@
 ---
 title: "a1.test.ts"
-description: "Unit tests for a1.ts."
+description: "Vitest coverage for A1 notation — base-26 rollover, the negative n convention, rejection rules, and a round-trip property"
 source: "src/lib/core/a1.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Seventy lines pinning down [a1.ts](/docs/src/lib/core/a1.ts), and they are
+worth reading as a specification: the conventions this project uses differ from
+a conventional spreadsheet in two ways — row 0 exists, and negative coordinates
+are marked with a lowercase `n` — so the tests are where those rules are stated
+unambiguously.
 
-````ts a1.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { getCellA1Notation, getColumnA1Notation, getRowA1Notation, parseCellRef } from './a1';
+The file closes on a round-trip property, which is the assertion that actually
+guards the pair of functions against drifting apart.
 
-describe('getColumnA1Notation', () => {
-	it('maps column 0 to A', () => {
-		expect(getColumnA1Notation(0)).toBe('A');
-	});
+<Scrollycoding>
 
+## !!steps The boundaries of bijective base 26
+
+Column conversion is a numbering system with no zero digit, and every
+interesting failure happens at a rollover. So the test names five of them
+rather than sampling arbitrary values.
+
+`25` to `26` is the single-to-double letter boundary, `26` and `27` confirm the
+sequence continues as `AA`, `AB` rather than restarting, and `701` to `702` is
+the double-to-triple boundary. A naive base-26 implementation — one treating
+`A` as zero — passes the first case and fails at `26`, producing `BA`.
+
+The separate `column 0 to A` test exists because it is the convention's
+foundation: a zero-based column index, unlike the 1-based columns of most
+spreadsheet APIs.
+
+```ts ! a1.test.ts
 	it('rolls over from Z to AA', () => {
 		expect(getColumnA1Notation(25)).toBe('Z');
+		// !mark(1:2)
 		expect(getColumnA1Notation(26)).toBe('AA');
 		expect(getColumnA1Notation(27)).toBe('AB');
 		expect(getColumnA1Notation(701)).toBe('ZZ');
+		// !mark
 		expect(getColumnA1Notation(702)).toBe('AAA');
 	});
+```
 
+## !!steps Two different negative conventions
+
+Negative columns and negative rows are marked the same way but computed
+differently, and the two tests together make that explicit.
+
+Columns mirror: `-1` becomes `nA`, so the first column left of the origin is
+named like the first column right of it. `-27` becoming `nAA` confirms the
+mirroring survives the rollover — it maps through the same bijective conversion,
+not a separate path.
+
+Rows are simpler because rows are already numbers: `-5` is just `n5`. The
+neighbouring test carries the more surprising assertion in its title — row `0`
+renders as `"0"`, since this grid has a row zero at all, which no conventional
+spreadsheet does.
+
+```ts ! a1.test.ts
 	it('prefixes negative columns with n', () => {
+		// !mark(1:2)
 		expect(getColumnA1Notation(-1)).toBe('nA');
 		expect(getColumnA1Notation(-27)).toBe('nAA');
 	});
@@ -34,6 +68,7 @@ describe('getColumnA1Notation', () => {
 
 describe('getRowA1Notation', () => {
 	it('uses the raw y value (row 0 exists)', () => {
+		// !mark
 		expect(getRowA1Notation(0)).toBe('0');
 		expect(getRowA1Notation(42)).toBe('42');
 	});
@@ -42,42 +77,109 @@ describe('getRowA1Notation', () => {
 		expect(getRowA1Notation(-5)).toBe('n5');
 	});
 });
+```
 
-describe('parseCellRef', () => {
-	it('parses simple refs', () => {
-		expect(parseCellRef('A0')).toEqual({ x: 0, y: 0 });
-		expect(parseCellRef('B7')).toEqual({ x: 1, y: 7 });
-		expect(parseCellRef('AA10')).toEqual({ x: 26, y: 10 });
-	});
+## !!steps The n marker in all three positions
 
+Parsing is where the `n` convention gets genuinely tricky, because the same
+letter can appear in three places, and these three assertions cover each
+arrangement.
+
+`nA7` puts the marker on the column, `An5` on the row, and `nBn2` on both. The
+middle case is the one that constrains the implementation: the parser cannot
+match column letters greedily, or the `n` in `An5` would be swallowed as part of
+the column name. That is why the regex in
+[a1.ts](/docs/src/lib/core/a1.ts) uses a lazy quantifier — this test is what
+would fail if it were changed.
+
+The lowercase test guards the other half of the same subtlety: input is matched
+case-sensitively so the marker is recognized, and only *then* uppercased for
+conversion.
+
+```ts ! a1.test.ts
 	it('parses negative columns and rows', () => {
 		expect(parseCellRef('nA7')).toEqual({ x: -1, y: 7 });
+		// !mark(1:2)
 		expect(parseCellRef('An5')).toEqual({ x: 0, y: -5 });
 		expect(parseCellRef('nBn2')).toEqual({ x: -2, y: -2 });
 	});
 
 	it('accepts lowercase', () => {
+		// !mark
 		expect(parseCellRef('aa10')).toEqual({ x: 26, y: 10 });
 	});
+```
 
+## !!steps Five ways to be malformed
+
+The rejection test packs five distinct rules into one case, and each input is
+chosen to violate exactly one.
+
+`'A'` has no row and `'7'` no column, establishing that both parts are
+required. The empty string covers the degenerate input. `'1A'` fixes the
+order — letters then digits, never the reverse.
+
+`'A-1'` is the most informative of the five. A minus sign is *not* how this
+notation expresses a negative row; the `n` prefix is. Rejecting it rather than
+quietly parsing it means a user typing a conventional negative gets no cell
+instead of the wrong one, and it stops the two conventions from silently
+coexisting.
+
+```ts ! a1.test.ts
 	it('rejects malformed refs', () => {
 		expect(parseCellRef('A')).toBeUndefined();
 		expect(parseCellRef('7')).toBeUndefined();
 		expect(parseCellRef('')).toBeUndefined();
+		// !mark
 		expect(parseCellRef('A-1')).toBeUndefined();
 		expect(parseCellRef('1A')).toBeUndefined();
 	});
+```
 
+## !!steps The property that ties both directions together
+
+The last test asserts what all the others imply: formatting a coordinate and
+parsing the result gives the coordinate back. It is a property test written as
+a loop over hand-picked inputs rather than generated ones.
+
+The five coordinates are chosen to span the space rather than to be
+representative. The origin, a positive multi-letter column, a negative column,
+a negative row, and one with both negative — so every quadrant of the infinite
+grid is covered, plus the rollover.
+
+That last entry is the one that exercises everything at once: `(-28, -9)`
+formats to `nABn9`, a reference carrying a two-letter column, a negative marker
+on each half, and therefore the exact ambiguity the lazy match exists to
+resolve. Any change that breaks the two functions apart fails here even if the
+individual cases still pass.
+
+```ts ! a1.test.ts
 	it('roundtrips with getCellA1Notation', () => {
 		for (const coord of [
 			{ x: 0, y: 0 },
 			{ x: 26, y: 3 },
 			{ x: -1, y: 7 },
 			{ x: 5, y: -2 },
+			// !mark
 			{ x: -28, y: -9 }
 		]) {
+			// !mark
 			expect(parseCellRef(getCellA1Notation(coord.x, coord.y))).toEqual(coord);
 		}
 	});
-});
-````
+```
+
+</Scrollycoding>
+
+Run with `pnpm test`. What these tests protect is wider than the module: A1
+notation is displayed by [GridHeadings.ts](/docs/src/lib/grid/pixi/GridHeadings.ts),
+parsed from user input by the `q.cells` API in
+[javascriptRunner.ts](/docs/src/lib/javascript/javascriptRunner.ts), and used to
+recognize cross-sheet references in
+[sheetRefs.ts](/docs/src/lib/formulas/sheetRefs.ts) — so a regression here
+would surface in three unrelated places.
+
+Not covered here: `getCellA1Notation` is only exercised through the round trip,
+never asserted directly against an expected string, and the internal
+`numberToLetters` and `lettersToNumber` helpers are not exported so they are
+tested only through the public functions.
