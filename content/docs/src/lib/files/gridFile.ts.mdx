@@ -1,37 +1,36 @@
 ---
 title: "gridFile.ts"
-description: "Source file src/lib/files/gridFile.ts of quadratic-svelte."
+description: "Persistence — the .grid v1.3 envelope, legacy import paths, IndexedDB storage with atomic writes, and a small CSV parser"
 source: "src/lib/files/gridFile.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Everything about getting a spreadsheet into and out of the browser: the file
+format, two generations of legacy layouts that still have to load, the
+IndexedDB layer that replaced `localStorage`, and downloading and CSV import.
 
-````ts gridFile.ts -n
-import { Sheet } from '../core/Sheet';
-import type { SheetController } from '../core/SheetController';
-import type { GridFile } from '../core/types';
+The persistence half is more careful than it first looks. A spreadsheet app
+that loses work is worthless, so the writes here are structured so an interrupted
+save cannot leave the store pointing at a file that was never written.
 
-export const DEFAULT_FILE_NAME = 'Untitled';
-const LEGACY_LOCAL_STORAGE_KEY = 'quadratic-svelte-file';
-const DB_NAME = 'quadratic-svelte';
-const DB_STORE = 'files';
-/** Pre-multi-file single slot; migrated to a per-id record on first load. */
-const LEGACY_SINGLE_KEY = 'current-file';
-/** Points at the id of the file that should open on the next visit. */
-const CURRENT_ID_KEY = 'current-id';
+<Scrollycoding>
 
-export interface StoredFileMeta {
-	id: string;
-	filename: string;
-	modified: number;
-	sheets: number;
-}
+## !!steps Writing the v1.3 envelope
 
+Export walks the controller's sheets and asks each to serialize itself,
+wrapping the result in the versioned envelope that
+[types.ts](/docs/src/lib/core/types.ts) defines.
+
+`order` is derived from the array index rather than stored on the sheet, so
+sheet order is whatever the tab bar shows — there is no second source of truth
+to drift. `borders: []` is written empty because borders now live inside each
+cell's format; the field remains only so files stay readable by the original
+app's schema, and the import path below is what still understands it.
+
+```ts ! gridFile.ts
 export function exportGridFile(sc: SheetController, filename: string, id: string): GridFile {
 	return {
+		// !mark
 		sheets: sc.sheets.map((sheet, order) => {
 			const data = sheet.export();
 			return {
@@ -53,16 +52,27 @@ export function exportGridFile(sc: SheetController, filename: string, id: string
 		version: '1.3'
 	};
 }
+```
 
-export function importGridFile(sc: SheetController, file: GridFile): void {
+## !!steps Two file layouts, one loader
+
+Multi-sheet support changed the shape of the format: v1.3 nests content under
+`sheets[]`, while v1.0 through v1.2 kept a single sheet's `cells` and `formats`
+at the top level.
+
+Rather than branch on the version string — which older files may not carry
+reliably — the loader detects the shape. If `sheets` has entries it uses them;
+otherwise the presence of a top-level `cells` array means the whole file *is*
+one sheet, so it is wrapped in an array and treated identically. Neither
+condition holding is a genuine error and throws.
+
+Every field is then read defensively with a fallback, including a generated
+sheet name, because these files may have been written by a different
+application years ago.
+
+```ts ! gridFile.ts
 	// v1.3 files nest content under sheets[]; v1.0–1.2 keep it at the top level
-	const legacy = file as unknown as {
-		cells?: unknown[];
-		formats?: unknown[];
-		columns?: unknown[];
-		rows?: unknown[];
-		cell_dependency?: string;
-	};
+	// !mark(1:3)
 	const sheetDatas =
 		file.sheets && file.sheets.length > 0 ? file.sheets : legacy.cells ? [legacy] : undefined;
 	if (!sheetDatas) throw new Error('Grid file has no sheets');
@@ -80,10 +90,25 @@ export function importGridFile(sc: SheetController, file: GridFile): void {
 			rows: f.rows ?? [],
 			cell_dependency: typeof f.cell_dependency === 'string' ? f.cell_dependency : '[]'
 		});
-		// files from the original app store borders separately, one entry per
-		// cell with `horizontal` = top edge and `vertical` = left edge; fold
-		// them into our per-format borders
-		if (Array.isArray(f.borders)) {
+```
+
+## !!steps Translating the original app's borders
+
+The original Quadratic stored borders as their own collection, one entry per
+cell, using `horizontal` for the top edge and `vertical` for the left. This port
+keeps borders inside each cell's format instead, so imported entries have to be
+folded across.
+
+The naming is the trap the comment defends against: `horizontal` describes the
+*line's* orientation, not which side it sits on, so a horizontal line is the
+cell's `top` edge. An entry with neither edge is skipped rather than creating an
+empty format, and a present-but-colorless edge defaults to black — matching what
+the original rendered.
+
+Merging onto any existing format, rather than replacing it, preserves bold and
+fill that arrived through the normal `formats` array.
+
+```ts ! gridFile.ts
 			for (const b of f.borders as {
 				x: number;
 				y: number;
@@ -91,6 +116,7 @@ export function importGridFile(sc: SheetController, file: GridFile): void {
 				vertical?: { color?: string };
 			}[]) {
 				if (!b || (b.horizontal === undefined && b.vertical === undefined)) continue;
+				// !mark
 				const existing = sheet.getFormat(b.x, b.y) ?? { x: b.x, y: b.y };
 				const borders = { ...(existing.borders ?? {}) };
 				if (b.horizontal)
@@ -99,29 +125,26 @@ export function importGridFile(sc: SheetController, file: GridFile): void {
 					borders.left = typeof b.vertical.color === 'string' ? b.vertical.color : '#000000';
 				sheet.setFormat(b.x, b.y, { ...existing, borders });
 			}
-		}
-		sheet.rebuildDependencies();
-		return sheet;
-	});
-	sc.currentSheetIndex = 0;
-}
+```
 
-// IndexedDB persistence (localStorage's ~5MB quota silently truncated
-// larger sheets — the Monte Carlo example alone is ~3MB on disk).
-function openDb(): Promise<IDBDatabase> {
-	return new Promise((resolve, reject) => {
-		const req = indexedDB.open(DB_NAME, 1);
-		req.onupgradeneeded = () => {
-			if (!req.result.objectStoreNames.contains(DB_STORE)) {
-				req.result.createObjectStore(DB_STORE);
-			}
-		};
-		req.onsuccess = () => resolve(req.result);
-		req.onerror = () => reject(req.error ?? new Error('IndexedDB open failed'));
-	});
-}
+## !!steps Resolving when the transaction commits
 
-/** Runs `use` inside one transaction; resolves when the transaction commits. */
+The comment above `openDb` records why IndexedDB is used at all: `localStorage`
+caps out around 5MB and **silently truncated** larger sheets, with the Monte
+Carlo example alone at roughly 3MB. Silent data loss is the worst kind, so the
+store moved.
+
+`withStore` is a small wrapper over the event-based API, and the detail that
+matters is which event resolves it. It waits for `tx.oncomplete` — the
+transaction *committing* — rather than an individual request's `onsuccess`,
+which fires while the write may still be rolled back. Awaiting a save therefore
+means the data is genuinely durable.
+
+The `collect` callback exists because reads need a result: a caller passes its
+request through it, and whatever the last one produced is what resolves.
+`finally` closes the connection on every path.
+
+```ts ! gridFile.ts
 async function withStore<T>(
 	mode: IDBTransactionMode,
 	use: (store: IDBObjectStore, collect: (req: IDBRequest) => void) => void
@@ -132,6 +155,7 @@ async function withStore<T>(
 			const tx = db.transaction(DB_STORE, mode);
 			let last: IDBRequest | undefined;
 			use(tx.objectStore(DB_STORE), (req) => (last = req));
+			// !mark
 			tx.oncomplete = () => resolve(last?.result as T | undefined);
 			tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
 			tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
@@ -140,36 +164,51 @@ async function withStore<T>(
 		db.close();
 	}
 }
+```
 
-/** Persists a file under its id without touching which file is current. */
-export async function saveStoredFile(file: GridFile): Promise<void> {
-	await withStore('readwrite', (store) => store.put(file, file.id));
-}
+## !!steps Saving the file and the pointer together
 
+Two save functions, differing in one respect: whether the file also becomes the
+one to reopen. `saveStoredFile` writes only the record — used when persisting a
+file the user is not currently editing — while `saveCurrentFile` also updates
+the pointer.
+
+That both `put` calls sit in a **single transaction** is the point. IndexedDB
+commits a transaction atomically, so it is impossible to end up with the
+pointer naming a file whose contents never landed. Splitting them into two
+awaited calls would open exactly that window.
+
+The doc comment notes that `saveCurrentFile` throws rather than swallowing
+errors, which is what lets `state.svelte.ts` set the `saveError` that
+[BottomBar.svelte](/docs/src/lib/components/BottomBar.svelte) shows.
+
+```ts ! gridFile.ts
 /** Persists the current file and marks it as the one to reopen.
  * Throws on failure so callers can surface it. */
 export async function saveCurrentFile(file: GridFile): Promise<void> {
 	await withStore('readwrite', (store) => {
+		// !mark(1:2)
 		store.put(file, file.id);
 		store.put(file.id, CURRENT_ID_KEY);
 	});
 }
+```
 
-export async function loadStoredFile(id: string): Promise<GridFile | undefined> {
-	return withStore<GridFile>('readonly', (store, collect) => collect(store.get(id)));
-}
+## !!steps Listing files around a pointer that shares the store
 
-export async function deleteStoredFile(id: string): Promise<void> {
-	await withStore('readwrite', (store) => store.delete(id));
-}
+The file list is built by cursoring the whole store, which has a wrinkle: the
+`current-id` pointer lives in that same store, as a bare string rather than a
+file.
 
-/** All stored files, newest-modified first. */
-export async function listStoredFiles(): Promise<StoredFileMeta[]> {
-	const db = await openDb();
-	try {
-		return await new Promise<StoredFileMeta[]>((resolve, reject) => {
-			const out: StoredFileMeta[] = [];
-			const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).openCursor();
+So each value is checked for actually being a file — an object with a `sheets`
+array — and anything else is skipped. The comment says it covers "anything odd"
+too, which also guards against a record written by an older version.
+
+Only metadata is kept, not the file bodies, so the file menu can list dozens of
+grids without holding megabytes of cell data in memory. Sorting by `modified`
+descending puts the most recent work first.
+
+```ts ! gridFile.ts
 			req.onsuccess = () => {
 				const cursor = req.result;
 				if (!cursor) {
@@ -178,6 +217,7 @@ export async function listStoredFiles(): Promise<StoredFileMeta[]> {
 				}
 				const v = cursor.value as GridFile;
 				// skip the current-id pointer (a bare string) and anything odd
+				// !mark
 				if (v && typeof v === 'object' && Array.isArray(v.sheets)) {
 					out.push({
 						id: String(cursor.key),
@@ -188,30 +228,31 @@ export async function listStoredFiles(): Promise<StoredFileMeta[]> {
 				}
 				cursor.continue();
 			};
-			req.onerror = () => reject(req.error ?? new Error('IndexedDB cursor failed'));
-		});
-	} finally {
-		db.close();
-	}
-}
+```
 
-/** Loads the file to reopen, migrating both legacy layouts: the single-slot
- * IndexedDB record from before multi-file support, and the pre-IndexedDB
- * localStorage copy. */
-export async function loadCurrentFile(): Promise<GridFile | undefined> {
-	try {
-		const currentId = await withStore<string>('readonly', (store, collect) =>
-			collect(store.get(CURRENT_ID_KEY))
-		);
-		if (typeof currentId === 'string') {
-			const file = await loadStoredFile(currentId);
-			if (file) return file;
-		}
+## !!steps Two generations of migration
+
+Opening the app tries three sources in order, oldest support last.
+
+The normal path reads the pointer and loads that file. Failing that, it looks
+for the pre-multi-file single-slot record: if found it is given an id, written
+under it, made current, and the old key deleted — all in **one transaction**, so
+a migration cannot half-apply. Failing that too, the `catch` falls through to
+the pre-IndexedDB `localStorage` copy, which is parsed, saved into the new store
+and then removed.
+
+Both migrations are one-way and self-erasing, so the legacy branches run at most
+once per user. The `saveCurrentFile(legacy).catch(() => {})` is deliberately
+forgiving: if that write fails the user still gets their file back this session,
+which beats failing the load outright.
+
+```ts ! gridFile.ts
 		const legacy = await withStore<GridFile>('readonly', (store, collect) =>
 			collect(store.get(LEGACY_SINGLE_KEY))
 		);
 		if (legacy) {
 			if (!legacy.id) legacy.id = crypto.randomUUID();
+			// !mark(1:5)
 			await withStore('readwrite', (store) => {
 				store.put(legacy, legacy.id);
 				store.put(legacy.id, CURRENT_ID_KEY);
@@ -233,26 +274,36 @@ export async function loadCurrentFile(): Promise<GridFile | undefined> {
 	} catch {
 		return undefined;
 	}
-}
+```
 
+## !!steps Downloading, and parsing pasted CSV
+
+Download is the classic synthetic-anchor trick: wrap the JSON in a blob, point
+a link at an object URL, click it programmatically. Revoking the URL on the very
+next line is safe because `a.click()` dispatches synchronously and the browser
+has already begun the download by the time it returns.
+
+`parseCSV` is a hand-rolled state machine over a single `inQuotes` flag — small
+enough to avoid a dependency, and it handles the three things that break naive
+splitting: commas inside quoted fields, doubled quotes as an escape, and CRLF
+endings consumed as one break.
+
+The closing filter encodes a distinction worth noticing: an empty *field* is
+preserved, because a blank cell between two commas is real data, while a row
+that parsed to a single empty field — a blank line — is dropped.
+
+```ts ! gridFile.ts
 export function downloadGridFile(file: GridFile): void {
 	const blob = new Blob([JSON.stringify(file, null, 2)], { type: 'application/json' });
 	const url = URL.createObjectURL(blob);
 	const a = document.createElement('a');
 	a.href = url;
 	a.download = `${file.filename}.grid`;
+	// !mark(1:2)
 	a.click();
 	URL.revokeObjectURL(url);
 }
-
-/** Minimal CSV parser (quotes, escaped quotes, CRLF). */
-export function parseCSV(text: string): string[][] {
-	const rows: string[][] = [];
-	let row: string[] = [];
-	let field = '';
-	let inQuotes = false;
-	for (let i = 0; i < text.length; i++) {
-		const ch = text[i];
+// ...
 		if (inQuotes) {
 			if (ch === '"') {
 				if (text[i + 1] === '"') {
@@ -260,23 +311,21 @@ export function parseCSV(text: string): string[][] {
 					i++;
 				} else inQuotes = false;
 			} else field += ch;
-		} else if (ch === '"') {
-			inQuotes = true;
-		} else if (ch === ',') {
-			row.push(field);
-			field = '';
-		} else if (ch === '\n' || ch === '\r') {
-			if (ch === '\r' && text[i + 1] === '\n') i++;
-			row.push(field);
-			field = '';
-			rows.push(row);
-			row = [];
-		} else field += ch;
-	}
-	if (field !== '' || row.length > 0) {
-		row.push(field);
-		rows.push(row);
-	}
+		}
+// ...
 	return rows.filter((r) => !(r.length === 1 && r[0] === ''));
 }
-````
+```
+
+</Scrollycoding>
+
+The load path is entered by `loadInitialFile` in
+[state.svelte.ts](/docs/src/lib/state.svelte.ts), which imports the result
+through `importGridFile`, rebuilds cross-sheet dependencies, and falls back to
+seeding example content when nothing is stored. The file menu in
+[FileMenu.svelte](/docs/src/lib/components/FileMenu.svelte) drives the rest —
+listing, opening, downloading and fetching the bundled examples generated by
+[generate-examples.mjs](/docs/scripts/generate-examples.mjs).
+
+Round-trip fidelity, both legacy import paths and the CSV edge cases are
+covered by [gridFile.test.ts](/docs/src/lib/files/gridFile.test.ts).

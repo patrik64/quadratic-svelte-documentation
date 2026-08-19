@@ -1,34 +1,35 @@
 ---
 title: "gridFile.test.ts"
-description: "Unit tests for gridFile.ts."
+description: "Vitest coverage for the file format — CSV edge cases, a full export/import round trip, and both legacy layouts"
 source: "src/lib/files/gridFile.test.ts"
-generated: true
+full: true
 ---
 
-_Auto-generated page showing the full file contents. To replace it with a
-hand-written walkthrough, remove `generated: true` from the frontmatter so
-`pnpm gen` keeps your edits._
+Two suites covering the halves of
+[gridFile.ts](/docs/src/lib/files/gridFile.ts) that can be tested without a
+browser: the CSV parser, and the export/import pair.
 
-````ts gridFile.test.ts -n
-import { describe, expect, it } from 'vitest';
-import { SheetController } from '../core/SheetController';
-import type { Cell, GridFile } from '../core/types';
-import { exportGridFile, importGridFile, parseCSV } from './gridFile';
+The IndexedDB layer is absent, which is a reasonable line to draw — it would
+need a fake implementation, and what it does is thin compared to the format
+translation these tests pin down.
 
-function textCell(x: number, y: number, value: string): Cell {
-	return { x, y, type: 'TEXT', value, last_modified: '2026-01-01T00:00:00.000Z' };
-}
+<Scrollycoding>
 
-describe('parseCSV', () => {
-	it('parses plain rows', () => {
-		expect(parseCSV('a,b\n1,2')).toEqual([
-			['a', 'b'],
-			['1', '2']
-		]);
-	});
+## !!steps The CSV cases that break naive splitting
 
+Four tests, each aimed at a way `text.split(',')` would go wrong.
+
+Quoted fields containing commas must stay one field, and doubled quotes must
+collapse to a single literal quote — `"say ""hi"""` becoming `say "hi"` is the
+case a hand-rolled parser most often gets wrong.
+
+CRLF is tested together with a trailing newline, so one test covers both
+consuming `\r\n` as a single break and not emitting a phantom final row.
+
+```ts ! gridFile.test.ts
 	it('handles quoted fields with commas and escaped quotes', () => {
 		expect(parseCSV('"a,b",c')).toEqual([['a,b', 'c']]);
+		// !mark
 		expect(parseCSV('"say ""hi""",x')).toEqual([['say "hi"', 'x']]);
 	});
 
@@ -38,28 +39,53 @@ describe('parseCSV', () => {
 			['1', '2']
 		]);
 	});
+```
 
+## !!steps Empty fields are data, empty rows are not
+
+The sharpest CSV test, because it asserts two behaviors that sound
+contradictory until you see them side by side.
+
+The input has an empty field in the middle of a row, a completely blank line,
+and a trailing empty field. The expectation keeps both empty *fields* — a blank
+cell between commas is real, positional data — while the blank line vanishes
+entirely.
+
+That is exactly the distinction the parser's closing filter draws, and stating
+it as a test means a later "simplification" that drops all empty strings would
+fail immediately.
+
+```ts ! gridFile.test.ts
 	it('keeps empty fields but drops fully empty rows', () => {
 		expect(parseCSV('a,,c\n\nx,y,')).toEqual([
+			// !mark(1:2)
 			['a', '', 'c'],
 			['x', 'y', '']
 		]);
 	});
 });
+```
 
-describe('export/import roundtrip', () => {
-	it('preserves cells, formats, headings, and sheet identity across sheets', () => {
-		const sc = new SheetController();
-		sc.sheet.setCell(textCell(0, 0, 'hello'));
-		sc.sheet.setFormat(0, 0, { bold: true, borders: { top: '#000000' } });
-		sc.sheet.gridOffsets.setColumnWidth(2, 150);
-		const second = sc.addSheet();
-		second.setCell(textCell(1, 1, 'other'));
-		sc.renameSheet(1, 'Data');
-		sc.setSheetColor(1, '#ff0000');
+## !!steps A round trip through real JSON
 
+The round-trip test builds a genuinely varied controller — a cell, a format
+carrying both bold and a border, a resized column, then a second sheet with its
+own cell, a rename and a color — so one assertion block covers every part of the
+envelope.
+
+The detail that makes it a real test is `JSON.parse(JSON.stringify(file))`.
+Passing the exported object straight to the importer would let shared
+references paper over a serialization bug; forcing it through JSON reproduces
+what actually happens on disk, so anything not representable — a `Map`, an
+`undefined`, a class instance — would surface here.
+
+The assertions then check both sheets, including that sheet *identity* survives:
+name and color, not just contents.
+
+```ts ! gridFile.test.ts
 		const file = exportGridFile(sc, 'My file', 'test-id');
 		const sc2 = new SheetController();
+		// !mark
 		importGridFile(sc2, JSON.parse(JSON.stringify(file)) as GridFile);
 
 		expect(sc2.sheets).toHaveLength(2);
@@ -70,44 +96,35 @@ describe('export/import roundtrip', () => {
 		expect(sc2.sheets[1].name).toBe('Data');
 		expect(sc2.sheets[1].color).toBe('#ff0000');
 		expect(sc2.sheets[1].getCell(1, 1)?.value).toBe('other');
-	});
+```
 
-	it('imports legacy top-level (pre-multi-sheet) files', () => {
-		const legacy = {
-			cells: [textCell(3, 3, 'legacy')],
-			formats: [],
-			columns: [],
-			rows: [],
-			cell_dependency: '[]'
-		} as unknown as GridFile;
+## !!steps Both legacy shapes, and a real failure
 
-		const sc = new SheetController();
-		importGridFile(sc, legacy);
-		expect(sc.sheets).toHaveLength(1);
-		expect(sc.sheet.getCell(3, 3)?.value).toBe('legacy');
-	});
+The legacy test constructs a pre-multi-sheet file — content at the top level,
+no `sheets` array — and asserts it loads as exactly one sheet. That is the shape
+detection rather than a version check, so it would still work on a file with no
+version field at all.
 
-	it('maps original-app border entries onto per-format borders', () => {
-		const file = {
-			sheets: [
-				{
-					name: 'Sheet1',
-					cells: [],
-					formats: [],
-					columns: [],
-					rows: [],
-					cell_dependency: '[]',
+The border test is the most detailed of the three, and its third fixture entry
+is the interesting one: a border record with neither edge, commented in the
+source as ignored, asserted by expecting `getFormat(5, 6)` to be `undefined`.
+Checking that *no format was created* is stronger than checking the borders are
+empty — it proves the skip happens before any format is materialized.
+
+The suite ends by confirming a file with no recoverable content throws rather
+than importing as an empty sheet, matching on the message fragment so the
+wording can change.
+
+```ts ! gridFile.test.ts
 					borders: [
 						{ x: 1, y: 2, horizontal: {} },
 						{ x: 3, y: 4, vertical: { color: '#ff0000' } },
 						{ x: 5, y: 6 } // no edges → ignored
 					]
-				}
-			]
-		} as unknown as GridFile;
-
+// ...
 		const sc = new SheetController();
 		importGridFile(sc, file);
+		// !mark(1:3)
 		expect(sc.sheet.getFormat(1, 2)?.borders).toEqual({ top: '#000000' });
 		expect(sc.sheet.getFormat(3, 4)?.borders).toEqual({ left: '#ff0000' });
 		expect(sc.sheet.getFormat(5, 6)).toBeUndefined();
@@ -118,5 +135,15 @@ describe('export/import roundtrip', () => {
 			'no sheets'
 		);
 	});
-});
-````
+```
+
+</Scrollycoding>
+
+The border assertions are worth reading against the import code: the fixture's
+`horizontal: {}` — present but with no color — comes back as `#000000`,
+confirming the default, while `vertical` maps to `left`. Both encode the
+orientation-versus-edge naming that would otherwise be easy to invert.
+
+Run with `pnpm test`. Untested here: the whole IndexedDB layer, the two
+migration paths in `loadCurrentFile`, and `downloadGridFile`, all of which need
+browser APIs.
