@@ -8,6 +8,7 @@ import {
   FlaskConical,
   Folder,
   Network,
+  Waypoints,
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 
@@ -28,6 +29,7 @@ const BY_EXTENSION: Record<string, { icon: typeof FileCode; className: string }>
 const OVERVIEW_ICONS: Record<string, { icon: typeof FileCode; className: string }> = {
   '/docs': { icon: BookOpen, className: 'text-fd-muted-foreground' },
   '/docs/architecture': { icon: Network, className: 'text-fd-muted-foreground' },
+  '/docs/code-graph': { icon: Waypoints, className: 'text-fd-muted-foreground' },
 };
 
 function iconFor(url: string): ReactNode {

@@ -23,6 +23,11 @@ export const docs = defineDocs({
       // marks pages that scripts/generate-docs.mjs may overwrite on re-run
       generated: z.boolean().optional(),
     }),
+    postprocess: {
+      // exports every link in a page as `extractedReferences`; lib/build-graph.ts
+      // turns those into the edges of the Code Graph page
+      extractLinkReferences: true,
+    },
   },
 });
 

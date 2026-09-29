@@ -17,7 +17,7 @@ const PROJECT = path.resolve(ROOT, '..', 'quadratic-svelte');
 const hasProject = fs.existsSync(PROJECT);
 
 /** Pages that document the project as a whole rather than one file. */
-const STANDALONE = /\/(index|architecture|findings)\.mdx$/;
+const STANDALONE = /\/(index|architecture|code-graph|findings)\.mdx$/;
 /** Lines inside a fence that mark an omission or a Code Hike annotation. */
 const isMarker = (line) => {
   const t = line.trim();
@@ -152,7 +152,10 @@ for (const file of mdxFiles.sort()) {
 
   // raw JSX-ish characters in prose break the MDX parse
   for (const [n, line] of prose) {
-    const stripped = line.replace(/`[^`]*`/g, '').replace(/<\/?Scrollycoding>/g, '');
+    // the components registered in mdx-components.tsx are the JSX that may appear
+    const stripped = line
+      .replace(/`[^`]*`/g, '')
+      .replace(/<\/?Scrollycoding>|<CodeGraph \/>/g, '');
     const bad = stripped.match(/[<>{}]/g);
     if (bad) report(file, `line ${n}: raw ${[...new Set(bad)].join(' ')} in prose — wrap in backticks`);
   }

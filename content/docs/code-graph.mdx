@@ -1,0 +1,59 @@
+---
+title: Code Graph
+description: Every documented file as a node, connected wherever one file's page refers to another
+full: true
+---
+
+The sidebar shows where each file lives. This page shows what each file is
+connected to: every documented source file is a node, and two nodes are joined
+when either file's page links to the other.
+
+<CodeGraph />
+
+## Reading the graph
+
+- **Color** is the language family, named in the legend: the Rust formula
+  engine, the TypeScript that holds the state and the sheet model, and the
+  Svelte components on top.
+- **Size** is the number of connections, so the files everything else leans on
+  are the large dots.
+- **Names** are shown for the most connected files in view. Zoom in and more
+  appear, until every dot is named.
+- **Hover** a file to name its neighbors and fade the rest; its summary appears
+  under the graph. **Click** to open its page.
+- **Drag** a file to pull it aside, or drag the background to pan. The button
+  in the corner brings the whole graph back into view.
+
+The table under the graph holds the same data, sorted by connections, for
+reading without a pointer.
+
+## What a connection is
+
+A connection is a link in the prose, not an import found by parsing the
+source. A page links to another file when its walkthrough has a reason to
+mention it: a function it calls, a type it shares, the test that covers it, or
+its counterpart on the other side of the WASM boundary.
+
+That makes this a map of how the code is explained. It follows how the code is
+built closely, but not exactly. A dependency that no walkthrough mentions is
+missing, and two files that never import each other are joined when one page
+compares them. Connections have no direction either: one line stands for a
+link from either page, or from both.
+
+## What stands out
+
+- **The layers of the [Architecture](/docs/architecture) page are visible.**
+  The components, the TypeScript beneath them and the Rust engine settle into
+  three groups without being told to. Nothing in the layout knows about
+  folders or languages; only the connections pull files together.
+- **The Rust engine is nearly self-contained.** Few connections leave it, and
+  more of them end at [runFormula.ts](/docs/src/lib/formulas/runFormula.ts)
+  than at any other file, which is what a single bridge to the WASM module
+  should look like.
+- **[state.svelte.ts](/docs/src/lib/state.svelte.ts) is the most connected
+  file.** Most of the components link to it, the visible side of every
+  component importing the store directly.
+- **Tests sit beside their subject.** Every `.test.ts` file is connected to the
+  file it tests, and mostly to little else. The exception is on the Rust side:
+  [tests.rs](/docs/quadratic-core/src/formulas/tests.rs) is a harness shared
+  across the engine, and is as connected as the modules it serves.

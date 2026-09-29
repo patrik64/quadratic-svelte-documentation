@@ -95,3 +95,18 @@ Two rules worth knowing before writing: code inside a fence must be copied
 `// !mark` only works where `//` is a real comment — in a `.svelte` fence that
 means inside `<script>` only, never in markup or `<style>`. `pnpm check`
 enforces both.
+
+## The code graph
+
+[`/docs/code-graph`](https://quadratic-svelte-documentation.vercel.app/docs/code-graph)
+draws one node per page that has a `source:` field, and one edge per pair of
+such pages where either links to the other. It is built from the links
+fumadocs-mdx extracts at compile time (`extractLinkReferences` in
+`source.config.ts`), so there is nothing to regenerate: link one walkthrough to
+another and the edge appears.
+
+The pieces are `lib/build-graph.ts` (the data), `components/graph-view.tsx`
+(the canvas, adapted from the fumadocs
+[Graph View](https://www.fumadocs.dev/docs/ui/components/graph-view)) and
+`components/code-graph.tsx` (the legend and the table view). Node colors are
+the `--graph-*` variables in `app/global.css`.

@@ -199,7 +199,15 @@ function writeMeta(dir, isRoot) {
     // fixed order for the hand-written pages, then the mirrored tree
     // `index` is never collected above (it is the folder's own page) but must
     // still lead the sidebar; the others appear only if their file exists.
-    const fixed = ['index', 'architecture', 'findings', 'src', 'quadratic-core', 'scripts'];
+    const fixed = [
+      'index',
+      'architecture',
+      'code-graph',
+      'findings',
+      'src',
+      'quadratic-core',
+      'scripts',
+    ];
     const rest = meta.pages.filter((p) => !fixed.includes(p));
     const lead = fixed.filter((p) => p === 'index' || meta.pages.includes(p));
     meta.pages = [...lead, ...rest];

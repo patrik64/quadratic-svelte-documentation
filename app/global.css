@@ -7,6 +7,25 @@ html {
 }
 
 /*
+ * Code Graph node colors, one per language family (`KINDS` in
+ * lib/build-graph.ts). Read by the canvas in components/graph-view.tsx and by
+ * the legend under it. Each theme has its own steps of the same three hues,
+ * checked for color-vision-deficiency separation against that theme's
+ * background — change them as a set, not one at a time.
+ */
+:root {
+  --graph-script: #2a78d6;
+  --graph-ui: #eb6834;
+  --graph-rust: #1baf7a;
+}
+
+.dark {
+  --graph-script: #3987e5;
+  --graph-ui: #d95926;
+  --graph-rust: #199e70;
+}
+
+/*
  * Code Hike "github-from-css" theme.
  * Token colors resolve to these variables, so code follows the
  * fumadocs light/dark toggle (`.dark` on <html>).
