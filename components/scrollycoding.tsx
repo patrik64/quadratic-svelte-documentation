@@ -70,8 +70,11 @@ export function Scrollycoding(props: unknown) {
         <div className="sticky top-20 overflow-hidden rounded-lg border bg-[var(--ch-16)]">
           <div className="max-h-[calc(100vh-7rem)] overflow-auto">
             <Selection
-              from={steps.map((step, i) => (
-                <StepCode key={i} code={step.code} className="min-h-[32rem]" />
+              // deliberately unkeyed: Selection renders one of these at a time, and a
+              // key per step would make React remount the block on every step change
+              // instead of updating it, so tokens would have nothing to animate from
+              from={steps.map((step) => (
+                <StepCode code={step.code} className="min-h-[32rem]" />
               ))}
             />
           </div>
